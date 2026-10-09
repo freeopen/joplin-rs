@@ -238,11 +238,10 @@ where
     // 2. mac = CBC-MAC over B0 = ((t-2)<<2)|(L-1) || nonce || msg_len_be(L bytes), then the PLAINTEXT
     // 3. expected stored tag = mac XOR E((L-1) || nonce || counter=0)[..tag_len]
     // 4. tag is APPENDED to the ciphertext
-    use aes::cipher::{BlockEncrypt, KeyInit};
     type Block = aes::cipher::generic_array::GenericArray<u8, aes::cipher::typenum::U16>;
 
     let l = 15 - nonce.len(); // length field size in bytes
-    if l < 2 || l > 8 {
+    if !(2..=8).contains(&l) {
         return Err(Error::Crypto(format!("invalid ccm L {l}")));
     }
     if ct.len() < tag_len {
@@ -331,7 +330,7 @@ pub fn debug_ccm_trace(key: &[u8], nonce: &[u8], tag_len: usize, ct: &[u8]) -> V
     };
     let mut s0 = ctr_block(0);
     cipher.encrypt_block(&mut s0);
-    log.push(format!("s0={}", hex::encode(&s0)));
+    log.push(format!("s0={}", hex::encode(s0)));
     let mut b0 = [0u8; 16];
     b0[0] = (((tag_len - 2) << 2) | (l - 1)) as u8;
     b0[1..1 + nonce.len()].copy_from_slice(nonce);
@@ -340,7 +339,7 @@ pub fn debug_ccm_trace(key: &[u8], nonce: &[u8], tag_len: usize, ct: &[u8]) -> V
     log.push(format!("b0={}", hex::encode(b0)));
     let mut mac = Block::clone_from_slice(&b0);
     cipher.encrypt_block(&mut mac);
-    log.push(format!("e_b0={}", hex::encode(&mac)));
+    log.push(format!("e_b0={}", hex::encode(mac)));
     let mut i = 0;
     while i < msg_len {
         let n = (msg_len - i).min(16);
@@ -351,7 +350,7 @@ pub fn debug_ccm_trace(key: &[u8], nonce: &[u8], tag_len: usize, ct: &[u8]) -> V
         cipher.encrypt_block(&mut mac);
         i += n;
     }
-    log.push(format!("mac={}", hex::encode(&mac)));
+    log.push(format!("mac={}", hex::encode(mac)));
     let masked: Vec<u8> = (0..tag_len).map(|idx| mac[idx] ^ s0[idx]).collect();
     log.push(format!("masked={}", hex::encode(&masked)));
     log

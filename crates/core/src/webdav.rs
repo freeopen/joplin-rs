@@ -49,7 +49,7 @@ impl WebDavClient {
             // Percent-encode each segment but keep slashes.
             let joined = self
                 .base_url
-                .join(&trimmed)
+                .join(trimmed)
                 .map(|u| u.to_string())
                 .unwrap_or_else(|_| format!("{}{}", self.base_url, trimmed));
             joined

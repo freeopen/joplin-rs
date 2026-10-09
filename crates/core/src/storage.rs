@@ -245,7 +245,7 @@ impl Storage {
         self.items_by_type(crate::items::TYPE_NOTE_TAG)
     }
 
-    fn items_by_type(&self, t: i64) -> Result<Vec<Item>> {
+    pub fn items_by_type(&self, t: i64) -> Result<Vec<Item>> {
         let mut stmt = self
             .conn
             .prepare("SELECT payload FROM items WHERE type_ = ?1 AND deleted_time = 0 ORDER BY title COLLATE NOCASE")
@@ -330,6 +330,16 @@ impl Storage {
             }));
         }
         Ok(None)
+    }
+
+    /// Count items of a type (including deleted) - used to decide resource prefetch.
+    pub fn items_count(&self, t: i64) -> Result<usize> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT COUNT(*) FROM items WHERE type_ = ?1")
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let n: i64 = stmt.query_row([t], |r| r.get(0)).map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(n as usize)
     }
 
     /// Simple LIKE-based search over title/body.

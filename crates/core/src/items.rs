@@ -35,12 +35,12 @@ pub enum FieldType {
 /// JoplinDatabase.ts (base CREATE TABLE + all migrations up to v54).
 pub fn table_fields(model_type: i64) -> Option<&'static [(&'static str, FieldType)]> {
     match model_type {
-        TYPE_NOTE => Some(&NOTE_FIELDS),
-        TYPE_FOLDER => Some(&FOLDER_FIELDS),
-        TYPE_TAG => Some(&TAG_FIELDS),
-        TYPE_NOTE_TAG => Some(&NOTE_TAG_FIELDS),
-        TYPE_RESOURCE => Some(&RESOURCE_FIELDS),
-        TYPE_MASTER_KEY => Some(&MASTER_KEY_FIELDS),
+        TYPE_NOTE => Some(NOTE_FIELDS),
+        TYPE_FOLDER => Some(FOLDER_FIELDS),
+        TYPE_TAG => Some(TAG_FIELDS),
+        TYPE_NOTE_TAG => Some(NOTE_TAG_FIELDS),
+        TYPE_RESOURCE => Some(RESOURCE_FIELDS),
+        TYPE_MASTER_KEY => Some(MASTER_KEY_FIELDS),
         _ => None,
     }
 }
