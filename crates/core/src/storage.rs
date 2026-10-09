@@ -77,6 +77,11 @@ impl Storage {
                     resource_id TEXT PRIMARY KEY,
                     data BLOB NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS resource_fetch_times (
+                    resource_id TEXT PRIMARY KEY,
+                    fetched_time INT NOT NULL DEFAULT 0
+                );
                 "#,
             )
             .map_err(|e| Error::Storage(format!("migrate: {e}")))?;
@@ -215,6 +220,29 @@ impl Storage {
                 rusqlite::params![resource_id, data],
             )
             .map_err(|e| Error::Storage(format!("save blob: {e}")))?;
+        Ok(())
+    }
+
+    pub fn resource_fetched_time(&self, resource_id: &str) -> Result<i64> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT fetched_time FROM resource_fetch_times WHERE resource_id = ?1")
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let mut rows = stmt.query([resource_id]).map_err(|e| Error::Storage(e.to_string()))?;
+        if let Some(row) = rows.next().map_err(|e| Error::Storage(e.to_string()))? {
+            Ok(row.get(0).map_err(|e| Error::Storage(e.to_string()))?)
+        } else {
+            Ok(0)
+        }
+    }
+
+    pub fn set_resource_fetched_time(&self, resource_id: &str, t: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO resource_fetch_times (resource_id, fetched_time) VALUES (?1, ?2) ON CONFLICT(resource_id) DO UPDATE SET fetched_time=?2",
+                rusqlite::params![resource_id, t],
+            )
+            .map_err(|e| Error::Storage(format!("set fetch time: {e}")))?;
         Ok(())
     }
 

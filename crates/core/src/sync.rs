@@ -431,8 +431,13 @@ impl<'a> SyncEngine<'a> {
             if idx % 20 == 0 {
                 progress(&format!("resources {}/{}", idx + 1, total));
             }
-            if self.storage.resource_blob(&id)?.is_some() {
-                continue; // already downloaded
+            // Skip only when a blob is cached AND its blob_updated_time hasn't
+            // advanced since the last fetch.
+            let cached = self.storage.resource_blob(&id)?.is_some();
+            let blob_time = res.props.get("blob_updated_time").and_then(Value::as_i64).unwrap_or(0);
+            let fetched_at = self.storage.resource_fetched_time(&id)?;
+            if cached && fetched_at >= blob_time {
+                continue; // already downloaded and fresh
             }
             let path = format!(".resource/{id}");
             let raw = match self.client.get_text(&path).await? {
@@ -459,6 +464,7 @@ impl<'a> SyncEngine<'a> {
                 raw.into_bytes()
             };
             self.storage.save_resource_blob(&id, &data)?;
+            self.storage.set_resource_fetched_time(&id, crate::time_ms())?;
             downloaded += 1;
         }
         Ok((downloaded, pending, pending_errors))
