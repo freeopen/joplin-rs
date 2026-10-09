@@ -19,6 +19,9 @@ fn config_path() -> PathBuf {
 }
 
 fn data_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("JOPLIN_RS_DATA_DIR") {
+        return PathBuf::from(dir);
+    }
     dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("joplin-rs")
 }
 
@@ -190,7 +193,7 @@ impl eframe::App for App {
                 self.selected_folder = None;
                 self.load_notes();
             }
-            egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+            egui::ScrollArea::vertical().max_height(180.0).id_salt("folders").show(ui, |ui| {
                 let folders = self.folders.clone();
                 for folder in &folders {
                     let id = folder.props.get("id").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
@@ -203,7 +206,7 @@ impl eframe::App for App {
             });
             ui.separator();
             ui.heading("Notes");
-            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            egui::ScrollArea::vertical().auto_shrink(false).id_salt("notes").show(ui, |ui| {
                 let notes = self.notes.clone();
                 let note_tags = self.note_tags.clone();
                 for note in &notes {
