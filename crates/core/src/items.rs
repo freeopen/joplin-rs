@@ -396,7 +396,10 @@ mod tests {
     }
 
     #[test]
-    fn unescape_preserves_double_escapes() {
-        assert_eq!(unescape_prop("a\\nb\\\\nc"), "a\nb\\nc");
+    fn unserialize_skips_unknown_fields() {
+        let blob = "Note\n\nbody\n\nid: 0f1e2d3c4b5a69788796a5b4c3d2e1f0\nsome_unknown: 1\ntype_: 1";
+        let item = unserialize(blob).unwrap();
+        assert!(!item.props.contains_key("some_unknown"));
+        assert_eq!(item.body, "body");
     }
 }
