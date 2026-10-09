@@ -223,7 +223,17 @@ async function main() {
   const tag = { id: '3'.repeat(32), title: 'important', type_: 5, created_time: now, updated_time: now, encryption_cipher_text: '', encryption_applied: 0 };
   const noteTag = { id: '4'.repeat(32), note_id: note1.id, tag_id: tag.id, type_: 6, created_time: now, updated_time: now, encryption_cipher_text: '', encryption_applied: 0 };
 
-  const plainItems = [folder, note1, note2, tag, noteTag];
+  var resourceMeta = { id: '5'.repeat(32), title: 'pixel.png', mime: 'image/png', filename: 'pixel.png', file_extension: 'png', type_: 4, created_time: now, updated_time: now, encryption_blob_encrypted: 1 };
+
+  // Real-world-ish notes: long content (multi-chunk), escaped newlines in props,
+  // resource links, HTML markup_language, user_*_time fields
+  const longBody = Array.from({length: 4000}, (_, i) => `Paragraph line ${i} with some text to fill up the chunk boundary.Korean 한글 emoji 🎉 mixed in.`).join('\n\n');
+  const bigNote = { id: '6'.repeat(32), parent_id: folder.id, title: 'Big multi-chunk note', body: longBody, type_: 1, created_time: now, updated_time: now + 3000, user_created_time: now, user_updated_time: now + 3000, is_todo: 0, markup_language: 1, encryption_cipher_text: '', encryption_applied: 0 };
+  // Note with a resource link in body + application_data with newline escapes
+  const linkNote = { id: '7'.repeat(32), parent_id: folder.id, title: 'Note with image', body: 'Here is an image:\n\n![pixel.png](:/' + resourceMeta.id + ')\n\nEnd.', type_: 1, created_time: now, updated_time: now + 4000, user_created_time: now, user_updated_time: now + 4000, is_todo: 0, markup_language: 1, application_data: 'line1\\nline2', encryption_cipher_text: '', encryption_applied: 0 };
+  const htmlNote = { id: '8'.repeat(32), parent_id: folder.id, title: 'HTML note', body: '<h1>Title</h1><p>html body</p>', type_: 1, created_time: now, updated_time: now + 5000, user_created_time: now, user_updated_time: now + 5000, is_todo: 0, markup_language: 2, encryption_cipher_text: '', encryption_applied: 0 };
+
+  const plainItems = [folder, note1, note2, tag, noteTag, bigNote, linkNote, htmlNote];
   const vault = { info_json: null, items: {}, resources: {} };
 
   for (const item of plainItems) {
@@ -232,7 +242,6 @@ async function main() {
   }
 
   // Resource (image): FileV1-encrypted blob at .resource/{id}
-  const resourceMeta = { id: '5'.repeat(32), title: 'pixel.png', mime: 'image/png', filename: 'pixel.png', file_extension: 'png', type_: 4, created_time: now, updated_time: now, encryption_blob_encrypted: 1 };
   const resourceMetaSerialized = serializeItem(resourceMeta);
   vault.items[resourceMeta.id + '.md'] = await encryptItemString(resourceMetaSerialized);
 
@@ -264,6 +273,9 @@ async function main() {
     notes: [
       { id: note1.id, title: note1.title, body: note1.body, parent_id: folder.id },
       { id: note2.id, title: note2.title, body: note2.body, parent_id: folder.id, is_todo: 1 },
+      { id: bigNote.id, title: bigNote.title, body_len: [...longBody].length, parent_id: folder.id },
+      { id: linkNote.id, title: linkNote.title, body: linkNote.body, parent_id: folder.id, resource_link: ':/' + resourceMeta.id },
+      { id: htmlNote.id, title: htmlNote.title, body: htmlNote.body, parent_id: folder.id, markup_language: 2 },
     ],
     folders: [{ id: folder.id, title: folder.title }],
     tags: [{ id: tag.id, title: tag.title }],

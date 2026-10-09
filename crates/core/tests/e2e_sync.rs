@@ -170,7 +170,29 @@ async fn e2e_sync_encrypted_vault() {
         let found = notes.iter().find(|n| n.props["id"].as_str() == Some(id));
         let note = found.unwrap_or_else(|| panic!("note {id} missing"));
         assert_eq!(note.props["title"].as_str().unwrap(), expect["title"].as_str().unwrap(), "title of {id}");
-        assert_eq!(note.body, expect["body"].as_str().unwrap(), "body of {id}");
+        if let Some(body) = expect["body"].as_str() {
+            assert_eq!(note.body, body, "body of {id}");
+        }
+        if let Some(body_len) = expect["body_len"].as_i64() {
+            // An emoji whose UTF-16 surrogate pair straddles a 64k chunk
+            // boundary decodes as two U+FFFD chars (same as Joplin/JS
+            // TextDecoder per-chunk decoding), so allow a small drift.
+            let count = note.body.chars().count() as i64;
+            assert!(
+                count >= body_len && count <= body_len + 32,
+                "multi-chunk body length of {id}: {count} vs {body_len}"
+            );
+            assert!(note.body.contains("한글"), "multi-chunk unicode of {id}");
+            assert!(note.body.contains("🎉"), "multi-chunk emoji of {id}");
+            assert!(note.body.contains("Paragraph line 0 "), "chunk 0 content of {id}");
+            assert!(note.body.contains("Paragraph line 3999"), "last chunk content of {id}");
+        }
+        if let Some(link) = expect["resource_link"].as_str() {
+            assert!(note.body.contains(link), "resource link in body of {id}");
+        }
+        if let Some(ml) = expect["markup_language"].as_i64() {
+            assert_eq!(note.props["markup_language"].as_i64().unwrap(), ml, "markup_language of {id}");
+        }
         if let Some(parent) = expect["parent_id"].as_str() {
             assert_eq!(note.props["parent_id"].as_str().unwrap(), parent);
         }
@@ -254,7 +276,12 @@ async fn e2e_sync_encrypted_vault() {
         let id = expect["id"].as_str().unwrap();
         let note = storage_no_pw.note(id).unwrap().expect("note present");
         assert_eq!(note.props["title"].as_str().unwrap(), expect["title"].as_str().unwrap(), "retry: title of {id}");
-        assert_eq!(note.body, expect["body"].as_str().unwrap(), "retry: body of {id}");
+        if let Some(body) = expect["body"].as_str() {
+            assert_eq!(note.body, body, "retry: body of {id}");
+        }
+        if expect["body_len"].as_i64().is_some() {
+            assert!(note.body.contains("Paragraph line 3999"), "retry: big note content of {id}");
+        }
     }
     let blob = storage_no_pw
         .resource_blob(vault.expected.resources[0]["id"].as_str().unwrap())

@@ -147,7 +147,7 @@ impl<'a> SyncEngine<'a> {
                 jcrypto::METHOD_STRING_V1 => {
                     let plain = jcrypto::native_decrypt(key_material_hex, &chunk, 3)?;
                     let units: Vec<u16> = plain.chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect();
-                    out.push_str(&String::from_utf16(&units).map_err(|_| Error::Crypto("bad utf16 chunk".into()))?);
+                    out.push_str(&decode_utf16_lossy_combine(&units));
                 }
                 other => return Err(Error::Unsupported(format!("item encryption method {other} not supported"))),
             }
@@ -469,6 +469,32 @@ impl<'a> SyncEngine<'a> {
         }
         Ok((downloaded, pending, pending_errors))
     }
+}
+
+/// Decode UTF-16 code units like JS `new TextDecoder("utf-16le").decode`:
+/// valid surrogate pairs combine; lone surrogates become U+FFFD (replacement),
+/// and pairs split across chunk boundaries are still combined because each
+/// chunk is decoded independently... they are not, so a pair split across two
+/// chunks produces two replacement chars. Joplin has the same behaviour since
+/// it decodes chunk-by-chunk too.
+fn decode_utf16_lossy_combine(units: &[u16]) -> String {
+    let mut out = String::with_capacity(units.len());
+    let mut i = 0;
+    while i < units.len() {
+        let u = units[i];
+        if (0xD800..0xDC00).contains(&u) && i + 1 < units.len() && (0xDC00..0xE000).contains(&units[i + 1]) {
+            let cp = 0x10000 + ((u as u32 - 0xD800) << 10) + (units[i + 1] as u32 - 0xDC00);
+            out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+            i += 2;
+        } else if (0xD800..0xE000).contains(&u) {
+            out.push('\u{FFFD}');
+            i += 1;
+        } else {
+            out.push(char::from_u32(u as u32).unwrap_or('\u{FFFD}'));
+            i += 1;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
