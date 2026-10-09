@@ -21,8 +21,12 @@ A read-only Joplin client written in Rust:
     per item instead of failing the sync
 - Local storage: SQLite (`items` + `sync_items` + `kv` + `resource_blobs`)
 - CLI: `sync`, `doctor`, `list`, `show`, `export`
+- Encrypted-then-decrypt flow: sync without a password stores items
+  encrypted (`pending decryption`); a later sync with the password decrypts
+  and replaces them automatically
 - GUI (egui): notebook list, note list (todos/tags), full-text search,
-  Markdown rendering (GFM via egui_commonmark), background sync
+  Markdown rendering (GFM via egui_commonmark) with decrypted resource
+  images, in-app E2EE password field, background sync
 
 ## Build
 

@@ -36,22 +36,24 @@ struct App {
     note_body: String,
     note_title: String,
     search: String,
+    e2ee_password: String,
     status: String,
     sync_running: Arc<Mutex<bool>>,
     status_shared: Arc<Mutex<String>>,
+    resource_dir: PathBuf,
     note_tags: std::collections::HashMap<String, Vec<String>>, // note_id -> tag titles
 }
 
 impl App {
     fn new() -> Self {
         let storage = Storage::open(&data_dir().join("joplin-rs.db")).expect("open storage");
-        let config = std::fs::read_to_string(config_path())
+        let config: Config = std::fs::read_to_string(config_path())
             .ok()
             .and_then(|raw| toml::from_str(&raw).ok())
             .unwrap_or_default();
         let mut app = Self {
             storage,
-            config,
+            config: config.clone(),
             folders: Vec::new(),
             selected_folder: None,
             notes: Vec::new(),
@@ -59,9 +61,11 @@ impl App {
             note_body: String::new(),
             note_title: String::new(),
             search: String::new(),
+            e2ee_password: config.password.clone().unwrap_or_default(),
             status: "ready".into(),
             sync_running: Arc::new(Mutex::new(false)),
             status_shared: Arc::new(Mutex::new(String::new())),
+            resource_dir: PathBuf::new(),
             note_tags: Default::default(),
         };
         app.reload_meta();
@@ -103,7 +107,33 @@ impl App {
     fn open_note(&mut self, id: &str) {
         if let Ok(Some(note)) = self.storage.note(id) {
             self.note_title = note.props.get("title").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
-            self.note_body = note.body.clone();
+            let mut body = note.body.clone();
+            // Rewrite Joplin resource links ":/id" to decrypted temp files.
+            self.resource_dir = data_dir().join("resources");
+            let _ = std::fs::create_dir_all(&self.resource_dir);
+            let resource_ids = crate_resource_ids(&body);
+            for rid in resource_ids {
+                let mime = self
+                    .storage
+                    .resource(&rid)
+                    .ok()
+                    .flatten()
+                    .and_then(|r| r.props.get("mime").and_then(serde_json::Value::as_str).map(String::from));
+                let Some(data) = self.storage.resource_blob(&rid).ok().flatten() else { continue };
+                let ext = match mime.as_deref() {
+                    Some("image/png") => "png",
+                    Some("image/jpeg") => "jpg",
+                    Some("image/gif") => "gif",
+                    Some("image/svg+xml") => "svg",
+                    Some("image/webp") => "webp",
+                    _ => continue, // non-image resources stay as links
+                };
+                let path = self.resource_dir.join(format!("{rid}.{ext}"));
+                if std::fs::write(&path, &data).is_ok() {
+                    body = body.replace(&format!(":/{rid}"), &path.to_string_lossy());
+                }
+            }
+            self.note_body = body;
             self.selected_note = Some(id.to_string());
         }
     }
@@ -118,7 +148,11 @@ impl App {
         *self.sync_running.lock().unwrap() = true;
         self.status = "syncing...".into();
 
-        let config = self.config.clone();
+        let mut config = self.config.clone();
+        // Prefer the in-app password field over config.toml.
+        if !self.e2ee_password.is_empty() {
+            config.password = Some(self.e2ee_password.clone());
+        }
         let data_dir = data_dir();
         let status = self.status_shared.clone();
         let running = self.sync_running.clone();
@@ -160,6 +194,8 @@ impl eframe::App for App {
         // Top bar
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                ui.label("E2EE password:");
+                ui.add(egui::TextEdit::singleline(&mut self.e2ee_password).password(true).desired_width(140.0));
                 if ui.button("Sync").clicked() {
                     self.start_sync(ctx);
                 }
@@ -250,6 +286,27 @@ impl eframe::App for App {
             });
         });
     }
+}
+
+/// Extract Joplin resource ids referenced as ":/<32-hex>" in a note body.
+fn crate_resource_ids(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i + 34 <= bytes.len() {
+        if bytes[i] == b':' && bytes[i + 1] == b'/' {
+            let candidate = &body[i + 2..(i + 34).min(body.len())];
+            if candidate.len() == 32 && candidate.chars().all(|c| c.is_ascii_hexdigit()) {
+                if !out.contains(&candidate.to_string()) {
+                    out.push(candidate.to_string());
+                }
+                i += 34;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
 }
 
 fn main() -> eframe::Result {

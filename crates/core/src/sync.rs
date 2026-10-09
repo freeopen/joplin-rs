@@ -68,7 +68,12 @@ pub struct SyncOutcome {
     pub deleted: usize,
     pub skipped_unsupported: usize,
     pub resources_downloaded: usize,
+    /// Resources fetched but kept encrypted because no password was available.
+    pub resources_pending: usize,
     pub errors: Vec<String>,
+    /// Item ids stored in encrypted form that could not be decrypted (no
+    /// password). They are retried on the next sync once a password is given.
+    pub pending_decryption: Vec<String>,
 }
 
 /// Delta context persisted between syncs (basicDelta context).
@@ -173,14 +178,19 @@ impl<'a> SyncEngine<'a> {
 
     /// Run one sync pass. `password` is only needed for encrypted vaults.
     pub async fn sync(&self, password: Option<&str>, progress: &mut dyn FnMut(&str)) -> Result<SyncOutcome> {
-        let mut outcome = SyncOutcome { downloaded: 0, deleted: 0, skipped_unsupported: 0, resources_downloaded: 0, errors: Vec::new() };
+        let mut outcome = SyncOutcome { downloaded: 0, deleted: 0, skipped_unsupported: 0, resources_downloaded: 0, resources_pending: 0, errors: Vec::new(), pending_decryption: Vec::new() };
 
         progress("fetching info.json");
         let info = self.fetch_sync_info().await?;
 
+        // Encrypted vault without a password is allowed: items are stored in
+        // encrypted form (pending_decryption) and retried on a later sync once
+        // a password is provided. A WRONG password still fails hard.
         let key_material: Option<String> = if info.e2ee_enabled() {
-            let pw = password.ok_or_else(|| Error::Sync("vault is encrypted: password required".into()))?;
-            Some(self.unlock_master_key(&info, pw)?)
+            match password {
+                Some(pw) => Some(self.unlock_master_key(&info, pw)?),
+                None => None,
+            }
         } else {
             None
         };
@@ -271,31 +281,40 @@ impl<'a> SyncEngine<'a> {
             // serialized string was encrypted. Handle both:
             // 1. If the text starts with JED (fully encrypted), decrypt first.
             // 2. Otherwise parse, and decrypt encryption_cipher_text when present.
+            // When no password is available the raw blob is stored with
+            // `encryption_applied=1` so a later sync (with password) can retry.
             let final_item = if text.starts_with("JED") {
-                let km = key_material.as_ref().ok_or_else(|| {
+                let Some(km) = key_material.as_ref() else {
                     outcome.skipped_unsupported += 1;
-                    Error::Sync(format!("{}: encrypted but no password provided", stat.path))
-                });
-                match km {
-                    Ok(km) => match Self::decrypt_item_blob(&text, km) {
-                        Ok(plain) => match items::unserialize(&plain) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                outcome.errors.push(format!("{}: decrypt parse: {e}", stat.path));
-                                continue;
-                            }
-                        },
-                        Err(Error::Unsupported(msg)) => {
-                            outcome.skipped_unsupported += 1;
-                            outcome.errors.push(format!("{}: {}", stat.path, msg));
-                            continue;
-                        }
+                    outcome.pending_decryption.push(items::path_to_id(&stat.path));
+                    // Store a minimal encrypted placeholder so the id is tracked.
+                    let mut placeholder = items::unserialize(&format!(
+                        "{}\n\nid: {}\nencryption_applied: 1\ntype_: 1",
+                        "(encrypted)", items::path_to_id(&stat.path)
+                    ))?;
+                    placeholder.body = String::new();
+                    if let Err(e) = self.storage.upsert_item(&placeholder) {
+                        outcome.errors.push(format!("{}: store placeholder: {e}", stat.path));
+                    }
+                    continue;
+                };
+                match Self::decrypt_item_blob(&text, km) {
+                    Ok(plain) => match items::unserialize(&plain) {
+                        Ok(p) => p,
                         Err(e) => {
-                            outcome.errors.push(format!("{}: decrypt: {e}", stat.path));
+                            outcome.errors.push(format!("{}: decrypt parse: {e}", stat.path));
                             continue;
                         }
                     },
-                    Err(_) => continue,
+                    Err(Error::Unsupported(msg)) => {
+                        outcome.skipped_unsupported += 1;
+                        outcome.errors.push(format!("{}: {}", stat.path, msg));
+                        continue;
+                    }
+                    Err(e) => {
+                        outcome.errors.push(format!("{}: decrypt: {e}", stat.path));
+                        continue;
+                    }
                 }
             } else {
                 let parsed = match items::unserialize(&text) {
@@ -336,7 +355,7 @@ impl<'a> SyncEngine<'a> {
                         },
                         None => {
                             outcome.skipped_unsupported += 1;
-                            outcome.errors.push(format!("{}: encrypted but no password provided", stat.path));
+                            outcome.pending_decryption.push(items::path_to_id(&stat.path));
                             parsed
                         }
                     }
@@ -359,11 +378,38 @@ impl<'a> SyncEngine<'a> {
         context.deleted_items_processed = false;
         self.storage.kv_set("delta_context", &serde_json::to_string(&context).unwrap_or_default())?;
 
+        // ---- retry items that were stored encrypted (password now available) ----
+        if let Some(km) = &key_material {
+            let still_encrypted = self.storage.items_still_encrypted()?;
+            if !still_encrypted.is_empty() {
+                progress(&format!("retrying {} encrypted items", still_encrypted.len()));
+                for id in still_encrypted {
+                    let path = items::system_path(&id);
+                    let Some(text) = self.client.get_text(&path).await? else { continue };
+                    match Self::decrypt_item_blob(&text, km).and_then(|plain| items::unserialize(&plain)) {
+                        Ok(item) => {
+                            if let Err(e) = self.storage.upsert_item(&item) {
+                                outcome.errors.push(format!("{path}: store: {e}"));
+                            } else {
+                                self.storage.save_sync_time(&id, crate::time_ms(), 0)?;
+                                outcome.downloaded += 1;
+                            }
+                        }
+                        Err(e) => outcome.errors.push(format!("{path}: retry: {e}")),
+                    }
+                }
+            }
+        }
+
         // ---- resource prefetch ----
         if outcome.downloaded > 0 || self.storage.items_count(crate::items::TYPE_RESOURCE)? > 0 {
             progress("syncing resources");
             match self.sync_resources(key_material.as_deref(), progress).await {
-                Ok(n) => outcome.resources_downloaded = n,
+                Ok((n, pending, mut res_errors)) => {
+                    outcome.resources_downloaded = n;
+                    outcome.resources_pending = pending;
+                    outcome.errors.append(&mut res_errors);
+                }
                 Err(e) => outcome.errors.push(format!("resources: {e}")),
             }
         }
@@ -371,8 +417,10 @@ impl<'a> SyncEngine<'a> {
         Ok(outcome)
     }
 
-    async fn sync_resources(&self, key_material: Option<&str>, progress: &mut dyn FnMut(&str)) -> Result<usize> {
+    async fn sync_resources(&self, key_material: Option<&str>, progress: &mut dyn FnMut(&str)) -> Result<(usize, usize, Vec<String>)> {
         let mut downloaded = 0;
+        let mut pending = 0;
+        let mut pending_errors = Vec::new();
         let resources = self.storage.items_by_type(crate::items::TYPE_RESOURCE)?;
         let total = resources.len();
         for (idx, res) in resources.iter().enumerate() {
@@ -398,10 +446,14 @@ impl<'a> SyncEngine<'a> {
                         Ok(d) => d,
                         Err(e) => {
                             tracing::warn!("resource {id}: {e}");
+                            pending_errors.push(format!("resource {id}: {e}"));
                             continue;
                         }
                     },
-                    None => continue,
+                    None => {
+                        pending += 1;
+                        continue;
+                    }
                 }
             } else {
                 raw.into_bytes()
@@ -409,7 +461,7 @@ impl<'a> SyncEngine<'a> {
             self.storage.save_resource_blob(&id, &data)?;
             downloaded += 1;
         }
-        Ok(downloaded)
+        Ok((downloaded, pending, pending_errors))
     }
 }
 

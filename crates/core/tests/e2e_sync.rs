@@ -225,6 +225,43 @@ async fn e2e_sync_encrypted_vault() {
     // Local data intact
     assert!(storage.note(vault.expected.notes[0]["id"].as_str().unwrap()).unwrap().is_some());
 
+    // ---- No-password sync: items stored encrypted, then retried with password ----
+    files.lock().unwrap().insert("info.json".to_string(), vault.info_json.clone().into_bytes());
+    for (p_, c_) in &vault.items {
+        files.lock().unwrap().insert(p_.clone(), c_.as_bytes().to_vec());
+    }
+    for (p_, c_) in &vault.resources {
+        files.lock().unwrap().insert(p_.clone(), c_.as_bytes().to_vec());
+    }
+    let storage_no_pw = Storage::open_in_memory().unwrap();
+    let engine_no_pw = SyncEngine::new(&client, &storage_no_pw);
+    let outcome4 = engine_no_pw.sync(None, &mut |_| {}).await.expect("no-password sync should not fail");
+    assert!(outcome4.pending_decryption.len() >= vault.expected.notes.len(), "notes must be pending: {outcome4:?}");
+    assert_eq!(outcome4.resources_downloaded, 0, "no resource plaintext without password");
+    // Encrypted notes must NOT expose plaintext
+    for expect in &vault.expected.notes {
+        let id = expect["id"].as_str().unwrap();
+        let note = storage_no_pw.note(id).unwrap().expect("placeholder stored");
+        let title = note.props.get("title").and_then(Value::as_str).unwrap_or("");
+        assert_ne!(title, expect["title"].as_str().unwrap(), "title must not be plaintext without password");
+        assert!(note.body.is_empty() || !note.body.contains(expect["body"].as_str().unwrap().split('\n').next().unwrap()));
+    }
+
+    // Retry with password on the same storage: everything decrypts.
+    let outcome5 = engine_no_pw.sync(Some(&vault.password), &mut |_| {}).await.expect("retry sync failed");
+    assert!(outcome5.downloaded >= vault.expected.notes.len(), "retry must decrypt pending items: {outcome5:?}");
+    for expect in &vault.expected.notes {
+        let id = expect["id"].as_str().unwrap();
+        let note = storage_no_pw.note(id).unwrap().expect("note present");
+        assert_eq!(note.props["title"].as_str().unwrap(), expect["title"].as_str().unwrap(), "retry: title of {id}");
+        assert_eq!(note.body, expect["body"].as_str().unwrap(), "retry: body of {id}");
+    }
+    let blob = storage_no_pw
+        .resource_blob(vault.expected.resources[0]["id"].as_str().unwrap())
+        .unwrap()
+        .expect("resource decrypted on retry");
+    assert_eq!(&blob[..8], b"\x89PNG\r\n\x1a\n", "resource must decrypt on retry");
+
     // ---- Wrong password must fail with a crypto error ----
     // (restore the remote info.json; the failsafe step cleared everything)
     files.lock().unwrap().insert("info.json".to_string(), vault.info_json.clone().into_bytes());

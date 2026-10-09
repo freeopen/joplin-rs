@@ -332,6 +332,22 @@ impl Storage {
         Ok(None)
     }
 
+    /// Ids of items that are stored in encrypted form (no plaintext available).
+    pub fn items_still_encrypted(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM items WHERE encryption_applied = 1")
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| Error::Storage(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
     /// Count items of a type (including deleted) - used to decide resource prefetch.
     pub fn items_count(&self, t: i64) -> Result<usize> {
         let mut stmt = self

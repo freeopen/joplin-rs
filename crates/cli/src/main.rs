@@ -126,9 +126,12 @@ async fn main() -> Result<()> {
                 })
                 .await?;
             println!(
-                "done: {} downloaded, {} deleted, {} resources, {} unsupported",
-                outcome.downloaded, outcome.deleted, outcome.resources_downloaded, outcome.skipped_unsupported
+                "done: {} downloaded, {} deleted, {} resources, {} unsupported, {} pending decryption",
+                outcome.downloaded, outcome.deleted, outcome.resources_downloaded, outcome.skipped_unsupported, outcome.pending_decryption.len()
             );
+            if !outcome.pending_decryption.is_empty() {
+                println!("items stored encrypted - run sync again with the E2EE password to decrypt them");
+            }
             if !outcome.errors.is_empty() {
                 eprintln!("{} errors:", outcome.errors.len());
                 for e in &outcome.errors {
