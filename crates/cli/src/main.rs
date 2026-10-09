@@ -160,10 +160,10 @@ async fn main() -> Result<()> {
         }
         Command::List { item_type, folder, query } => {
             let storage = db(cli)?;
-            let t = type_from_str(&item_type)?;
+            let t = type_from_str(item_type)?;
             let items: Vec<joplin_rs_core::items::Item> = if t == joplin_rs_core::items::TYPE_NOTE {
                 if let Some(q) = query {
-                    storage.search_notes(&q)?
+                    storage.search_notes(q)?
                 } else {
                     storage.notes(folder.as_deref().unwrap_or(""), true)?
                 }
@@ -187,7 +187,7 @@ async fn main() -> Result<()> {
         }
         Command::Show { id } => {
             let storage = db(cli)?;
-            let note = storage.note(&id)?.context("note not found")?;
+            let note = storage.note(id)?.context("note not found")?;
             let title = note.props.get("title").and_then(serde_json::Value::as_str).unwrap_or("");
             println!("{title}");
             println!("{}", "=".repeat(title.len()));
@@ -195,12 +195,12 @@ async fn main() -> Result<()> {
         }
         Command::Export { id, output } => {
             let storage = db(cli)?;
-            let note = storage.note(&id)?.context("note not found")?;
+            let note = storage.note(id)?.context("note not found")?;
             let title = note.props.get("title").and_then(serde_json::Value::as_str).unwrap_or("note");
             let content = format!("# {title}\n\n{}", note.body);
             match output {
                 Some(path) => {
-                    std::fs::write(&path, content).context("write output")?;
+                    std::fs::write(path, content).context("write output")?;
                     println!("wrote {}", path.display());
                 }
                 None => {

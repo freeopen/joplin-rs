@@ -10,8 +10,9 @@ path = "src/main.rs"
 
 [dependencies]
 joplin-rs-core = { workspace = true }
-eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
-egui = "0.33"
+tokio = { workspace = true }
+eframe = { version = "0.32", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.32"
 egui_commonmark = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
