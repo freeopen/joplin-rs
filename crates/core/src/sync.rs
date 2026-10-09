@@ -122,17 +122,34 @@ impl<'a> SyncEngine<'a> {
             .iter()
             .find(|k| k.id == key_id)
             .ok_or_else(|| Error::Sync(format!("master key {key_id} not found in info.json")))?;
-        match mk.encryption_method {
+        let hex_str = match mk.encryption_method {
             jcrypto::METHOD_KEY_V1 => {
                 let plain = jcrypto::native_decrypt(password, &mk.content, 220000)?;
-                let hex_str = String::from_utf8(plain).map_err(|_| Error::Crypto("master key not utf8".into()))?;
-                if hex_str.len() != 512 || !hex_str.chars().all(|c| c.is_ascii_hexdigit()) {
-                    return Err(Error::Crypto("decrypted master key has unexpected format".into()));
-                }
-                Ok(hex_str)
+                String::from_utf8(plain).map_err(|_| Error::Crypto("master key not utf8".into()))?
             }
-            other => Err(Error::Unsupported(format!("master key encryption method {other} not supported (only password/KeyV1)"))),
+            // Legacy SJCL password master keys (very common in real vaults).
+            // SJCL1a/1b are the modern variants (AES-CCM, escape()'d payload).
+            jcrypto::METHOD_SJCL1A | jcrypto::METHOD_SJCL1B => {
+                let params = jcrypto::parse_sjcl(&mk.content)?;
+                let plain = jcrypto::sjcl_ccm_decrypt(password, &params)?;
+                let escaped = String::from_utf8(plain).map_err(|_| Error::Crypto("master key not utf8".into()))?;
+                jcrypto::sjcl_unescape(&escaped)?
+            }
+            jcrypto::METHOD_SJCL3 | jcrypto::METHOD_SJCL4 => {
+                let params = jcrypto::parse_sjcl(&mk.content)?;
+                let plain = jcrypto::sjcl_ccm_decrypt(password, &params)?;
+                String::from_utf8(plain).map_err(|_| Error::Crypto("master key not utf8".into()))?
+            }
+            other => {
+                return Err(Error::Unsupported(format!(
+                    "master key encryption method {other} not supported (need a password master key: KeyV1/SJCL)"
+                )))
+            }
+        };
+        if hex_str.len() != 512 || !hex_str.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(Error::Crypto("decrypted master key has unexpected format".into()));
         }
+        Ok(hex_str)
     }
 
     /// Decrypt an item blob (JED01 container) with the given key material.
@@ -148,6 +165,19 @@ impl<'a> SyncEngine<'a> {
                     let plain = jcrypto::native_decrypt(key_material_hex, &chunk, 3)?;
                     let units: Vec<u16> = plain.chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect();
                     out.push_str(&decode_utf16_lossy_combine(&units));
+                }
+                // Legacy SJCL item chunks: the chunk is an SJCL JSON blob whose
+                // plaintext is (for 1a/1b) escape()'d UTF-8 text.
+                jcrypto::METHOD_SJCL | jcrypto::METHOD_SJCL1A | jcrypto::METHOD_SJCL1B
+                | jcrypto::METHOD_SJCL2 | jcrypto::METHOD_SJCL3 | jcrypto::METHOD_SJCL4 => {
+                    let params = jcrypto::parse_sjcl(&chunk)?;
+                    let plain = jcrypto::sjcl_ccm_decrypt(key_material_hex, &params)?;
+                    let text = String::from_utf8(plain).map_err(|_| Error::Crypto("sjcl item not utf8".into()))?;
+                    if header.method == jcrypto::METHOD_SJCL1A || header.method == jcrypto::METHOD_SJCL1B {
+                        out.push_str(&jcrypto::sjcl_unescape(&text)?);
+                    } else {
+                        out.push_str(&text);
+                    }
                 }
                 other => return Err(Error::Unsupported(format!("item encryption method {other} not supported"))),
             }

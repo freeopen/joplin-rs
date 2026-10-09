@@ -1,0 +1,28 @@
+{
+  "info_json": "{\n\t\"version\": 3,\n\t\"e2ee\": {\n\t\t\"value\": true,\n\t\t\"updatedTime\": 1717243200000\n\t},\n\t\"activeMasterKeyId\": {\n\t\t\"value\": \"cc1be39eca87e6a9f95efde820e6575f\",\n\t\t\"updatedTime\": 1717243200000\n\t},\n\t\"masterKeys\": [\n\t\t{\n\t\t\t\"id\": \"cc1be39eca87e6a9f95efde820e6575f\",\n\t\t\t\"created_time\": 1717243200000,\n\t\t\t\"updated_time\": 1717243200000,\n\t\t\t\"source_application\": \"net.cozic.joplin-desktop\",\n\t\t\t\"encryption_method\": 4,\n\t\t\t\"checksum\": \"\",\n\t\t\t\"content\": \"{\\\"iv\\\":\\\"bZDvRHhLriprckF3EpZUtw==\\\",\\\"v\\\":1,\\\"iter\\\":10000,\\\"ks\\\":256,\\\"ts\\\":64,\\\"mode\\\":\\\"ccm\\\",\\\"adata\\\":\\\"\\\",\\\"cipher\\\":\\\"aes\\\",\\\"salt\\\":\\\"yCQGwJLHX+k=\\\",\\\"ct\\\":\\\"wuUuH95JxNyNLWYJWTviyCkztvZh4nX/wbw78ubGs1Q9sa7exejigVl8iUh0dYT357RmX9lPXCIENIJFdMEXEC8VJOkYFhc5IVyQRQXn/+4Nod24JJCO+nvNqmT+xwLkn+/qf6wfYM28es2QneY4IAh/addbD5Jk3fxmt4j7rUFzwYc2C+O/CDIcmOrHR3wFuviwlgwRLj0Hbul1uve5xpEmBNlICq9ytlbTZipTY2RLzad5d4GCkjt/3O6eE6mnS/8aXeV+tVWjE+f2Km4Tgij3M1z02DHsE10O04ejfy7TO5BAACYKYVUCJA+TXFGlvd8DZQVE/6EycXyA21t57BlcMpHDQeZADliaWgPY+Ht78S5MltHY+08jTFFg4vLDVMuejMGxw6ag3c0IX1APkCCUHLfrIMrZmNZCxU16UPt6q16OlsmH+07L0ecgHBTMRUOdo0jx5khX3dzIO1Uwqthg8Tv3X6uPyVpf7G0Dym0TgsSiV4u2tpUg1JP2aWsNFudf28oULpIla/K/DKQwEqVMBmSmnGokn2o/kfrVFHBm0H9Bc9+dBmN+fhLor4qGrD9F+Evzoprgm7KzvOKKslHKWDV9Qzuq0dJUwuTyh48qxakANSfjCRDxuJRo4he0hVEa9AbaUKFrdwn6mavi0gc5PE3OKuoh4C03oXpQpsMMPhWPCuTlNw==\\\"}\"\n\t\t}\n\t],\n\t\"ppk\": {\n\t\t\"value\": null\n\t},\n\t\"appMinVersion\": \"3.7.0\"\n}",
+  "items": {
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.md": "JED0100002207cc1be39eca87e6a9f95efde820e6575f0001cc{\"iv\":\"vwMNy1D+b9z6IQ5VpG1xGw==\",\"v\":1,\"iter\":101,\"ks\":256,\"ts\":64,\"mode\":\"ccm\",\"adata\":\"\",\"cipher\":\"aes\",\"salt\":\"7pEzn7cDLNM=\",\"ct\":\"s3wNQvA2NppAYyAf5Pb4Xa42OIvH5bn7QjSJKf3G9dN1h0wbKCj7aJy1uOY78kaIMJ9D5L/2CJgQN2plWnxQE6WoTnTDa5/X8n14mZc4Oh2/vvlPn36hl6q/edV1/dig47pGPV3AjPA7RwL5d0SFJ9ed26DKsCj2Gy0vcDA88CLcMTY8DQD9Lo19O6OzvyMsCIEUnSygN4zZq/Ll8Vd+T5ur2X3sFnGyURkODon5ZfVsbr3dp9mI4V5hhCSis7+fHT8uuQegQXUnwxAPQYYKRjQscIGo21Fk98kyMA8spXgGRieSDq9wXlWb6dBtah6js3+3\"}",
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.md": "JED0100002207cc1be39eca87e6a9f95efde820e6575f00035c{\"iv\":\"H2LtQdo/zLYK+R4bTmBzOg==\",\"v\":1,\"iter\":101,\"ks\":256,\"ts\":64,\"mode\":\"ccm\",\"adata\":\"\",\"cipher\":\"aes\",\"salt\":\"7pEzn7cDLNM=\",\"ct\":\"VO7XyuHEUp+Gy8rrRH/07cdoedcNzj7zV2e4rMrn8B8ucRIEHGLDwA9b2IcnmrVVWt2RypXU2of2pemQlB+HySCgOmoNRMA9C0+Bl0SMhcVcxJF/V7NOIDl9mGCSXJmFtzygT8xzbkah4lNeLhPc8EHeJL2WT7v4mpARPj2N2deTDTzPcybrNtnCJ8NFMYyb7QOuiPL2Q65yztIxXa69flyzrNBspj4qmvoYzIOhWM9Oovg1/PDowuEHwsX1H1UjmPfbK5slyayXyrNUQ7FgWYrP+b+jN4QZYy6eR2WrU/nj3JAKFIOEBt241eTSTIxOjRFpEqDu7jl1nyABPKteYzI99buOuCLs0GtGwSuygBGHPoEF207BDFK+DOgamV9cKIrL6BTRUtbwdVnIR5tHi1MCCuwH20D40f2mqWLN8JUsdSRtZemVdMpGhwhexf8WEYhkC9wJ6DRP2GCSYsVyypNdPEBdtCszbOI6pR13/TfLo5Ve0hpuBsv1De4vkebC9j0o1qBK/uxOkGv+VNnVJn1Ap73nwuistypors696ml/xk7/+r0TpYlSprQUAePzVM2gnQxxgZXjIceff1c5i2eaBcdhDaGrVInCgknkdCYFI7psmDDkHutju4727wg+HdbwPojbeVpfsF+9kJPt9GlYWv+i+8SIglQsaJ1LD5K9oNwKywIGV06Bnxs0+XLmaMK4Hi/4GEKuBx8ddRY=\"}"
+  },
+  "resources": {},
+  "password": "legacy-pw",
+  "expected": {
+    "notes": [
+      {
+        "id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "title": "Legacy SJCL note",
+        "body": "Encrypted with the old SJCL scheme\n\nUnicode: 你好 🎉",
+        "parent_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    ],
+    "folders": [
+      {
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "title": "Legacy Notebook"
+      }
+    ],
+    "tags": [],
+    "noteTags": [],
+    "resources": []
+  }
+}

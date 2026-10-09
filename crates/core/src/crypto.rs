@@ -26,6 +26,7 @@ pub const METHOD_SJCL2: i64 = 2;
 pub const METHOD_SJCL3: i64 = 3;
 pub const METHOD_SJCL4: i64 = 4;
 pub const METHOD_SJCL1A: i64 = 5;
+pub const METHOD_SJCL1B: i64 = 7;
 pub const METHOD_KEY_V1: i64 = 8;
 pub const METHOD_FILE_V1: i64 = 9;
 pub const METHOD_STRING_V1: i64 = 10;

@@ -287,6 +287,70 @@ async function main() {
   fs.writeFileSync(vaultPath, JSON.stringify(vault, null, 2));
   console.log('Wrote', vaultPath, '-', Object.keys(vault.items).length, 'items,', Object.keys(vault.resources).length, 'resources');
 
+  // ---- SJCL4 master key (as used by real Joplin vaults; method 4) ----
+  const sjclMasterKeyPassword = 'sjcl-master-pw';
+  const sjclKeyMaterial = Buffer.from(crypto.getRandomValues(new Uint8Array(256))).toString('hex');
+  const sjclMasterKeyContent = sjcl.json.encrypt(sjclMasterKeyPassword, sjclKeyMaterial, {
+    v: 1, iter: 10000, ks: 256, ts: 64, mode: 'ccm', cipher: 'aes',
+  });
+  fixtures.sjclMasterKeys = [
+    { password: sjclMasterKeyPassword, keyMaterial: sjclKeyMaterial, encryptionMethod: 4, content: sjclMasterKeyContent },
+  ];
+  // SJCL1b master key variant (method 7)
+  const sjcl1bPassword = 'sjcl1b-master-pw';
+  const sjcl1bKeyMaterial = Buffer.from(crypto.getRandomValues(new Uint8Array(256))).toString('hex');
+  const sjcl1bContent = sjcl.json.encrypt(sjcl1bPassword, escape(sjcl1bKeyMaterial), {
+    v: 1, iter: 101, ks: 256, ts: 64, mode: 'ccm', cipher: 'aes',
+  });
+  fixtures.sjclMasterKeys.push({ password: sjcl1bPassword, keyMaterial: sjcl1bKeyMaterial, encryptionMethod: 7, content: sjcl1bContent });
+
+  // ---- Legacy SJCL vault (as produced by real Joplin 1.x/2.x vaults) ----
+  // Master key: SJCL4 (method 4). Items: SJCL1b (method 7) with escape()'d text.
+  const legacyPassword = 'legacy-pw';
+  const legacyKeyMaterial = Buffer.from(crypto.getRandomValues(new Uint8Array(256))).toString('hex');
+  const legacyMasterKeyId = Buffer.from(crypto.getRandomValues(new Uint8Array(16))).toString('hex');
+  const legacyMasterKeyContent = sjcl.json.encrypt(legacyPassword, legacyKeyMaterial, {
+    v: 1, iter: 10000, ks: 256, ts: 64, mode: 'ccm', cipher: 'aes',
+  });
+
+  function sjclItemHeader(method, masterKeyId) {
+    let metadata = method.toString(16).padStart(2, '0') + masterKeyId;
+    metadata = metadata.length.toString(16).padStart(6, '0') + metadata;
+    return 'JED01' + metadata;
+  }
+
+  function sjclEncryptItemString(method, plainText) {
+    // Joplin chunks SJCL item payloads by 5000 chars.
+    let out = sjclItemHeader(method, legacyMasterKeyId);
+    for (let i = 0; i < plainText.length; i += 5000) {
+      const block = plainText.substring(i, i + 5000);
+      const cipher = method === 7 || method === 5
+        ? sjcl.json.encrypt(legacyKeyMaterial, escape(block), { v: 1, iter: 101, ks: 256, ts: 64, mode: 'ccm', cipher: 'aes' })
+        : sjcl.json.encrypt(legacyKeyMaterial, block, { v: 1, iter: 10000, ks: 256, ts: 64, mode: 'ccm', cipher: 'aes' });
+      out += cipher.length.toString(16).padStart(6, '0') + cipher;
+    }
+    return out;
+  }
+
+  const legacyFolder = { id: 'a'.repeat(32), title: 'Legacy Notebook', type_: 2, created_time: now, updated_time: now, encryption_cipher_text: '', encryption_applied: 0 };
+  const legacyNote = { id: 'b'.repeat(32), parent_id: legacyFolder.id, title: 'Legacy SJCL note', body: 'Encrypted with the old SJCL scheme\n\nUnicode: 你好 🎉', type_: 1, created_time: now, updated_time: now + 100, user_created_time: now, user_updated_time: now + 100, is_todo: 0, markup_language: 1, encryption_cipher_text: '', encryption_applied: 0 };
+
+  const legacyVault = { info_json: null, items: {}, resources: {}, password: legacyPassword, expected: { notes: [], folders: [], tags: [], noteTags: [], resources: [] } };
+  legacyVault.items[legacyFolder.id + '.md'] = sjclEncryptItemString(7, serializeItem(legacyFolder));
+  legacyVault.items[legacyNote.id + '.md'] = sjclEncryptItemString(7, serializeItem(legacyNote));
+  legacyVault.expected.folders.push({ id: legacyFolder.id, title: legacyFolder.title });
+  legacyVault.expected.notes.push({ id: legacyNote.id, title: legacyNote.title, body: legacyNote.body, parent_id: legacyFolder.id });
+  legacyVault.info_json = JSON.stringify({
+    version: 3,
+    e2ee: { value: true, updatedTime: now },
+    activeMasterKeyId: { value: legacyMasterKeyId, updatedTime: now },
+    masterKeys: [{ id: legacyMasterKeyId, created_time: now, updated_time: now, source_application: 'net.cozic.joplin-desktop', encryption_method: 4, checksum: '', content: legacyMasterKeyContent }],
+    ppk: { value: null },
+    appMinVersion: '3.7.0',
+  }, null, '\t');
+  fs.writeFileSync(path.join(outDir, 'legacy_vault.json'), JSON.stringify(legacyVault, null, 2));
+  console.log('Wrote legacy_vault.json -', Object.keys(legacyVault.items).length, 'items');
+
   const outPath = path.join(outDir, 'crypto_fixtures.json');
   fs.writeFileSync(outPath, JSON.stringify(fixtures, null, 2));
   console.log('Wrote', outPath);

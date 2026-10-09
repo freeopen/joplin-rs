@@ -13,10 +13,12 @@ A read-only Joplin client written in Rust:
   initial download, incremental sync via timestamp context, deletion
   detection with a 90% fail-safe.
 - E2EE decryption:
-  - master keys: `KeyV1` (PBKDF2-HMAC-SHA512 x220k + AES-256-GCM), password-based
+  - master keys: `KeyV1` (PBKDF2-HMAC-SHA512 x220k + AES-256-GCM) and the legacy
+    `SJCL1a/1b/3/4` password master keys used by real Joplin 1.x/2.x vaults
   - item blobs: `StringV1` (JED01 container, chunked)
   - resource blobs: `FileV1`
   - legacy `SJCL1a/1b/3/4` items (AES-CCM, byte-exact port of sjcl's mode)
+  - item payloads encrypted with legacy SJCL (method 1a/1b/3/4) as well as `StringV1`
   - `SJCL`/`SJCL2` (OCB2) and PPK (RSA) master keys are reported as unsupported
     per item instead of failing the sync
 - Local storage: SQLite (`items` + `sync_items` + `kv` + `resource_blobs`)

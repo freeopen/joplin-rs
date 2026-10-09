@@ -11,7 +11,18 @@ struct Fixtures {
     sjcl: Vec<SjclCase>,
     native: Vec<NativeCase>,
     master_keys: Vec<MasterKeyCase>,
+    #[serde(default)]
+    sjcl_master_keys: Vec<SjclMasterKeyCase>,
     items: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SjclMasterKeyCase {
+    password: String,
+    key_material: String,
+    encryption_method: i64,
+    content: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -166,5 +177,50 @@ fn serialization_cases() {
         if let Some(applied) = expect.get("encryption_applied").and_then(|v| v.as_i64()) {
             assert_eq!(parsed.props["encryption_applied"].as_i64().unwrap(), applied);
         }
+    }
+}
+
+/// Real Joplin vaults commonly use SJCL (method 4) master keys rather than
+/// KeyV1. The sync engine's unlock path must handle both.
+#[test]
+fn sjcl_master_key_unlock_cases() {
+    use joplin_rs_core::storage::Storage;
+    use joplin_rs_core::sync::{MasterKeyEntity, SyncEngine, SyncInfo};
+    use joplin_rs_core::webdav::WebDavClient;
+
+    let fixtures = load();
+    assert!(!fixtures.sjcl_master_keys.is_empty(), "SJCL master key fixtures missing");
+    let storage = Storage::open_in_memory().unwrap();
+    let client = WebDavClient::new("http://localhost:1/", "u", "p").unwrap();
+    let engine = SyncEngine::new(&client, &storage);
+
+    for case in &fixtures.sjcl_master_keys {
+        let info = SyncInfo {
+            version: 3,
+            e2ee: Some(serde_json::json!({"value": true})),
+            active_master_key_id: Some(serde_json::json!({"value": "mk1"})),
+            master_keys: vec![MasterKeyEntity {
+                id: "mk1".into(),
+                created_time: 0,
+                updated_time: 0,
+                source_application: "test".into(),
+                encryption_method: case.encryption_method,
+                checksum: String::new(),
+                content: case.content.clone(),
+            }],
+            ppk: None,
+            app_min_version: None,
+        };
+        let key = engine
+            .unlock_master_key(&info, &case.password)
+            .unwrap_or_else(|e| panic!("method {}: {e}", case.encryption_method));
+        assert_eq!(key, case.key_material, "method {} key material", case.encryption_method);
+
+        // Wrong password must fail for SJCL too.
+        assert!(
+            engine.unlock_master_key(&info, "definitely-wrong").is_err(),
+            "method {} wrong password should fail",
+            case.encryption_method
+        );
     }
 }
