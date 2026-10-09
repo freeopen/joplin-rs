@@ -13,7 +13,7 @@ reqwest = { workspace = true }
 url = { workspace = true }
 rusqlite = { workspace = true }
 aes-gcm = { workspace = true }
-ccm = { workspace = true }
+aes = { workspace = true }
 pbkdf2 = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }

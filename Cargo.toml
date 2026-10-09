@@ -18,8 +18,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 url = "2"
 rusqlite = { version = "0.37", features = ["bundled"] }
 aes-gcm = "0.10"
-ccm = "0.10"
-pbkdf2 = { version = "0.12", default-features = false }
+aes = "0.8"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 hmac = "0.12"
 sha2 = "0.10"
 rsa = { version = "0.9", features = ["sha2"] }
