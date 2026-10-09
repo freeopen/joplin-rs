@@ -94,9 +94,14 @@ impl Storage {
         let title = get_str("title");
         let parent_id = get_str("parent_id");
         let body = if item.item_type == crate::items::TYPE_NOTE { item.body.clone() } else { String::new() };
+        // Store the body inside the payload too so items round-trip when read back.
+        let mut payload_props = item.props.clone();
+        if item.item_type == crate::items::TYPE_NOTE {
+            payload_props.insert("body".to_string(), Value::String(body.clone()));
+        }
         // Searchable text: body + title. For encrypted notes, no plaintext.
         let body_text = format!("{}\n{}", title, body);
-        let payload = serde_json::to_string(&item.props).map_err(|e| Error::Storage(format!("payload: {e}")))?;
+        let payload = serde_json::to_string(&payload_props).map_err(|e| Error::Storage(format!("payload: {e}")))?;
         self.conn
             .execute(
                 r#"INSERT INTO items (id, type_, parent_id, title, body, created_time, updated_time, deleted_time,
@@ -278,10 +283,11 @@ impl Storage {
             let payload: String = row.map_err(|e| Error::Storage(e.to_string()))?;
             let props: serde_json::Map<String, Value> =
                 serde_json::from_str(&payload).map_err(|e| Error::Storage(format!("payload parse: {e}")))?;
+            let body = props.get("body").and_then(Value::as_str).unwrap_or_default().to_string();
             out.push(Item {
                 item_type: crate::items::TYPE_NOTE,
                 props: props.into_iter().collect(),
-                body: props.get("body").and_then(Value::as_str).unwrap_or_default().to_string(),
+                body,
             });
         }
         Ok(out)
@@ -339,10 +345,11 @@ impl Storage {
             let payload: String = row.map_err(|e| Error::Storage(e.to_string()))?;
             let props: serde_json::Map<String, Value> =
                 serde_json::from_str(&payload).map_err(|e| Error::Storage(format!("payload parse: {e}")))?;
+            let body = props.get("body").and_then(Value::as_str).unwrap_or_default().to_string();
             out.push(Item {
                 item_type: crate::items::TYPE_NOTE,
                 props: props.into_iter().collect(),
-                body: props.get("body").and_then(Value::as_str).unwrap_or_default().to_string(),
+                body,
             });
         }
         Ok(out)

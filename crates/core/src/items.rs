@@ -270,48 +270,6 @@ fn escape_prop(s: &str) -> String {
         .replace('\r', "\\r")
 }
 
-fn unescape_prop(s: &str) -> String {
-    // Mirrors unserialize_format ordering (str.replace is sequential in JS;
-    // here we emulate with a single pass scanner for exactness).
-    let bytes: Vec<char> = s.chars().collect();
-    let mut out = String::with_capacity(s.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == '\\' && i + 1 < bytes.len() {
-            match bytes[i + 1] {
-                'n' => {
-                    out.push('\n');
-                    i += 2;
-                }
-                'r' => {
-                    out.push('\r');
-                    i += 2;
-                }
-                '\\' => {
-                    out.push('\\');
-                    // JS: '\\n' -> '\n' literal backslash-n. Handle double escapes:
-                    if i + 2 < bytes.len() && bytes[i + 2] == 'n' {
-                        out.push('n');
-                        i += 3;
-                    } else if i + 2 < bytes.len() && bytes[i + 2] == 'r' {
-                        out.push('r');
-                        i += 3;
-                    } else {
-                        i += 2;
-                    }
-                }
-                other => {
-                    out.push(other);
-                    i += 2;
-                }
-            }
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    out
-}
 
 /// Unserialize an item blob (BaseItem.unserialize).
 pub fn unserialize(content: &str) -> Result<Item> {
@@ -358,7 +316,9 @@ pub fn unserialize(content: &str) -> Result<Item> {
     if let Some(end) = body_end {
         let mut body_lines: Vec<&str> = lines[..end].to_vec();
         if !body_lines.is_empty() {
-            body_lines.remove(0); // title
+            let title = body_lines.remove(0); // title is the first line
+            // TS unserialize sets output.title from the first body line for all items.
+            out_props.entry("title".to_string()).or_insert_with(|| Value::String(title.to_string()));
             // Skip the blank line between title and body.
             while body_lines.first().is_some_and(|l| l.trim().is_empty()) {
                 body_lines.remove(0);

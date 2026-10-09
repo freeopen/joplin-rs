@@ -37,15 +37,6 @@ pub struct EncryptionHeader {
     pub master_key_id: String,
 }
 
-fn left_pad(s: &str, len: usize, c: char) -> String {
-    let mut out = String::with_capacity(len.max(s.len()));
-    for _ in 0..(len - s.len().min(len)) {
-        out.push(c);
-    }
-    out.push_str(s);
-    out
-}
-
 fn is_valid_header_identifier(id: &str) -> bool {
     id.len() == 5 && id.starts_with("JED") && id.ends_with("01")
 }
@@ -198,14 +189,14 @@ pub fn parse_sjcl(json: &str) -> Result<SjclParams> {
     })
 }
 
-/// Decrypt an SJCL AES-CCM payload. `plaintext_encoding` describes how the
-/// resulting bytes are interpreted by Joplin (utf8 for plain SJCL, latin1 for
-/// escape()'d 1a/1b).
+/// Decrypt an SJCL AES-CCM payload. Mirrors sjcl.mode.ccm: the stored 16-byte
+/// iv is truncated to a (15-L)-byte nonce where L is the byte length of the
+/// message length field (2..4, chosen from the plaintext size).
 pub fn sjcl_ccm_decrypt(password: &str, params: &SjclParams) -> Result<Vec<u8>> {
     if params.mode != "ccm" {
         return Err(Error::Unsupported(format!("sjcl mode {} not supported", params.mode)));
     }
-    if params.cipher != "aes" || params.ks != 128 && params.ks != 256 {
+    if params.cipher != "aes" || (params.ks != 128 && params.ks != 256) {
         return Err(Error::Crypto(format!("unsupported sjcl cipher {} ks {}", params.cipher, params.ks)));
     }
 
@@ -213,9 +204,28 @@ pub fn sjcl_ccm_decrypt(password: &str, params: &SjclParams) -> Result<Vec<u8>> 
     let mut key = vec![0u8; key_len];
     pbkdf2::pbkdf2_hmac::<sha2::Sha256>(password.as_bytes(), &params.salt, params.iter, &mut key);
 
+    // sjcl.mode.ccm.encrypt: iv must be >= 7 bytes; L (called f) = smallest
+    // number of bytes needed for the message length, then clamped up so the
+    // nonce is at most 15 bytes. With a 16-byte stored iv, 15-iv_len < 2, so
+    // the clamp never applies and f is purely message-length driven.
+    let msg_len = params.ct.len() - (params.ts as usize / 8);
+    let f = {
+        let mut f = 2usize;
+        while f < 4 && (msg_len >> (8 * f)) != 0 {
+            f += 1;
+        }
+        f
+    };
+    let nonce_len = 15 - f;
+    if params.iv.len() < nonce_len {
+        return Err(Error::Crypto(format!("sjcl iv too short: {} < {nonce_len}", params.iv.len())));
+    }
+    let nonce = &params.iv[..nonce_len];
+
+    let tag_len = (params.ts / 8) as usize;
     match params.ks {
-        128 => ccm_decrypt_inner::<aes::Aes128>(&key, &params.iv, params.ts as usize, &params.ct),
-        256 => ccm_decrypt_inner::<aes::Aes256>(&key, &params.iv, params.ts as usize, &params.ct),
+        128 => ccm_decrypt_inner::<aes::Aes128>(&key, nonce, tag_len, &params.ct),
+        256 => ccm_decrypt_inner::<aes::Aes256>(&key, nonce, tag_len, &params.ct),
         _ => Err(Error::Crypto(format!("unsupported key size {}", params.ks))),
     }
 }
@@ -223,121 +233,231 @@ fn ccm_decrypt_inner<A>(key: &[u8], nonce: &[u8], tag_len: usize, ct: &[u8]) -> 
 where
     A: aes::cipher::BlockCipher + aes::cipher::BlockEncrypt + aes::cipher::KeyInit + aes::cipher::BlockSizeUser<BlockSize = aes::cipher::typenum::U16>,
 {
-    // Hand-rolled CCM (NIST SP 800-38C) against aes::BlockCipher to avoid
-    // trait-version mismatches between the ccm crate and aes 0.8.
-    // SJCL always uses 13-byte nonces (L = 15 - 13 = 2) and 8-byte tags.
+    // SJCL CCM (NOT standard CCM). Mirrors sjcl.mode.ccm.decrypt:
+    // 1. data = CTR-decrypt(msg) with keystream blocks E((L-1) || nonce || counter) for counter = 1..
+    // 2. mac = CBC-MAC over B0 = ((t-2)<<2)|(L-1) || nonce || msg_len_be(L bytes), then the PLAINTEXT
+    // 3. expected stored tag = mac XOR E((L-1) || nonce || counter=0)[..tag_len]
+    // 4. tag is APPENDED to the ciphertext
     use aes::cipher::{BlockEncrypt, KeyInit};
     type Block = aes::cipher::generic_array::GenericArray<u8, aes::cipher::typenum::U16>;
 
-    if nonce.len() != 13 {
-        return Err(Error::Crypto(format!("unexpected sjcl iv length {} (expected 13)", nonce.len())));
-    }
-    if tag_len != 8 {
-        return Err(Error::Crypto(format!("unexpected sjcl tag length {} (expected 8)", tag_len)));
+    let l = 15 - nonce.len(); // length field size in bytes
+    if l < 2 || l > 8 {
+        return Err(Error::Crypto(format!("invalid ccm L {l}")));
     }
     if ct.len() < tag_len {
         return Err(Error::Crypto("ciphertext shorter than tag".into()));
     }
 
     let cipher = A::new_from_slice(key).map_err(|e| Error::Crypto(format!("bad aes key: {e}")))?;
-    let (tag, msg) = ct.split_at(tag_len);
-    let msg_len = msg.len();
+    let msg_len = ct.len() - tag_len;
+    let (msg, tag) = ct.split_at(msg_len);
 
-    // B0: flags = (64*(t-2)/2) + (15-nonce_len-1)  -> adata=0, t=8 -> 0x40, L=2
-    let mut b0 = [0u8; 16];
-    b0[0] = 0x40 | ((tag_len - 2) * 2) as u8 | (15 - nonce.len() - 1) as u8;
-    b0[1..1 + nonce.len()].copy_from_slice(nonce);
-    let len_bytes = (msg_len as u64).to_be_bytes();
-    b0[16 - 2..].copy_from_slice(&len_bytes[6..8]);
-
-    let mut mac_block = Block::from(b0);
-    cipher.encrypt_block(&mut mac_block);
-
-    // CBC-MAC over message (no associated data in SJCL default)
-    let mut i = 0;
-    while i < msg_len {
-        let mut block = Block::from([0u8; 16]);
-        let n = (msg_len - i).min(16);
-        for j in 0..n {
-            block[j] ^= msg[i + j] ^ mac_block[j];
-        }
-        // block = (mac xor msg_chunk)
-        let mut cur = [0u8; 16];
-        for j in 0..16 {
-            cur[j] = mac_block[j] ^ block[j];
-        }
-        mac_block = Block::from(cur);
-        cipher.encrypt_block(&mut mac_block);
-        i += n;
-    }
-
-    let mut computed_tag = [0u8; 8];
-    computed_tag.copy_from_slice(&mac_block.as_slice()[..tag_len]);
-    if computed_tag[..] != tag[..] {
-        return Err(Error::Crypto("AES-CCM tag mismatch (wrong password or corrupted data)".into()));
-    }
-
-    // CTR mode decryption. A_i: flags=1 (L-1=1), nonce, counter i big-endian in last 2 bytes.
-    let mut out = Vec::with_capacity(msg_len);
-    let mut counter: u64 = 1;
-    let mut keystream = Vec::new();
-    while keystream.len() < msg_len {
+    let ctr_block = |counter: u64| -> Block {
         let mut a = [0u8; 16];
-        a[0] = 1;
+        a[0] = (l - 1) as u8;
         a[1..1 + nonce.len()].copy_from_slice(nonce);
-        let c = (counter as u64).to_be_bytes();
-        a[14..].copy_from_slice(&c[6..8]);
-        let mut blk = Block::from(a);
+        let c = counter.to_be_bytes();
+        a[16 - l..].copy_from_slice(&c[8 - l..]);
+        Block::clone_from_slice(&a)
+    };
+
+    // 1. CTR decryption, counters starting at 1.
+    let mut plaintext = Vec::with_capacity(msg_len);
+    let mut keystream = Vec::new();
+    let mut counter: u64 = 1;
+    while keystream.len() < msg_len {
+        let mut blk = ctr_block(counter);
         cipher.encrypt_block(&mut blk);
         keystream.extend_from_slice(blk.as_slice());
         counter += 1;
     }
     for (idx, m) in msg.iter().enumerate() {
-        out.push(m ^ keystream[idx]);
+        plaintext.push(m ^ keystream[idx]);
+    }
+
+    // 2. CBC-MAC over B0 + plaintext.
+    let mut b0 = [0u8; 16];
+    b0[0] = (((tag_len - 2) << 2) | (l - 1)) as u8;
+    b0[1..1 + nonce.len()].copy_from_slice(nonce);
+    let len_bytes = (msg_len as u64).to_be_bytes();
+    b0[16 - l..].copy_from_slice(&len_bytes[8 - l..]);
+    let mut mac = Block::clone_from_slice(&b0);
+    cipher.encrypt_block(&mut mac);
+    let mut i = 0;
+    while i < msg_len {
+        let n = (msg_len - i).min(16);
+        let mut cur = [0u8; 16];
+        for j in 0..n {
+            cur[j] = mac[j] ^ plaintext[i + j];
+        }
+        for j in n..16 {
+            cur[j] = mac[j];
+        }
+        mac = Block::clone_from_slice(&cur);
+        cipher.encrypt_block(&mut mac);
+        i += n;
+    }
+
+    // 3. Unmask and compare: stored_tag == mac XOR s0[..tag_len].
+    let mut s0 = ctr_block(0);
+    cipher.encrypt_block(&mut s0);
+    for idx in 0..tag_len {
+        if mac[idx] ^ s0[idx] != tag[idx] {
+            return Err(Error::Crypto("AES-CCM tag mismatch (wrong password or corrupted data)".into()));
+        }
+    }
+    Ok(plaintext)
+}
+
+#[doc(hidden)]
+pub fn debug_ccm_trace(key: &[u8], nonce: &[u8], tag_len: usize, ct: &[u8]) -> Vec<String> {
+    let mut log = Vec::new();
+    let l = 15 - nonce.len();
+    log.push(format!("l={l} ct_len={} tag_len={tag_len}", ct.len()));
+    let msg_len = ct.len() - tag_len;
+    let (msg, tag) = ct.split_at(msg_len);
+    log.push(format!("msg={} tag={}", hex::encode(msg), hex::encode(tag)));
+    use aes::cipher::{BlockEncrypt, KeyInit};
+    type Block = aes::cipher::generic_array::GenericArray<u8, aes::cipher::typenum::U16>;
+    let cipher = aes::Aes128::new_from_slice(key).unwrap();
+    let ctr_block = |counter: u64| -> Block {
+        let mut a = [0u8; 16];
+        a[0] = (l - 1) as u8;
+        a[1..1 + nonce.len()].copy_from_slice(nonce);
+        let c = counter.to_be_bytes();
+        a[16 - l..].copy_from_slice(&c[8 - l..]);
+        Block::clone_from_slice(&a)
+    };
+    let mut s0 = ctr_block(0);
+    cipher.encrypt_block(&mut s0);
+    log.push(format!("s0={}", hex::encode(&s0)));
+    let mut b0 = [0u8; 16];
+    b0[0] = (((tag_len - 2) << 2) | (l - 1)) as u8;
+    b0[1..1 + nonce.len()].copy_from_slice(nonce);
+    let len_bytes = (msg_len as u64).to_be_bytes();
+    b0[16 - l..].copy_from_slice(&len_bytes[8 - l..]);
+    log.push(format!("b0={}", hex::encode(b0)));
+    let mut mac = Block::clone_from_slice(&b0);
+    cipher.encrypt_block(&mut mac);
+    log.push(format!("e_b0={}", hex::encode(&mac)));
+    let mut i = 0;
+    while i < msg_len {
+        let n = (msg_len - i).min(16);
+        let mut cur = [0u8; 16];
+        for j in 0..n { cur[j] = mac[j] ^ msg[i + j]; }
+        for j in n..16 { cur[j] = mac[j]; }
+        mac = Block::clone_from_slice(&cur);
+        cipher.encrypt_block(&mut mac);
+        i += n;
+    }
+    log.push(format!("mac={}", hex::encode(&mac)));
+    let masked: Vec<u8> = (0..tag_len).map(|idx| mac[idx] ^ s0[idx]).collect();
+    log.push(format!("masked={}", hex::encode(&masked)));
+    log
+}
+
+/// JS escape(): keeps alphanumerics and @*_+-./; encodes each UTF-16 code unit
+/// as %XX (<= 255) or %uXXXX (> 255). Mirrors Joplin's escape(plainText).
+pub fn sjcl_escape(s: &str) -> String {
+    let mut out = String::new();
+    for unit in s.encode_utf16() {
+        if unit < 128 {
+            let c = unit as u8 as char;
+            if c.is_ascii_alphanumeric() || "@*_+-./".contains(c) {
+                out.push(c);
+            } else {
+                out.push_str(&format!("%{unit:02X}"));
+            }
+        } else if unit < 256 {
+            out.push_str(&format!("%{unit:02X}"));
+        } else {
+            out.push_str(&format!("%u{unit:04X}"));
+        }
+    }
+    out
+}
+
+/// Reverse of JS unescape(): %uXXXX -> U+XXXX char, %XX -> U+00XX char,
+/// everything else literal. UTF-16 surrogate pairs (%uD83C%uDF89) are combined.
+pub fn sjcl_unescape(s: &str) -> Result<String> {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && bytes[i + 1] == b'u'
+            && i + 5 < bytes.len() + 1
+            && i + 6 <= bytes.len()
+        {
+            // %uXXXX (with surrogate pair combining)
+            let hex_str = std::str::from_utf8(&bytes[i + 2..i + 6]).map_err(|_| Error::Crypto("bad escape".into()))?;
+            if let Ok(unit) = u32::from_str_radix(hex_str, 16) {
+                if (0xD800..0xDC00).contains(&unit) {
+                    // High surrogate: try to consume a following %uXXXX low surrogate.
+                    if i + 12 <= bytes.len() && bytes[i + 6] == b'%' && bytes[i + 7] == b'u' {
+                        let low_hex = std::str::from_utf8(&bytes[i + 8..i + 12]).map_err(|_| Error::Crypto("bad escape".into()))?;
+                        if let Ok(low) = u32::from_str_radix(low_hex, 16) {
+                            if (0xDC00..0xE000).contains(&low) {
+                                let cp = 0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00);
+                                if let Some(ch) = char::from_u32(cp) {
+                                    out.push(ch);
+                                    i += 12;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    // Unpaired surrogate: replacement char.
+                    out.push('\u{FFFD}');
+                    i += 6;
+                    continue;
+                }
+                if let Some(ch) = char::from_u32(unit) {
+                    out.push(ch);
+                    i += 6;
+                    continue;
+                }
+            }
+            out.push('%');
+            i += 1;
+        } else if bytes[i] == b'%' && i + 2 < bytes.len() + 1 && i + 3 <= bytes.len() {
+            let hex_str = std::str::from_utf8(&bytes[i + 1..i + 3]).map_err(|_| Error::Crypto("bad escape".into()))?;
+            match u8::from_str_radix(hex_str, 16) {
+                Ok(byte) => {
+                    // JS unescape maps %XX to char U+00XX (latin-1 range).
+                    out.push(byte as char);
+                    i += 3;
+                }
+                Err(_) => {
+                    out.push('%');
+                    i += 1;
+                }
+            }
+        } else {
+            // Copy as a UTF-8 sequence (multi-byte chars pass through unescaped).
+            let ch_len = utf8_len(bytes[i]);
+            let end = (i + ch_len).min(bytes.len());
+            out.push_str(std::str::from_utf8(&bytes[i..end]).map_err(|_| Error::Crypto("bad utf8".into()))?);
+            i = end;
+        }
     }
     Ok(out)
 }
 
-/// SJCL "escape()" equivalent: encodeURIComponent + the %-encoding quirks
-/// Joplin relies on for methods 1a/1b.
-pub fn sjcl_unescape(s: &str) -> Result<String> {
-    let bytes = s.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            if i + 2 >= bytes.len() + 1 {
-                return Err(Error::Crypto("bad escape sequence".into()));
-            }
-            let hex = &s[i + 1..(i + 3).min(s.len())];
-            if hex.len() != 2 {
-                return Err(Error::Crypto("bad escape hex".into()));
-            }
-            let byte = u8::from_str_radix(hex, 16).map_err(|_| Error::Crypto("bad escape hex".into()))?;
-            out.push(byte);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
+fn utf8_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b >> 5 == 0b110 {
+        2
+    } else if b >> 4 == 0b1110 {
+        3
+    } else if b >> 3 == 0b11110 {
+        4
+    } else {
+        1
     }
-    // escape() produces latin1-style bytes for chars >= 256 encoded as %uXXXX.
-    // Joplin only round-trips standard escape() so UTF-8 interpretation is correct here.
-    String::from_utf8(out).map_err(|_| Error::Crypto("unescape produced invalid utf-8".into()))
-}
-
-pub fn sjcl_escape(s: &str) -> String {
-    let mut out = String::new();
-    for &b in s.as_bytes() {
-        let c = b as char;
-        let keep = c.is_ascii_alphanumeric() || "@*_+-./".contains(c);
-        if keep {
-            out.push(c);
-        } else {
-            out.push_str(&format!("%{:02X}", b));
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -357,6 +477,8 @@ mod tests {
 
     #[test]
     fn escape_roundtrip() {
-        assert_eq!(sjcl_unescape(&sjcl_escape("héllo world+./")).unwrap(), "héllo world+./");
+        let original = "héllo wörld 你好世界 🎉 +./@*_";
+        let unescaped = sjcl_unescape(&sjcl_escape(original)).unwrap();
+        assert_eq!(unescaped, original);
     }
 }
