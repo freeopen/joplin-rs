@@ -61,8 +61,12 @@ enum Command {
 struct Config {
     webdav_url: String,
     username: String,
+    /// WebDAV account password
     #[serde(default)]
     password: Option<String>,
+    /// E2EE master key password (distinct from the WebDAV password)
+    #[serde(default)]
+    e2ee_password: Option<String>,
 }
 
 fn config_path(cli: &Cli) -> PathBuf {
@@ -215,14 +219,23 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Resolve the E2EE password: CLI arg > config `e2ee_password` > prompt.
+/// The WebDAV password is never used as the E2EE password.
 fn resolve_password(cfg: &Config, cli_password: Option<String>) -> Result<Option<String>> {
     if let Some(p) = cli_password {
         return Ok(Some(p));
     }
-    if let Some(p) = &cfg.password {
+    if let Some(p) = &cfg.e2ee_password {
         return Ok(Some(p.clone()));
     }
-    print!("E2EE password: ");
+    print!("E2EE password (empty to skip decryption): ");
     std::io::stdout().flush()?;
-    Ok(Some(rpassword::read_password()?))
+    // read_password fails on a non-tty stdin; treat that as "skip decryption"
+    // so scripted/CI runs can proceed without a password.
+    let pw = rpassword::read_password().unwrap_or_default();
+    if pw.trim().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(pw))
+    }
 }

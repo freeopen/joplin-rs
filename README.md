@@ -42,7 +42,9 @@ on macOS, `$XDG_CONFIG_HOME/joplin-rs/config.toml` on Linux):
 ```toml
 webdav_url = "https://example.com/remote.php/dav/files/user/joplin"
 username = "user"
-password = "webdav-password"   # optional; prompted if missing
+password = "webdav-password"        # WebDAV account password
+e2ee_password = "e2ee-password"     # optional; master key password (prompted if missing,
+                                    # or leave empty + run sync to store items encrypted)
 ```
 
 Then:
