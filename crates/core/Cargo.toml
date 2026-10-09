@@ -1,0 +1,33 @@
+[package]
+name = "joplin-rs-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+url = { workspace = true }
+rusqlite = { workspace = true }
+aes-gcm = { workspace = true }
+ccm = { workspace = true }
+pbkdf2 = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+rsa = { workspace = true }
+rand = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+quick-xml = { workspace = true }
+tracing = { workspace = true }
+time = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+http-body-util = { workspace = true }
+tempfile = { workspace = true }
