@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 joplin-rs-core = { workspace = true }
-clap = { workspace = true }
+clap = { workspace = true, features = ["derive", "env"] }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
