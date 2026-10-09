@@ -174,6 +174,107 @@ async function main() {
     },
   });
 
+  // ---- Full vault simulation: info.json + items + resources ----
+  // Builds the structure a Joplin WebDAV sync target would have, with E2EE on.
+  const vaultPassword = 'vault-pw-123';
+  const keyMaterial = Buffer.from(crypto.getRandomValues(new Uint8Array(256))).toString('hex');
+  const mkSalt = Buffer.from(crypto.getRandomValues(new Uint8Array(32)));
+  const mkEnv = await nativeEncrypt(vaultPassword, mkSalt, Buffer.from(keyMaterial, 'utf8'), { iterationCount: 220000 });
+  const masterKeyId = Buffer.from(crypto.getRandomValues(new Uint8Array(16))).toString('hex');
+
+  async function encryptItemString(plainText) {
+    let header = encodeHeader(10, masterKeyId);
+    let chunks = '';
+    for (let i = 0; i < plainText.length; i += 65536) {
+      const block = plainText.substring(i, i + 65536);
+      const dataBytes = Buffer.from(block, 'utf16le');
+      const salt = Buffer.from(crypto.getRandomValues(new Uint8Array(32)));
+      const env = await nativeEncrypt(keyMaterial, salt, dataBytes, { iterationCount: 3 });
+      const cipher = JSON.stringify(env);
+      chunks += cipher.length.toString(16).padStart(6, '0') + cipher;
+    }
+    return header + chunks;
+  }
+
+  const iso = (ms) => new Date(ms).toISOString().replace(/\.000Z$/, '.000Z');
+  const base = Date.UTC(2024, 5, 1, 12, 0, 0);
+  function serializeItem(item) {
+    // BaseItem.serialize: temp.join('\n\n') over [title?, body?, props].
+    // The title/props separator always exists; blank lines inside the body are literal.
+    const parts = [item.title];
+    if (item.body) parts.push(item.body);
+    const props = [];
+    for (const [k, v] of Object.entries(item)) {
+      if (['title', 'body'].includes(k)) continue;
+      let val = v;
+      if (['created_time', 'updated_time', 'user_created_time', 'user_updated_time'].includes(k)) {
+        val = new Date(v).toISOString();
+      }
+      props.push(k + ': ' + val);
+    }
+    parts.push(props.join('\n'));
+    return parts.join('\n\n');
+  }
+
+  const now = base;
+  const folder = { id: 'f'.repeat(32), title: 'Test Notebook', type_: 2, created_time: now, updated_time: now, encryption_cipher_text: '', encryption_applied: 0 };
+  const note1 = { id: '1'.repeat(32), parent_id: folder.id, title: 'First note', body: 'Hello from the encrypted vault\n\nWith a second paragraph', type_: 1, created_time: now, updated_time: now + 1000, user_created_time: now, user_updated_time: now + 1000, is_todo: 0, markup_language: 1, encryption_cipher_text: '', encryption_applied: 0 };
+  const note2 = { id: '2'.repeat(32), parent_id: folder.id, title: 'Second note', body: '- item 1\n- item 2', type_: 1, created_time: now, updated_time: now + 2000, user_created_time: now, user_updated_time: now + 2000, is_todo: 1, todo_completed: 0, markup_language: 1, encryption_cipher_text: '', encryption_applied: 0 };
+  const tag = { id: '3'.repeat(32), title: 'important', type_: 5, created_time: now, updated_time: now, encryption_cipher_text: '', encryption_applied: 0 };
+  const noteTag = { id: '4'.repeat(32), note_id: note1.id, tag_id: tag.id, type_: 6, created_time: now, updated_time: now, encryption_cipher_text: '', encryption_applied: 0 };
+
+  const plainItems = [folder, note1, note2, tag, noteTag];
+  const vault = { info_json: null, items: {}, resources: {} };
+
+  for (const item of plainItems) {
+    const serialized = serializeItem(item);
+    vault.items[item.id + '.md'] = await encryptItemString(serialized);
+  }
+
+  // Resource (image): FileV1-encrypted blob at .resource/{id}
+  const resourceMeta = { id: '5'.repeat(32), title: 'pixel.png', mime: 'image/png', filename: 'pixel.png', file_extension: 'png', type_: 4, created_time: now, updated_time: now, encryption_blob_encrypted: 1 };
+  const resourceMetaSerialized = serializeItem(resourceMeta);
+  vault.items[resourceMeta.id + '.md'] = await encryptItemString(resourceMetaSerialized);
+
+  // Fake 1x1 PNG
+  const png = Buffer.from('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d4944415478da63640000000600023081d02f0000000049454e44ae426082', 'hex');
+  const b64 = png.toString('base64');
+  let resChunks = '';
+  for (let i = 0; i < b64.length; i += 131072) {
+    const block = b64.substring(i, i + 131072);
+    const salt = Buffer.from(crypto.getRandomValues(new Uint8Array(32)));
+    const env = await nativeEncrypt(keyMaterial, salt, Buffer.from(block, 'binary'), { iterationCount: 3 });
+    const cipher = JSON.stringify(env);
+    resChunks += cipher.length.toString(16).padStart(6, '0') + cipher;
+  }
+  let resHeader = encodeHeader(9, masterKeyId);
+  vault.resources['.resource/' + resourceMeta.id] = resHeader + resChunks;
+
+  vault.info_json = JSON.stringify({
+    version: 3,
+    e2ee: { value: true, updatedTime: now },
+    activeMasterKeyId: { value: masterKeyId, updatedTime: now },
+    masterKeys: [{ id: masterKeyId, created_time: now, updated_time: now, source_application: 'net.cozic.joplin-desktop', encryption_method: 8, checksum: '', content: JSON.stringify(mkEnv) }],
+    ppk: { value: null },
+    appMinVersion: '3.7.0',
+  }, null, '\t');
+
+  vault.password = vaultPassword;
+  vault.expected = {
+    notes: [
+      { id: note1.id, title: note1.title, body: note1.body, parent_id: folder.id },
+      { id: note2.id, title: note2.title, body: note2.body, parent_id: folder.id, is_todo: 1 },
+    ],
+    folders: [{ id: folder.id, title: folder.title }],
+    tags: [{ id: tag.id, title: tag.title }],
+    noteTags: [{ id: noteTag.id, note_id: note1.id, tag_id: tag.id }],
+    resources: [{ id: resourceMeta.id, mime: 'image/png' }],
+  };
+
+  const vaultPath = path.join(outDir, 'test_vault.json');
+  fs.writeFileSync(vaultPath, JSON.stringify(vault, null, 2));
+  console.log('Wrote', vaultPath, '-', Object.keys(vault.items).length, 'items,', Object.keys(vault.resources).length, 'resources');
+
   const outPath = path.join(outDir, 'crypto_fixtures.json');
   fs.writeFileSync(outPath, JSON.stringify(fixtures, null, 2));
   console.log('Wrote', outPath);

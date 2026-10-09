@@ -1,0 +1,57 @@
+{
+  "info_json": "{\n\t\"version\": 3,\n\t\"e2ee\": {\n\t\t\"value\": true,\n\t\t\"updatedTime\": 1717243200000\n\t},\n\t\"activeMasterKeyId\": {\n\t\t\"value\": \"40b19fece79281e3f06a68e0fb73ee1f\",\n\t\t\"updatedTime\": 1717243200000\n\t},\n\t\"masterKeys\": [\n\t\t{\n\t\t\t\"id\": \"40b19fece79281e3f06a68e0fb73ee1f\",\n\t\t\t\"created_time\": 1717243200000,\n\t\t\t\"updated_time\": 1717243200000,\n\t\t\t\"source_application\": \"net.cozic.joplin-desktop\",\n\t\t\t\"encryption_method\": 8,\n\t\t\t\"checksum\": \"\",\n\t\t\t\"content\": \"{\\\"salt\\\":\\\"dlfxjceAngAhKUPEMAa2lFIklFCwX22lv7ziNkXyxSI=\\\",\\\"iv\\\":\\\"GsgOjg8s7K65OyCU\\\",\\\"ct\\\":\\\"HZSG3XyI3WeERumJglG/wAkBzC+1bwQsaQvunU9RA7wRM2wnNM8Kbn9Y39V3M8qyZTJmkuqOuMA8mxaAG1yJf61r6HbJK4Pk231wJX713PW9bZfPmMlMfjxPdXSN5SZyWSc0RlyaU5J3mKbHzbUDuUdHN7+Cl9AYmFt/eQrjWnEyAvHd42+zZhJbTkR0DCrbsG7kCVk8p2oTWFdLYhLCRl9yGsXWITS6RWJxp7/P5scr2ui1yeTwRrOvWTBSj1tlvbA/g3XDEwmpaR/54s65vyOI+jB/k+Bazdi9GXVvXQiFewxc4FCaUdycaTtBE7gwCMIbGVEe/pjZ2KNscKhM1PKo1OR7rQVpjCtSEZANZy/jflpJi/tTZd2VDN8lT9+obsnG7QBV/6mSNTqsVu+SjuDlBpKqqQvwY01Q7BpN/t1fPVMOw1rHqdFNQ4UaIdAbPvwLI+SuuWJFM1KvP7dcK9KEIASLNbJxO/iV4FzlQ3RMwGwBottiBW7ElS3w/oNKviym3wRSUh48n3TYjAhg3+vRm0aq9RcSCnTknymRkMAGTgAcxhBqThe3lEYveUcVfLWEzberhFhJkP4geeUfP0m5w1iIiSHoL9e8j5AqCj6Yen3vJnGOA+5pXgiVhkwddEnY/ERv6yE7WxpijqXPN8i981wldyo0n+dKPGbKM7k7wI87tL4WkNKZ23HnbNnS\\\"}\"\n\t\t}\n\t],\n\t\"ppk\": {\n\t\t\"value\": null\n\t},\n\t\"appMinVersion\": \"3.7.0\"\n}",
+  "items": {
+    "ffffffffffffffffffffffffffffffff.md": "JED010000220a40b19fece79281e3f06a68e0fb73ee1f00025b{\"salt\":\"s06inff8jbUs+teKQNGTHmKfGnZCgDxfRcEY1BFbGRw=\",\"iv\":\"MGfnkV/9i2OPmMP/\",\"ct\":\"8C2yYAFn3THch/VOvKK5QC1Oc2wMNSnMmaPqbua8OLQy31U5jjFp+a26xookow14lj8b5c2x7bjxBYK5g/09gGYGXiDLX6lCx2Wo6AO48gq6ecUglSTOrAuPv7rATE/irsvTkuJ3Ilviss2DBoHduLEB0edcv9kPYdi1c3aqP1ybJOxRpbdUX2Aq4AE66QQOzx2WjTN0J+ndnbl1/6BqekV6O/CDlinMZBHY7kGeXPahxWaPNOF74gWGWHlHALUa3KtHr8fglWKaVqp7r1Rle3RA6dV5LI4Eo1U0wJ2Z07Y+9br1bt0v22Wt6vWloEX3kUB7+vWN3Jife03LEUOffmeEpaaefm53AgrgNQx9WSCD3IQivhKuvrNzzmmQ8+QK03WwkXLh3O1/OPUzs/s/Wnwat52VgllpzddGqGymN562gy0rj0exngGbC4OZCMfH29Ko7SzxWvdd1NSIM5NtDTI9UpXEHiRH2cqk7+dXVLJNb8VLzCtBUs3t/4gGcxOM21M=\"}",
+    "11111111111111111111111111111111.md": "JED010000220a40b19fece79281e3f06a68e0fb73ee1f00049b{\"salt\":\"5Ua/ejBRANtQ985MlnhxEE+qq5v462pCrUXrwN6H9cc=\",\"iv\":\"7yQi07OzjPHXV+Cs\",\"ct\":\"unQHNq8OPBFCrjZ0OFertS278ELdRbDBBEkDVWGHdTtPv0oaCBNWzzbgz61epCS/CeKeo/V5XAqh/33uPIVDVbMpfVFWVo0Spq5XskOlxukYuCLYvYwzVkNkkVebHgqAX+XCsJlCrJOTRyPQjcB0wa/ycGOFWbEPuJCyzW6O5lelpMLT04n2z31vye1blXShesEiEFznF1BXi8s/ZZsxrC9BcpRSDpotp27CnG3XyT6TDBADHonrYxhv+mKyW2HnoIc2P92NOrvT5lWEaF8CBC2qxvzi4r/Nk1+sT9dGI3Y/3KZeIlzhY072cKQBldgKyCYNmLEr5cgbKvIV+NU2BH/J078DuIGba/oi8uoQSiODULvH7+MEUi68ppHN4wVpFykbAUbnl3fu2iUT6SfU9HDrSGTAixNVEqAd6TUfiBFgSu8pxF3cXKBG//gLNFs4p7zsmqb4MEuiugEGDdHPpYLoyGOC/25tKRsaoba0O/8T/r7uPxjtuvC1F8jgla1kviNPG8TnheeM29qiaKJvAf7CjxpWconrFIOVctfLDA9hv0kwifRH2KSsnXQXDlgL82VmuEo9ZfexLRY7V/O1Suig5zmL4FkEPVdcun8pbC1NH6Zf6Xk68A68Fn0qhqgjiprNWJOatZfx+Rj7XbrVWAZtYpW5i0PW72s9jQ61/F+NQeSvDKXDb71WrtQUzZ6JnchMtt5DN6fiHMucL0MKqT4OylqNQT0dtGv+tQ4IHgRr8elXB+4/cQdBiwVkFFacyiwpWyKhhMOYCSb0nMR5YlPhwIEQO7eo0tDShOnDhdgTjVpxqnPZ3V/hl/BInqiGoGMvV+wyzLysxe5Xl/87vSsAO2b89/1rVYpTRPSTcSLsKPvpVG/EKDPQFtxAS1w76oRXE0jsZyjgCcC+DsSyHkx2U8VHAK6r07A3d3bw81zDIFMcfV84eK7Pr+5bzg9ZtkSXk72l0Z/7ROCi6ZBlhdRE0E7zLACIbQvqVcLpYdj7MoE7jmhVETy+sAsGDmNafsz9UelIRLNKWUFVtRGN81UORq48w7qZWvjenFu+lVRGhor3HNCjNsdjIDOjRYDng0w=\"}",
+    "22222222222222222222222222222222.md": "JED010000220a40b19fece79281e3f06a68e0fb73ee1f000467{\"salt\":\"uIqliBSUU/dI/WwrcEh0Hz1loGTukOFUrHRpSdb4KEk=\",\"iv\":\"PryDXce86SYQfu4g\",\"ct\":\"uSXxHGLoDHf3tgcZBBEgQAlrs/xfqmHLGT9xPiXGf+oZ3s0o44bL1U9R2XZyDc3zYzEHZncEbmJnIufLPZDm0NK3Wigawqz2VP5BhTjqaeYDoHJrQPo4qLNIrRbm81p9Oe8obX/7DZH6UNtbEOTn31Wvj/yrbVHI4vUFOfshb5/nnhT9eCCuPEVihsPQOMv+mpoEXbBeW3itvk/aLCn1TfyGlqPwC1Ej2JdBjmKoSZnwv92s2Mvnr9viS69VxFgRpEVHzvZTzpf1WQVBwWFaWGSsPOU7jB5S3IRAxIqOS9DXxN8G7+R/9T+/u9CG7WqOpH1TqPy8XMXH3C9d2/08kMIHhJ8XjEd7nxg+AFJJXc8rd+uhqg3pbGpDFSNdVAP3TX7R4ARXWpaqsybaotnL5qhzV/+oCHuL72J7cN7dKurGR8i5E+tHXjuQD2Rmoxa/bsvZejrYyuaFbXlUCZYlXBbELUFQPA2qOVR7YXtSfWkqsVqObf93W+SObP3KOh8bU3A92cza4AYfr7L9q1YtQzdYiP/6CAZFOo8J9dg9YTXeGp+I0Tx4Yx1cTm1jdMx4xwpHbBeku2VsLB7CeFMF+7VMXwcUehM3s33qFO++ATyjrRUq7WLLI5iG/g+MGtyWDcRBNcRzyXuh/NkxlOkGWv3QM4C706ZsfY9Ga8HyBiRd4PHIhoMmhULj9FUqSpzluxIxGxyHXXCKuORNCx7iIomx/qS4MjUUW2CXzEAzdGjOyCVQ3pjlZIuZnJWy8tjSS9Ki63rcuTwTPLjSEsYOkvvjvMmNh5YPFeqv8WQRt05MjjDN7+gI0sRrlLYOo9Q6v+7sYiTOJrnaGxwTv6adVfLc69zaOkg+BSQOhLG0ASvOwq3aQFl3Lx+jw4gGWS6IsZ3Ti6nPjwvjYRjGgi6in+CRgnxCCGuhN9dHC2l8x8qb0Y7dIt9x3qNvQbP3WMPuSo7tYuMFgqOSgKSoKbjjGQ9OD4gn/s4F0me5MA6nH5axgsFS8EeaCGZTucalyaUF3HIZ78x/rZSSO3x7\"}",
+    "33333333333333333333333333333333.md": "JED010000220a40b19fece79281e3f06a68e0fb73ee1f00024f{\"salt\":\"OBJNheqzQ+eerTNBFmK2OW5h69r8MB6z3BDTXQIcL6w=\",\"iv\":\"s2w+2Cj3hcPtuADI\",\"ct\":\"y04wG8vifbBHJXfuZk06dyl0apmCdU2YhnZ8P9/AYhFil1emfUwXOGRA1IukQKARFnAYvJOJ125B1qznZlO0cDXKhKt+uvJRpH13Hq22tM3bnhaZSaDr3wjWzdv6/roWAJoHcW33bbUsGMbpdUhQOXVRckGKbBI/a53Cul2scI07tLfuo0GEARhbA9uHt1ltdz1/7wY+M/8mTvrip6DUtpYW92pgKCuZ0B/57YbqPJ63HhFbsoXNhdCowEwkLyiYceaGhyOrkUOISg9XQIeg4T+BSsjsLt7U7VXHdslfAbTTozLm7B+dPOs2uGeAaMr0vuywnhADofMhKRFZpaeNHwkPpVA8pn/OSW58oxaj3btth3xnc35zZ7rQo9HgivR3kaW/pWjOx2JtU8QBITWWU2QR3Uc21tsuim21uK15bizkguA4x/TahjMcWdIh6+B+cryYsJP+C5X1dGjMnaX/6tuLbGNEtCNBpSSQgy1iaXTIHb8K8bZ2gOxO\"}",
+    "44444444444444444444444444444444.md": "JED010000220a40b19fece79281e3f06a68e0fb73ee1f000317{\"salt\":\"ib0i1kgnLox0D0kV7yH0OOYsuXMOYVQDJaCsS69afGs=\",\"iv\":\"kPTuDAXrJ7WDaanZ\",\"ct\":\"L3/Yd/azDkbYSeTqMe0/q9NfIu6UDRgvf1V8Ri+4zovf/KXVT1Gb5UirI0rKyUQHofCUtqIj4bRHwy7Ys4U2e+DeRW6nm6mQXdyHM60ZRxJF4duD5mbHVkgq3s8UZxH7aK0vWvRHI2ZI4xnI8WaIfnY6U7g0Y810GAuZAJP9J/XFLqNa0CjvMZHa2z6yrDBLb2KPvWq7WZcgTh8aGeSRnVAbYdLsDckpROGy4tX+7pLDcmQ71A2sgUkF6FoASwiqmmOCJp7XKrB1N82ebay2sUB+ChzLQ9GE2DOPlqHo/tMi+uRjIH5lFqwcWdTcnsgHKEXkBHgxcujGEqsQFuIDa9vth5j0pN4il7JULEvdhJkoUQGeoIlGqkBsN5RkzyjV/ErAWohGIC7FHWAs+cJsHnGfQhcNYiaje2eIT/k01n/4yp/5jCxhCKwOH+fUGZGb0qr3RNuaf18wXMd5UhNrXb6SjQICAUoi1UlrrlSHu1easxC1GGCJdrRE3egbRCJvbbyz94iLT+xhFEvaztcPIPDfGdCIyoF2geOoU65e/u1Qo4QysonhxGkvbxKMesMJu98frsXEepS+nE9OgTqP0i0z3r92PFBPXsfeoA40DAdruyx66MlpNHf95ulg6MTjxmYcZHbgCAcDNkEEqL0c9E8WKBpNOOp6bIGZRh3cdDfpDdy10UuQwnGx5NWT8w==\"}",
+    "55555555555555555555555555555555.md": "JED010000220a40b19fece79281e3f06a68e0fb73ee1f0002b7{\"salt\":\"9mA+gS1yjDGbB6j+O5XUgha1YCt84m5EujS4p41ktHc=\",\"iv\":\"5hPE3kKYgK9Tt+Rs\",\"ct\":\"2k+/23j/3Ey/vsz4LTtWAOgt4zyRhwGpJ972IIZhRwZ5vKnZ3vyFyMhAHW3XUTbj6QqGnVnUfJvJGKqZn4gLMhDLvq5UiAaw7Azt7vTFNfdfpRo2KAzCShR0OXmk5f9qNRbvf9Kik4Yxef8iaCk9pWn9dCC3hFwbj+d/7+RuEGtuxWUTwzA58zY9x+VrW807m7VNHHXY+Cu0egD2W2Rkb6+ypfU7+PlyyirAjq5t2+uCn48XjVFApV/0G6wS0P684xEn6VBttwBjbyTi6sBnMcUjodVilKyTBnDLoh0DOzrFdkXzuKFoA1m5jnuBQlSU9+wxKvqboSNZuNMrzkWFFh+9JFbje0u+nONCAakFMQYa3t7oh+SAQ1Pa5eczRG+SUAfp8C5M+07UwQNs9txqeKtnN7a6Kb6NDNCBn8Li568YMLwfo/DVRhu4z8pvgGd82yYnZ7AtB5L4uRyXKlbAGCkb2XcMSJYyuSFUhiYpnQ0cNdpLp0/x0VZkAGgPuddhUgiEcoyC6BnwuVeDVGCadfW+c+TgOItzIvGlTrbUOzT2aFXWzaKMO7TCuUCbR5NcDB2iZg7Mp4jSFc+IjQKtw2vgYXfXaQ==\"}"
+  },
+  "resources": {
+    ".resource/55555555555555555555555555555555": "JED010000220940b19fece79281e3f06a68e0fb73ee1f0000e7{\"salt\":\"o45kApOCy482LrGZQgi4Kq8UvtqmgkkqH38SI/md0Lo=\",\"iv\":\"tdha5/kutwQLPHnp\",\"ct\":\"eNo8A94tKIK+YNZsEjFX2MAoguUoF1rXVrQ3JAMC7epYxGe0tS+SaDlqYLGgFQw+4+/J5vg4Cx90rkuPCDD/o2w4ZJVPiL3BvPOTDxAaL8vehsS19n3xFgeWLfx0/OxH0l759BdbrW/SIAGb\"}"
+  },
+  "password": "vault-pw-123",
+  "expected": {
+    "notes": [
+      {
+        "id": "11111111111111111111111111111111",
+        "title": "First note",
+        "body": "Hello from the encrypted vault\n\nWith a second paragraph",
+        "parent_id": "ffffffffffffffffffffffffffffffff"
+      },
+      {
+        "id": "22222222222222222222222222222222",
+        "title": "Second note",
+        "body": "- item 1\n- item 2",
+        "parent_id": "ffffffffffffffffffffffffffffffff",
+        "is_todo": 1
+      }
+    ],
+    "folders": [
+      {
+        "id": "ffffffffffffffffffffffffffffffff",
+        "title": "Test Notebook"
+      }
+    ],
+    "tags": [
+      {
+        "id": "33333333333333333333333333333333",
+        "title": "important"
+      }
+    ],
+    "noteTags": [
+      {
+        "id": "44444444444444444444444444444444",
+        "note_id": "11111111111111111111111111111111",
+        "tag_id": "33333333333333333333333333333333"
+      }
+    ],
+    "resources": [
+      {
+        "id": "55555555555555555555555555555555",
+        "mime": "image/png"
+      }
+    ]
+  }
+}

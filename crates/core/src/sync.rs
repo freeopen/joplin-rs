@@ -214,7 +214,7 @@ impl<'a> SyncEngine<'a> {
                 if files_at_timestamp.contains(&stat.path) {
                     continue; // processed in a previous run at the exact same ms
                 }
-            } else {
+            } else if stat.updated_time > new_timestamp {
                 new_timestamp = stat.updated_time;
                 files_at_timestamp.clear();
             }
@@ -265,19 +265,19 @@ impl<'a> SyncEngine<'a> {
                 }
             };
 
-            // Parse first to learn type_ before decryption (keepKeys make the
-            // encrypted form parseable directly).
-            let parsed = match items::unserialize(&text) {
-                Ok(p) => p,
-                Err(e) => {
-                    outcome.errors.push(format!("{}: {}", stat.path, e));
-                    continue;
-                }
-            };
-
-            let final_item = if parsed.props.get("encryption_applied").and_then(Value::as_i64).unwrap_or(0) == 1 {
-                match &key_material {
-                    Some(km) => match Self::decrypt_item_blob(&text, km) {
+            // Joplin's serializeForSync keeps plaintext keys (id, type_, timestamps...)
+            // and puts the encrypted container in encryption_cipher_text. But a
+            // fully-encrypted blob (no plaintext props) also exists if the whole
+            // serialized string was encrypted. Handle both:
+            // 1. If the text starts with JED (fully encrypted), decrypt first.
+            // 2. Otherwise parse, and decrypt encryption_cipher_text when present.
+            let final_item = if text.starts_with("JED") {
+                let km = key_material.as_ref().ok_or_else(|| {
+                    outcome.skipped_unsupported += 1;
+                    Error::Sync(format!("{}: encrypted but no password provided", stat.path))
+                });
+                match km {
+                    Ok(km) => match Self::decrypt_item_blob(&text, km) {
                         Ok(plain) => match items::unserialize(&plain) {
                             Ok(p) => p,
                             Err(e) => {
@@ -295,14 +295,54 @@ impl<'a> SyncEngine<'a> {
                             continue;
                         }
                     },
-                    None => {
-                        outcome.skipped_unsupported += 1;
-                        outcome.errors.push(format!("{}: encrypted but no password provided", stat.path));
-                        parsed
-                    }
+                    Err(_) => continue,
                 }
             } else {
-                parsed
+                let parsed = match items::unserialize(&text) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        outcome.errors.push(format!("{}: {}", stat.path, e));
+                        continue;
+                    }
+                };
+                let cipher_text = parsed.props.get("encryption_cipher_text").and_then(Value::as_str).unwrap_or_default().to_string();
+                if parsed.props.get("encryption_applied").and_then(Value::as_i64).unwrap_or(0) == 1 && !cipher_text.is_empty() {
+                    match &key_material {
+                        Some(km) => match Self::decrypt_item_blob(&cipher_text, km) {
+                            Ok(plain) => match items::unserialize(&plain) {
+                                Ok(mut p) => {
+                                    // Restore the keepKeys that Joplin preserves on the outside.
+                                    for keep_key in ["id", "type_", "updated_time", "parent_id", "note_id", "tag_id"] {
+                                        if let Some(v) = parsed.props.get(keep_key) {
+                                            p.props.entry(keep_key.to_string()).or_insert_with(|| v.clone());
+                                        }
+                                    }
+                                    p
+                                }
+                                Err(e) => {
+                                    outcome.errors.push(format!("{}: decrypt parse: {e}", stat.path));
+                                    continue;
+                                }
+                            },
+                            Err(Error::Unsupported(msg)) => {
+                                outcome.skipped_unsupported += 1;
+                                outcome.errors.push(format!("{}: {}", stat.path, msg));
+                                continue;
+                            }
+                            Err(e) => {
+                                outcome.errors.push(format!("{}: decrypt: {e}", stat.path));
+                                continue;
+                            }
+                        },
+                        None => {
+                            outcome.skipped_unsupported += 1;
+                            outcome.errors.push(format!("{}: encrypted but no password provided", stat.path));
+                            parsed
+                        }
+                    }
+                } else {
+                    parsed
+                }
             };
 
             if let Err(e) = self.storage.upsert_item(&final_item) {

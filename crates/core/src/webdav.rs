@@ -82,15 +82,18 @@ impl WebDavClient {
     }
 
     pub async fn propfind(&self, path: &str, depth: u32) -> Result<reqwest::Response> {
-        let body = r#"<?xml version="1.0"?>\n<d:propfind xmlns:d="DAV:"><d:prop><d:getlastmodified/><d:resourcetype/></d:prop></d:propfind>"#;
-        let _ = body;
         let body = r#"<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:getlastmodified/><d:resourcetype/></d:prop></d:propfind>"#;
+        let url = self.url_for(path);
         let resp = self
-            .request("PROPFIND", path, Some(body.to_string()))
-            .await?
-            .error_for_status()
+            .http
+            .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), &url)
+            .header(reqwest::header::AUTHORIZATION, &self.auth_header)
+            .header(reqwest::header::CONTENT_TYPE, "application/xml")
+            .header("Depth", depth.to_string())
+            .body(body.to_string())
+            .send()
+            .await
             .map_err(|e| Error::WebDav(format!("PROPFIND {path}: {e}")))?;
-        let _ = depth;
         Ok(resp)
     }
 
