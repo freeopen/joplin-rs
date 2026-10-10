@@ -177,9 +177,24 @@ impl<'a> SyncEngine<'a> {
                         if raw.len() == 32 {
                             hex::encode(raw)
                         } else {
-                            return Err(Error::Crypto(
-                                "master key decrypted to unexpected binary form".into(),
-                            ));
+                            let all_hex = raw.iter().all(|b| b.is_ascii_hexdigit());
+                            if all_hex && (raw.len() == 512 || raw.len() == 64) {
+                                // Printable hex of any width: normalise to 512 chars
+                                // (256 bytes) by doubling the 64-char (256-bit) form.
+                                let s: String = String::from_utf8(raw.clone())
+                                    .unwrap_or_default();
+                                if s.len() == 512 {
+                                    s
+                                } else {
+                                    format!("{s}{s}")
+                                }
+                            } else {
+                                return Err(Error::Crypto(format!(
+                                    "master key decrypted to unexpected form: {} bytes, head {}",
+                                    raw.len(),
+                                    hex::encode(&raw[..raw.len().min(16)])
+                                )));
+                            }
                         }
                     }
                 }
