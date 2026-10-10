@@ -294,19 +294,48 @@ impl<'a> SyncEngine<'a> {
         Ok(out)
     }
 
-    /// Decrypt a resource blob (FileV1) with the given key material. Returns raw bytes.
+    /// Decrypt a resource blob and return the raw file bytes.
+    ///
+    /// Two on-disk families share the JED01 chunked container:
+    /// - FileV1 (method 9): each chunk is native AES-256-GCM; plaintext is a
+    ///   base64 slice of the file.
+    /// - Legacy SJCL methods (SJCL3/4 and SJCL1a/1b, methods 3/4/5/7): each
+    ///   chunk is an SJCL AES-CCM JSON blob. SJCL1a/1b additionally wrap the
+    ///   plaintext with JS escape()/unescape(). Old vaults (created before
+    ///   FileV1 became the default file method) encrypt attachments this way,
+    ///   so real sync targets still contain them. In every case the
+    ///   concatenated plaintext is one base64 stream decoded to the file bytes.
     pub fn decrypt_resource_blob(blob: &str, key_material_hex: &str) -> Result<Vec<u8>> {
         let header = jcrypto::decode_header(blob)?;
         let md_size = usize::from_str_radix(&blob[5..11], 16)
             .map_err(|_| Error::Crypto("bad header size".into()))?;
         let chunks = jcrypto::decode_chunks(&blob[11 + md_size..])?;
         use base64::Engine;
-        let mut raw = Vec::new();
+        let mut b64 = String::new();
         for chunk in chunks {
             match header.method {
                 jcrypto::METHOD_FILE_V1 => {
                     let plain = jcrypto::native_decrypt(key_material_hex, &chunk, 3)?;
-                    raw.extend_from_slice(&plain);
+                    b64.push_str(
+                        &String::from_utf8(plain)
+                            .map_err(|_| Error::Crypto("resource chunk not utf8/base64".into()))?,
+                    );
+                }
+                jcrypto::METHOD_SJCL1A
+                | jcrypto::METHOD_SJCL1B
+                | jcrypto::METHOD_SJCL3
+                | jcrypto::METHOD_SJCL4 => {
+                    let params = jcrypto::parse_sjcl(&chunk)?;
+                    let plain = jcrypto::sjcl_ccm_decrypt(key_material_hex, &params)?;
+                    let text = String::from_utf8(plain)
+                        .map_err(|_| Error::Crypto("sjcl resource chunk not utf8".into()))?;
+                    if header.method == jcrypto::METHOD_SJCL1A
+                        || header.method == jcrypto::METHOD_SJCL1B
+                    {
+                        b64.push_str(&jcrypto::sjcl_unescape(&text)?);
+                    } else {
+                        b64.push_str(&text);
+                    }
                 }
                 other => {
                     return Err(Error::Unsupported(format!(
@@ -316,7 +345,7 @@ impl<'a> SyncEngine<'a> {
             }
         }
         base64::engine::general_purpose::STANDARD
-            .decode(&raw)
+            .decode(b64.as_bytes())
             .map_err(|e| Error::Crypto(format!("resource base64: {e}")))
     }
 
