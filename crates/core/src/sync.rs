@@ -371,8 +371,15 @@ impl<'a> SyncEngine<'a> {
             // remote listing). Fetch it regardless of the cursor, otherwise
             // such items stay silently missing forever. Items stored as
             // encrypted placeholders are retried separately below.
-            let missing_locally =
-                !local_id_set.contains(&items::path_to_id(&stat.path));
+            //
+            // An item whose current blob genuinely cannot be processed is
+            // re-fetched on every sync; this is deliberate: a capability
+            // upgrade (newly supported encryption method) or a corrected
+            // password must recover it without manual intervention, and
+            // item metadata blobs are small. Joplin retries failed items the
+            // same way.
+            let item_id = items::path_to_id(&stat.path);
+            let missing_locally = !local_id_set.contains(&item_id);
             let behind_cursor = stat.updated_time < context.timestamp
                 || (stat.updated_time == context.timestamp
                     && files_at_timestamp.contains(&stat.path));
@@ -383,7 +390,9 @@ impl<'a> SyncEngine<'a> {
                 new_timestamp = stat.updated_time;
                 files_at_timestamp.clear();
             }
-            if stat.updated_time == new_timestamp {
+            // A missing item retried via self-heal may already be recorded
+            // from a previous context; don't accumulate duplicates.
+            if stat.updated_time == new_timestamp && !files_at_timestamp.contains(&stat.path) {
                 files_at_timestamp.push(stat.path.clone());
             }
             to_download.push(stat.clone());
