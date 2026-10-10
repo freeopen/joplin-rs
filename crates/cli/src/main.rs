@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use joplin_rs_core::storage::Storage;
 use joplin_rs_core::sync::SyncEngine;
-use joplin_rs_core::webdav::WebDavClient;
+use joplin_rs_core::webdav::{TlsOptions, WebDavClient};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::PathBuf;
@@ -71,6 +71,21 @@ struct Config {
     /// E2EE master key password (distinct from the WebDAV password)
     #[serde(default)]
     e2ee_password: Option<String>,
+    /// Accept self-signed/invalid TLS certificates (self-hosted servers)
+    #[serde(default)]
+    insecure_tls: bool,
+    /// Path to a PEM CA certificate to trust (alternative to insecure_tls)
+    #[serde(default)]
+    ca_cert: Option<String>,
+}
+
+impl Config {
+    fn tls_options(&self) -> TlsOptions {
+        TlsOptions {
+            insecure: self.insecure_tls,
+            ca_path: self.ca_cert.as_ref().map(std::path::PathBuf::from),
+        }
+    }
 }
 
 fn config_path(cli: &Cli) -> PathBuf {
@@ -130,10 +145,11 @@ async fn main() -> Result<()> {
         Command::Sync { password } => {
             let cfg = load_config(cli)?;
             let storage = db(cli)?;
-            let client = WebDavClient::new(
+            let client = WebDavClient::new_with_tls(
                 &cfg.webdav_url,
                 &cfg.username,
                 cfg.password.as_deref().unwrap_or(""),
+                &cfg.tls_options(),
             )?;
             let engine = SyncEngine::new(&client, &storage);
             let password = resolve_password(&cfg, password.clone())?;
@@ -158,10 +174,11 @@ async fn main() -> Result<()> {
         }
         Command::Doctor { password } => {
             let cfg = load_config(cli)?;
-            let client = WebDavClient::new(
+            let client = WebDavClient::new_with_tls(
                 &cfg.webdav_url,
                 &cfg.username,
                 cfg.password.as_deref().unwrap_or(""),
+                &cfg.tls_options(),
             )?;
             println!("url: {}", cfg.webdav_url);
             let tmp_storage = Storage::open_in_memory()?;

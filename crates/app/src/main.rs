@@ -12,6 +12,24 @@ struct Config {
     username: String,
     #[serde(default)]
     password: Option<String>,
+    /// E2EE master key password (the in-app field overrides this)
+    #[serde(default)]
+    e2ee_password: Option<String>,
+    /// Accept self-signed/invalid TLS certificates
+    #[serde(default)]
+    insecure_tls: bool,
+    /// Path to a PEM CA certificate to trust
+    #[serde(default)]
+    ca_cert: Option<String>,
+}
+
+impl Config {
+    fn tls_options(&self) -> joplin_rs_core::webdav::TlsOptions {
+        joplin_rs_core::webdav::TlsOptions {
+            insecure: self.insecure_tls,
+            ca_path: self.ca_cert.as_ref().map(std::path::PathBuf::from),
+        }
+    }
 }
 
 fn config_path() -> PathBuf {
@@ -66,7 +84,11 @@ impl App {
             note_body: String::new(),
             note_title: String::new(),
             search: String::new(),
-            e2ee_password: config.password.clone().unwrap_or_default(),
+            e2ee_password: config
+                .e2ee_password
+                .clone()
+                .or_else(|| config.password.clone())
+                .unwrap_or_default(),
             status: "ready".into(),
             sync_running: Arc::new(Mutex::new(false)),
             status_shared: Arc::new(Mutex::new(String::new())),
@@ -173,9 +195,13 @@ impl App {
         self.status = "syncing...".into();
 
         let mut config = self.config.clone();
-        // Prefer the in-app password field over config.toml.
+        // Prefer the in-app password field over config.toml. Note: config.password
+        // is the WebDAV password; the GUI e2ee field maps to config.e2ee_password.
         if !self.e2ee_password.is_empty() {
-            config.password = Some(self.e2ee_password.clone());
+            config.e2ee_password = Some(self.e2ee_password.clone());
+        }
+        if config.e2ee_password.is_none() {
+            config.e2ee_password = config.password.clone();
         }
         let data_dir = data_dir();
         let status = self.status_shared.clone();
@@ -190,14 +216,16 @@ impl App {
             let status_async = status.clone();
             let result = rt.block_on(async move {
                 let storage = Storage::open(&data_dir.join("joplin-rs.db"))?;
-                let client = joplin_rs_core::webdav::WebDavClient::new(
+                let client = joplin_rs_core::webdav::WebDavClient::new_with_tls(
                     &config.webdav_url,
                     &config.username,
                     config.password.as_deref().unwrap_or(""),
+                    &config.tls_options(),
                 )?;
                 let engine = joplin_rs_core::sync::SyncEngine::new(&client, &storage);
+                let e2ee_pw = config.e2ee_password.as_deref();
                 engine
-                    .sync(config.password.as_deref(), &mut |msg| {
+                    .sync(e2ee_pw, &mut |msg| {
                         *status_async.lock().unwrap() = msg.to_string();
                     })
                     .await

@@ -7,7 +7,27 @@ use crate::error::{Error, Result};
 use base64::Engine;
 use quick_xml::events::Event;
 use quick_xml::Reader;
+use std::path::PathBuf;
 use url::Url;
+
+/// TLS behaviour for HTTPS sync targets.
+#[derive(Debug, Clone, Default)]
+pub struct TlsOptions {
+    /// Accept invalid/self-signed certificates. Use only against a server you
+    /// trust (e.g. a self-hosted WebDAV with a self-signed cert).
+    pub insecure: bool,
+    /// Path to a PEM CA certificate to additionally trust.
+    pub ca_path: Option<PathBuf>,
+}
+
+impl TlsOptions {
+    pub fn insecure() -> Self {
+        Self {
+            insecure: true,
+            ca_path: None,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct WebDavClient {
@@ -26,6 +46,15 @@ pub struct ItemStat {
 
 impl WebDavClient {
     pub fn new(base_url: &str, username: &str, password: &str) -> Result<Self> {
+        Self::new_with_tls(base_url, username, password, &TlsOptions::default())
+    }
+
+    pub fn new_with_tls(
+        base_url: &str,
+        username: &str,
+        password: &str,
+        tls: &TlsOptions,
+    ) -> Result<Self> {
         let mut url =
             Url::parse(base_url).map_err(|e| Error::WebDav(format!("bad base url: {e}")))?;
         if !url.path().ends_with('/') {
@@ -35,8 +64,19 @@ impl WebDavClient {
             "Basic {}",
             base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"))
         );
-        let http = reqwest::Client::builder()
-            .user_agent("joplin-rs/0.1")
+        let mut builder = reqwest::Client::builder().user_agent("joplin-rs/0.1");
+        if tls.insecure {
+            tracing::warn!("TLS certificate verification DISABLED for this sync target");
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+        if let Some(ca) = &tls.ca_path {
+            let pem = std::fs::read(ca)
+                .map_err(|e| Error::WebDav(format!("read CA cert {}: {e}", ca.display())))?;
+            let cert = reqwest::Certificate::from_pem(&pem)
+                .map_err(|e| Error::WebDav(format!("parse CA cert {}: {e}", ca.display())));
+            builder = builder.add_root_certificate(cert?);
+        }
+        let http = builder
             .build()
             .map_err(|e| Error::WebDav(format!("http client: {e}")))?;
         Ok(Self {
