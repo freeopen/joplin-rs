@@ -360,26 +360,39 @@ impl<'a> SyncEngine<'a> {
         let mut new_timestamp = context.timestamp;
         let mut files_at_timestamp: Vec<String> = context.files_at_timestamp.clone();
 
+        // Local contents back the self-heal below and deletion detection.
+        let local_ids = self.storage.all_item_ids()?;
+        let local_id_set: HashSet<String> = local_ids.iter().cloned().collect();
+
         for stat in &sorted {
-            if stat.updated_time < context.timestamp {
+            // Self-heal: the delta cursor may already have passed this item
+            // while it never landed locally (parse/decrypt/store error,
+            // interrupted download, or an older client that misread the
+            // remote listing). Fetch it regardless of the cursor, otherwise
+            // such items stay silently missing forever. Items stored as
+            // encrypted placeholders are retried separately below.
+            let missing_locally =
+                !local_id_set.contains(&items::path_to_id(&stat.path));
+            let behind_cursor = stat.updated_time < context.timestamp
+                || (stat.updated_time == context.timestamp
+                    && files_at_timestamp.contains(&stat.path));
+            if !missing_locally && behind_cursor {
                 continue;
             }
-            if stat.updated_time == context.timestamp {
-                if files_at_timestamp.contains(&stat.path) {
-                    continue; // processed in a previous run at the exact same ms
-                }
-            } else if stat.updated_time > new_timestamp {
+            if stat.updated_time > new_timestamp {
                 new_timestamp = stat.updated_time;
                 files_at_timestamp.clear();
             }
-            files_at_timestamp.push(stat.path.clone());
+            if stat.updated_time == new_timestamp {
+                files_at_timestamp.push(stat.path.clone());
+            }
             to_download.push(stat.clone());
         }
 
         // Deletion detection: items in local DB that no longer exist remotely.
         // (Only after the first sync; the failsafe guards against a wiped target.)
-        let local_ids = self.storage.all_item_ids()?;
         let remote_paths: HashSet<String> = sorted.iter().map(|s| s.path.clone()).collect();
+        // Local contents were fetched above for the self-heal check.
         if !local_ids.is_empty() {
             let deleted: Vec<String> = local_ids
                 .iter()

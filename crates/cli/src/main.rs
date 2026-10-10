@@ -193,6 +193,16 @@ fn print_list_item(item: &joplin_rs_core::items::Item) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Die quietly (exit 141) when the downstream pipe closes, like every
+    // other Unix CLI, instead of panicking on `list | head`.
+    #[cfg(unix)]
+    unsafe {
+        extern "C" {
+            fn signal(signum: i32, handler: usize) -> usize;
+        }
+        signal(13 /* SIGPIPE */, 0 /* SIG_DFL */);
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_target(false)
