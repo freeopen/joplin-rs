@@ -188,8 +188,16 @@ async fn main() -> Result<()> {
             println!("e2ee: {}", info.e2ee_enabled());
             if info.e2ee_enabled() {
                 let pw = resolve_password(&cfg, password.clone())?;
-                match engine.unlock_master_key(&info, pw.as_deref().unwrap_or("")) {
-                    Ok(_) => println!("master key: OK (password accepted)"),
+                match engine.unlock_master_key_any(&info, pw.as_deref().unwrap_or("")) {
+                    Ok((_, key_id)) => {
+                        let suffix =
+                            if info.active_master_key_id().as_deref() == Some(key_id.as_str()) {
+                                ""
+                            } else {
+                                ", not the active key"
+                            };
+                        println!("master key: OK (password accepted, key {key_id}{suffix})")
+                    }
                     Err(e) => {
                         println!("master key: FAILED - {e}");
                         bail!("master key check failed");

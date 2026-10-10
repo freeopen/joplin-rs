@@ -125,21 +125,64 @@ impl<'a> SyncEngine<'a> {
         }
     }
 
-    /// Unlock the active master key with a password. Returns the 512-char hex
-    /// key material, or an error if the password is wrong.
+    /// Unlock a master key with a password. Like Joplin, every known master
+    /// key is tried: the password may belong to an older key (e.g. after
+    /// re-enabling E2EE), while items can still reference it. Returns the
+    /// 512-char hex key material plus the id of the key that unlocked.
+    pub fn unlock_master_key_any(
+        &self,
+        info: &SyncInfo,
+        password: &str,
+    ) -> Result<(String, String)> {
+        if info.master_keys.is_empty() {
+            return Err(Error::Sync("no master keys in info.json".into()));
+        }
+        let active = info.active_master_key_id();
+        // Try the active key first, then the rest (newest first by updated_time).
+        let mut order: Vec<&MasterKeyEntity> = info.master_keys.iter().collect();
+        order.sort_by_key(|k| std::cmp::Reverse(k.updated_time));
+        order.sort_by_key(|k| if Some(&k.id) == active.as_ref() { 0 } else { 1 });
+
+        let mut last_err: Option<Error> = None;
+        for mk in order {
+            match Self::unlock_one_master_key(mk, password) {
+                Ok(hex) => return Ok((hex, mk.id.clone())),
+                Err(Error::Unsupported(e)) => {
+                    tracing::warn!("master key {}: {e}", mk.id);
+                    last_err = Some(Error::Unsupported(e));
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| Error::Crypto("no master key matched the password".into())))
+    }
+
+    /// Backward-compatible wrapper: unlock ignoring which key matched.
     pub fn unlock_master_key(&self, info: &SyncInfo, password: &str) -> Result<String> {
-        let key_id = info
-            .active_master_key_id()
-            .ok_or_else(|| Error::Sync("no active master key in sync info".into()))?;
-        let mk = info
-            .master_keys
-            .iter()
-            .find(|k| k.id == key_id)
-            .ok_or_else(|| Error::Sync(format!("master key {key_id} not found in info.json")))?;
+        self.unlock_master_key_any(info, password)
+            .map(|(hex, _)| hex)
+    }
+
+    fn unlock_one_master_key(mk: &MasterKeyEntity, password: &str) -> Result<String> {
         let hex_str = match mk.encryption_method {
             jcrypto::METHOD_KEY_V1 => {
                 let plain = jcrypto::native_decrypt(password, &mk.content, 220000)?;
-                String::from_utf8(plain).map_err(|_| Error::Crypto("master key not utf8".into()))?
+                match String::from_utf8(plain) {
+                    Ok(s) => s,
+                    // Some vaults store the 256-bit key as raw bytes instead of
+                    // a hex string; a successful GCM auth means the password is
+                    // right, so hex-encode to the expected form.
+                    Err(_) => {
+                        let raw = jcrypto::native_decrypt(password, &mk.content, 220000)?;
+                        if raw.len() == 32 {
+                            hex::encode(raw)
+                        } else {
+                            return Err(Error::Crypto(
+                                "master key decrypted to unexpected binary form".into(),
+                            ));
+                        }
+                    }
+                }
             }
             // Legacy SJCL password master keys (very common in real vaults).
             // SJCL1a/1b are the modern variants (AES-CCM, escape()'d payload).
