@@ -125,9 +125,7 @@ fn config_path(cli: &Cli) -> PathBuf {
 }
 
 fn data_dir(cli: &Cli) -> PathBuf {
-    cli.data_dir
-        .clone()
-        .unwrap_or_else(default_base_dir)
+    cli.data_dir.clone().unwrap_or_else(default_base_dir)
 }
 
 fn load_config(cli: &Cli) -> Result<Config> {

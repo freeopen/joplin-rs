@@ -164,7 +164,23 @@ impl WebDavClient {
             .text()
             .await
             .map_err(|e| Error::WebDav(format!("list body: {e}")))?;
-        parse_multistatus(&text)
+        // Real servers (dufs, Nextcloud, ...) return hrefs as absolute server
+        // paths (/dufs/src/x.md). Strip our base path so items are relative to
+        // the sync root and GET paths match. decode_href already removed the
+        // leading '/', so compare against the base path without it.
+        let base_rel = self.base_url.path().trim_matches('/').to_string();
+        let mut items = parse_multistatus(&text)?;
+        if !base_rel.is_empty() {
+            for it in &mut items {
+                if it.path == base_rel {
+                    it.path.clear(); // the root collection itself
+                } else if let Some(rest) = it.path.strip_prefix(&format!("{base_rel}/")) {
+                    it.path = rest.to_string();
+                }
+            }
+        }
+        items.retain(|it| !it.is_dir && !it.path.is_empty());
+        Ok(items)
     }
 
     pub async fn get(&self, path: &str) -> Result<Option<Vec<u8>>> {

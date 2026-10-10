@@ -318,8 +318,45 @@ pub fn unserialize(content: &str) -> Result<Item> {
         .parse()
         .map_err(|_| Error::Storage(format!("bad type_: {type_str}")))?;
 
-    let fields = table_fields(item_type)
-        .ok_or_else(|| Error::Storage(format!("unknown item type {item_type}")))?;
+    // Newer Joplin versions sync item types we don't model (13 FOLDER_TAG,
+    // 10 REVISION, ...). Keep only the common envelope fields so the item can
+    // still be tracked (deletion detection) instead of failing the whole sync.
+    let fields = match table_fields(item_type) {
+        Some(f) => f,
+        None => {
+            const GENERIC: &[(&str, FieldType)] = &[
+                ("id", FieldType::Text),
+                ("type_", FieldType::Text),
+                ("parent_id", FieldType::Text),
+                ("updated_time", FieldType::Int),
+                ("created_time", FieldType::Int),
+                ("deleted_time", FieldType::Int),
+            ];
+            let mut out = BTreeMap::new();
+            for (key, value) in &props {
+                if GENERIC.iter().any(|(n, _)| n == key) {
+                    out.insert(
+                        key.clone(),
+                        if key == "created_time" || key == "updated_time" || key == "deleted_time" {
+                            Value::Number(value.parse::<i64>().unwrap_or(0).into())
+                        } else {
+                            Value::String(value.clone())
+                        },
+                    );
+                }
+            }
+            if let Some(id) = out.get("id").and_then(Value::as_str) {
+                if !id.is_empty() && !is_valid_item_id(id) {
+                    return Err(Error::Storage(format!("invalid item ID format: {id}")));
+                }
+            }
+            return Ok(Item {
+                item_type,
+                props: out,
+                body: String::new(),
+            });
+        }
+    };
     let mut out_props = BTreeMap::new();
     for (key, value) in &props {
         if !fields.iter().any(|(n, _)| n == key) && key != "type_" {
