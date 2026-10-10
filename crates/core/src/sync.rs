@@ -71,6 +71,21 @@ impl SyncInfo {
     }
 }
 
+/// Result of decoding one downloaded item blob.
+#[derive(Debug)]
+enum ProcessResult {
+    /// Successfully parsed/decrypted item.
+    Item(items::Item),
+    /// Encrypted but no key material. The carried envelope (envelope layout)
+    /// is stored as-is; `None` means a fully-encrypted blob for which only a
+    /// placeholder can be stored.
+    Pending(Option<items::Item>),
+    /// Encryption uses a method this build does not support.
+    Unsupported(String),
+    /// Any other failure (parse/decrypt).
+    Error(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct SyncOutcome {
     pub downloaded: usize,
@@ -305,6 +320,80 @@ impl<'a> SyncEngine<'a> {
             .map_err(|e| Error::Crypto(format!("resource base64: {e}")))
     }
 
+    /// Turn a downloaded item blob into a parsed [`items::Item`], handling
+    /// both on-disk encryption layouts used by Joplin:
+    /// 1. Fully encrypted: the whole serialized item is a JED container.
+    /// 2. Envelope: plaintext props with the JED container in
+    ///    `encryption_cipher_text` (the common layout on real vaults).
+    ///
+    /// With no key material, encrypted items are returned as-is (the caller
+    /// stores the envelope/placeholder for a later password-bearing sync).
+    /// `Unsupported` errors are separated from other failures so the caller
+    /// can count them as skipped rather than hard errors.
+    fn process_item_text(text: &str, key_material: Option<&str>) -> ProcessResult {
+        if text.starts_with("JED") {
+            let Some(km) = key_material else {
+                // Fully encrypted blob: only a placeholder can be stored.
+                return ProcessResult::Pending(None);
+            };
+            return match Self::decrypt_item_blob(text, km).and_then(|p| items::unserialize(&p)) {
+                Ok(item) => ProcessResult::Item(item),
+                Err(Error::Unsupported(msg)) => ProcessResult::Unsupported(msg),
+                Err(e) => ProcessResult::Error(e.to_string()),
+            };
+        }
+
+        let parsed = match items::unserialize(text) {
+            Ok(p) => p,
+            Err(e) => return ProcessResult::Error(e.to_string()),
+        };
+        let cipher_text = parsed
+            .props
+            .get("encryption_cipher_text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let encrypted = parsed
+            .props
+            .get("encryption_applied")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            == 1
+            && !cipher_text.is_empty();
+        if !encrypted {
+            return ProcessResult::Item(parsed);
+        }
+
+        let Some(km) = key_material else {
+            // Envelope layout: the parsed outer item already carries id,
+            // type_ and encryption_applied=1, so store it verbatim.
+            return ProcessResult::Pending(Some(parsed));
+        };
+        match Self::decrypt_item_blob(&cipher_text, km).and_then(|p| items::unserialize(&p)) {
+            Ok(mut item) => {
+                // Joplin keeps identifying keys outside the encrypted payload;
+                // restore any the inner blob omitted.
+                for keep_key in [
+                    "id",
+                    "type_",
+                    "updated_time",
+                    "parent_id",
+                    "note_id",
+                    "tag_id",
+                ] {
+                    if let Some(v) = parsed.props.get(keep_key) {
+                        item.props
+                            .entry(keep_key.to_string())
+                            .or_insert_with(|| v.clone());
+                    }
+                }
+                ProcessResult::Item(item)
+            }
+            Err(Error::Unsupported(msg)) => ProcessResult::Unsupported(msg),
+            Err(e) => ProcessResult::Error(e.to_string()),
+        }
+    }
+
     /// Run one sync pass. `password` is only needed for encrypted vaults.
     pub async fn sync(
         &self,
@@ -447,134 +536,47 @@ impl<'a> SyncEngine<'a> {
                 }
             };
 
-            // Joplin's serializeForSync keeps plaintext keys (id, type_, timestamps...)
-            // and puts the encrypted container in encryption_cipher_text. But a
-            // fully-encrypted blob (no plaintext props) also exists if the whole
-            // serialized string was encrypted. Handle both:
-            // 1. If the text starts with JED (fully encrypted), decrypt first.
-            // 2. Otherwise parse, and decrypt encryption_cipher_text when present.
-            // When no password is available the raw blob is stored with
-            // `encryption_applied=1` so a later sync (with password) can retry.
-            let final_item = if text.starts_with("JED") {
-                let Some(km) = key_material.as_ref() else {
+            match Self::process_item_text(&text, key_material.as_deref()) {
+                ProcessResult::Item(final_item) => {
+                    if let Err(e) = self.storage.upsert_item(&final_item) {
+                        outcome.errors.push(format!("{}: store: {e}", stat.path));
+                        continue;
+                    }
+                    self.storage
+                        .save_sync_time(&id, crate::time_ms(), stat.updated_time)?;
+                    outcome.downloaded += 1;
+                }
+                ProcessResult::Pending(envelope) => {
                     outcome.skipped_unsupported += 1;
                     outcome
                         .pending_decryption
                         .push(items::path_to_id(&stat.path));
-                    // Store a minimal encrypted placeholder so the id is tracked.
-                    let mut placeholder = items::unserialize(&format!(
-                        "{}\n\nid: {}\nencryption_applied: 1\ntype_: 1",
-                        "(encrypted)",
-                        items::path_to_id(&stat.path)
-                    ))?;
-                    placeholder.body = String::new();
-                    if let Err(e) = self.storage.upsert_item(&placeholder) {
+                    // Track the id so deletion detection and later retries work:
+                    // store the parsed envelope verbatim, or a minimal
+                    // placeholder for a fully-encrypted (JED) blob.
+                    let mut item = match envelope {
+                        Some(p) => p,
+                        None => items::unserialize(&format!(
+                            "{}\n\nid: {}\nencryption_applied: 1\ntype_: 1",
+                            "(encrypted)",
+                            items::path_to_id(&stat.path)
+                        ))?,
+                    };
+                    item.body = String::new();
+                    if let Err(e) = self.storage.upsert_item(&item) {
                         outcome
                             .errors
                             .push(format!("{}: store placeholder: {e}", stat.path));
                     }
-                    continue;
-                };
-                match Self::decrypt_item_blob(&text, km) {
-                    Ok(plain) => match items::unserialize(&plain) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            outcome
-                                .errors
-                                .push(format!("{}: decrypt parse: {e}", stat.path));
-                            continue;
-                        }
-                    },
-                    Err(Error::Unsupported(msg)) => {
-                        outcome.skipped_unsupported += 1;
-                        outcome.errors.push(format!("{}: {}", stat.path, msg));
-                        continue;
-                    }
-                    Err(e) => {
-                        outcome.errors.push(format!("{}: decrypt: {e}", stat.path));
-                        continue;
-                    }
                 }
-            } else {
-                let parsed = match items::unserialize(&text) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        outcome.errors.push(format!("{}: {}", stat.path, e));
-                        continue;
-                    }
-                };
-                let cipher_text = parsed
-                    .props
-                    .get("encryption_cipher_text")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                if parsed
-                    .props
-                    .get("encryption_applied")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(0)
-                    == 1
-                    && !cipher_text.is_empty()
-                {
-                    match &key_material {
-                        Some(km) => match Self::decrypt_item_blob(&cipher_text, km) {
-                            Ok(plain) => match items::unserialize(&plain) {
-                                Ok(mut p) => {
-                                    // Restore the keepKeys that Joplin preserves on the outside.
-                                    for keep_key in [
-                                        "id",
-                                        "type_",
-                                        "updated_time",
-                                        "parent_id",
-                                        "note_id",
-                                        "tag_id",
-                                    ] {
-                                        if let Some(v) = parsed.props.get(keep_key) {
-                                            p.props
-                                                .entry(keep_key.to_string())
-                                                .or_insert_with(|| v.clone());
-                                        }
-                                    }
-                                    p
-                                }
-                                Err(e) => {
-                                    outcome
-                                        .errors
-                                        .push(format!("{}: decrypt parse: {e}", stat.path));
-                                    continue;
-                                }
-                            },
-                            Err(Error::Unsupported(msg)) => {
-                                outcome.skipped_unsupported += 1;
-                                outcome.errors.push(format!("{}: {}", stat.path, msg));
-                                continue;
-                            }
-                            Err(e) => {
-                                outcome.errors.push(format!("{}: decrypt: {e}", stat.path));
-                                continue;
-                            }
-                        },
-                        None => {
-                            outcome.skipped_unsupported += 1;
-                            outcome
-                                .pending_decryption
-                                .push(items::path_to_id(&stat.path));
-                            parsed
-                        }
-                    }
-                } else {
-                    parsed
+                ProcessResult::Unsupported(msg) => {
+                    outcome.skipped_unsupported += 1;
+                    outcome.errors.push(format!("{}: {msg}", stat.path));
                 }
-            };
-
-            if let Err(e) = self.storage.upsert_item(&final_item) {
-                outcome.errors.push(format!("{}: store: {e}", stat.path));
-                continue;
+                ProcessResult::Error(msg) => {
+                    outcome.errors.push(format!("{}: {msg}", stat.path));
+                }
             }
-            self.storage
-                .save_sync_time(&id, crate::time_ms(), stat.updated_time)?;
-            outcome.downloaded += 1;
         }
 
         // Save the delta context.
@@ -599,10 +601,8 @@ impl<'a> SyncEngine<'a> {
                     let Some(text) = self.client.get_text(&path).await? else {
                         continue;
                     };
-                    match Self::decrypt_item_blob(&text, km)
-                        .and_then(|plain| items::unserialize(&plain))
-                    {
-                        Ok(item) => {
+                    match Self::process_item_text(&text, Some(km)) {
+                        ProcessResult::Item(item) => {
                             if let Err(e) = self.storage.upsert_item(&item) {
                                 outcome.errors.push(format!("{path}: store: {e}"));
                             } else {
@@ -610,7 +610,18 @@ impl<'a> SyncEngine<'a> {
                                 outcome.downloaded += 1;
                             }
                         }
-                        Err(e) => outcome.errors.push(format!("{path}: retry: {e}")),
+                        // A password is present here, so Pending should be
+                        // impossible; treat it as an error if it ever occurs.
+                        ProcessResult::Pending(_) => outcome
+                            .errors
+                            .push(format!("{path}: retry: still encrypted")),
+                        ProcessResult::Unsupported(msg) => {
+                            outcome.skipped_unsupported += 1;
+                            outcome.errors.push(format!("{path}: {msg}"));
+                        }
+                        ProcessResult::Error(msg) => {
+                            outcome.errors.push(format!("{path}: retry: {msg}"))
+                        }
                     }
                 }
             }
