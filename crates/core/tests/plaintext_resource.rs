@@ -22,9 +22,18 @@ async fn plaintext_binary_resource_round_trips() {
     let res_meta = "pixel\n\nid: 55555555555555555555555555555555\ntype_: 4\nmime: image/png\nblob_updated_time: 1000".to_string();
     let files: Arc<Mutex<HashMap<String, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::from([
         ("info.json".to_string(), b"{\"version\": 3}".to_vec()),
-        ("11111111111111111111111111111111.md".to_string(), note.into_bytes()),
-        ("55555555555555555555555555555555.md".to_string(), res_meta.into_bytes()),
-        (".resource/55555555555555555555555555555555".to_string(), PNG.to_vec()),
+        (
+            "11111111111111111111111111111111.md".to_string(),
+            note.into_bytes(),
+        ),
+        (
+            "55555555555555555555555555555555.md".to_string(),
+            res_meta.into_bytes(),
+        ),
+        (
+            ".resource/55555555555555555555555555555555".to_string(),
+            PNG.to_vec(),
+        ),
     ])));
     let files_srv = files.clone();
 
@@ -64,11 +73,18 @@ async fn plaintext_binary_resource_round_trips() {
     let engine = SyncEngine::new(&client, &storage);
     let outcome = engine.sync(None, &mut |_| {}).await.expect("sync failed");
     assert_eq!(outcome.downloaded, 2, "note + resource meta: {outcome:?}");
-    assert_eq!(outcome.resources_downloaded, 1, "binary resource must download: {outcome:?}");
+    assert_eq!(
+        outcome.resources_downloaded, 1,
+        "binary resource must download: {outcome:?}"
+    );
 
     let blob = storage
         .resource_blob("55555555555555555555555555555555")
         .unwrap()
         .expect("blob stored");
-    assert_eq!(blob, PNG.to_vec(), "resource blob must be byte-exact (no lossy UTF-8)");
+    assert_eq!(
+        blob,
+        PNG.to_vec(),
+        "resource blob must be byte-exact (no lossy UTF-8)"
+    );
 }

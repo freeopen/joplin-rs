@@ -3,7 +3,8 @@
 //! Flow (mirrors Synchronizer.start + basicDelta for the download path):
 //! 1. GET info.json -> SyncInfo (version, e2ee, activeMasterKeyId, masterKeys[])
 //! 2. Unlock the active master key with the password (KeyV1 or Custom/PPK)
-//! 3. PROPFIND root -> basicDelta (timestamp-based context, page size 50)
+//! 3. PROPFIND root -> basicDelta-style timestamp diff (no server-side paging;
+//!    the full delta list is fetched with a single depth-1 PROPFIND)
 //! 4. Download changed `{id}.md`, unserialize, decrypt if needed, upsert
 //! 5. Deletion detection with a 90% failsafe
 //! 6. Prefetch all resource blobs (.resource/{id}), decrypting FileV1 blobs
@@ -54,11 +55,19 @@ pub struct SyncInfo {
 
 impl SyncInfo {
     pub fn e2ee_enabled(&self) -> bool {
-        self.e2ee.as_ref().and_then(|v| v.get("value")).and_then(Value::as_bool).unwrap_or(false)
+        self.e2ee
+            .as_ref()
+            .and_then(|v| v.get("value"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
     }
 
     pub fn active_master_key_id(&self) -> Option<String> {
-        self.active_master_key_id.as_ref().and_then(|v| v.get("value")).and_then(Value::as_str).map(String::from)
+        self.active_master_key_id
+            .as_ref()
+            .and_then(|v| v.get("value"))
+            .and_then(Value::as_str)
+            .map(String::from)
     }
 }
 
@@ -100,14 +109,19 @@ impl<'a> SyncEngine<'a> {
     pub async fn fetch_sync_info(&self) -> Result<SyncInfo> {
         let text = self.client.get_text("info.json").await?;
         match text {
-            Some(t) if !t.trim().is_empty() => {
-                let info: SyncInfo = serde_json::from_str(&t).map_err(|e| Error::Sync(format!("bad info.json: {e}")))?;
+            Some(t) => {
+                let info: SyncInfo = serde_json::from_str(&t)
+                    .map_err(|e| Error::Sync(format!("bad info.json: {e}")))?;
                 if info.version == 0 {
                     return Err(Error::Sync("info.json missing version field".into()));
                 }
                 Ok(info)
             }
-            _ => Ok(SyncInfo::default()),
+            // A v3 sync target must have an info.json. Missing means the target
+            // is a legacy target, which is unsupported.
+            None => Err(Error::Sync(
+                "info.json not found on sync target (legacy targets are not supported)".into(),
+            )),
         }
     }
 
@@ -147,7 +161,9 @@ impl<'a> SyncEngine<'a> {
             }
         };
         if hex_str.len() != 512 || !hex_str.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(Error::Crypto("decrypted master key has unexpected format".into()));
+            return Err(Error::Crypto(
+                "decrypted master key has unexpected format".into(),
+            ));
         }
         Ok(hex_str)
     }
@@ -156,30 +172,45 @@ impl<'a> SyncEngine<'a> {
     /// Returns the serialized item text.
     pub fn decrypt_item_blob(blob: &str, key_material_hex: &str) -> Result<String> {
         let header = jcrypto::decode_header(blob)?;
-        let md_size = usize::from_str_radix(&blob[5..11], 16).map_err(|_| Error::Crypto("bad header size".into()))?;
+        let md_size = usize::from_str_radix(&blob[5..11], 16)
+            .map_err(|_| Error::Crypto("bad header size".into()))?;
         let chunks = jcrypto::decode_chunks(&blob[11 + md_size..])?;
         let mut out = String::new();
         for chunk in chunks {
             match header.method {
                 jcrypto::METHOD_STRING_V1 => {
                     let plain = jcrypto::native_decrypt(key_material_hex, &chunk, 3)?;
-                    let units: Vec<u16> = plain.chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect();
+                    let units: Vec<u16> = plain
+                        .chunks_exact(2)
+                        .map(|p| u16::from_le_bytes([p[0], p[1]]))
+                        .collect();
                     out.push_str(&decode_utf16_lossy_combine(&units));
                 }
                 // Legacy SJCL item chunks: the chunk is an SJCL JSON blob whose
                 // plaintext is (for 1a/1b) escape()'d UTF-8 text.
-                jcrypto::METHOD_SJCL | jcrypto::METHOD_SJCL1A | jcrypto::METHOD_SJCL1B
-                | jcrypto::METHOD_SJCL2 | jcrypto::METHOD_SJCL3 | jcrypto::METHOD_SJCL4 => {
+                jcrypto::METHOD_SJCL
+                | jcrypto::METHOD_SJCL1A
+                | jcrypto::METHOD_SJCL1B
+                | jcrypto::METHOD_SJCL2
+                | jcrypto::METHOD_SJCL3
+                | jcrypto::METHOD_SJCL4 => {
                     let params = jcrypto::parse_sjcl(&chunk)?;
                     let plain = jcrypto::sjcl_ccm_decrypt(key_material_hex, &params)?;
-                    let text = String::from_utf8(plain).map_err(|_| Error::Crypto("sjcl item not utf8".into()))?;
-                    if header.method == jcrypto::METHOD_SJCL1A || header.method == jcrypto::METHOD_SJCL1B {
+                    let text = String::from_utf8(plain)
+                        .map_err(|_| Error::Crypto("sjcl item not utf8".into()))?;
+                    if header.method == jcrypto::METHOD_SJCL1A
+                        || header.method == jcrypto::METHOD_SJCL1B
+                    {
                         out.push_str(&jcrypto::sjcl_unescape(&text)?);
                     } else {
                         out.push_str(&text);
                     }
                 }
-                other => return Err(Error::Unsupported(format!("item encryption method {other} not supported"))),
+                other => {
+                    return Err(Error::Unsupported(format!(
+                        "item encryption method {other} not supported"
+                    )))
+                }
             }
         }
         Ok(out)
@@ -188,7 +219,8 @@ impl<'a> SyncEngine<'a> {
     /// Decrypt a resource blob (FileV1) with the given key material. Returns raw bytes.
     pub fn decrypt_resource_blob(blob: &str, key_material_hex: &str) -> Result<Vec<u8>> {
         let header = jcrypto::decode_header(blob)?;
-        let md_size = usize::from_str_radix(&blob[5..11], 16).map_err(|_| Error::Crypto("bad header size".into()))?;
+        let md_size = usize::from_str_radix(&blob[5..11], 16)
+            .map_err(|_| Error::Crypto("bad header size".into()))?;
         let chunks = jcrypto::decode_chunks(&blob[11 + md_size..])?;
         use base64::Engine;
         let mut raw = Vec::new();
@@ -198,7 +230,11 @@ impl<'a> SyncEngine<'a> {
                     let plain = jcrypto::native_decrypt(key_material_hex, &chunk, 3)?;
                     raw.extend_from_slice(&plain);
                 }
-                other => return Err(Error::Unsupported(format!("resource encryption method {other} not supported"))),
+                other => {
+                    return Err(Error::Unsupported(format!(
+                        "resource encryption method {other} not supported"
+                    )))
+                }
             }
         }
         base64::engine::general_purpose::STANDARD
@@ -207,8 +243,20 @@ impl<'a> SyncEngine<'a> {
     }
 
     /// Run one sync pass. `password` is only needed for encrypted vaults.
-    pub async fn sync(&self, password: Option<&str>, progress: &mut dyn FnMut(&str)) -> Result<SyncOutcome> {
-        let mut outcome = SyncOutcome { downloaded: 0, deleted: 0, skipped_unsupported: 0, resources_downloaded: 0, resources_pending: 0, errors: Vec::new(), pending_decryption: Vec::new() };
+    pub async fn sync(
+        &self,
+        password: Option<&str>,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<SyncOutcome> {
+        let mut outcome = SyncOutcome {
+            downloaded: 0,
+            deleted: 0,
+            skipped_unsupported: 0,
+            resources_downloaded: 0,
+            resources_pending: 0,
+            errors: Vec::new(),
+            pending_decryption: Vec::new(),
+        };
 
         progress("fetching info.json");
         let info = self.fetch_sync_info().await?;
@@ -228,7 +276,10 @@ impl<'a> SyncEngine<'a> {
         // ---- basicDelta: list root and diff against context ----
         progress("listing remote items");
         let stats = self.client.list("").await?;
-        let remote_files: Vec<&ItemStat> = stats.iter().filter(|s| !s.is_dir && items::is_system_path(&s.path)).collect();
+        let remote_files: Vec<&ItemStat> = stats
+            .iter()
+            .filter(|s| !s.is_dir && items::is_system_path(&s.path))
+            .collect();
 
         let context_json = self.storage.kv_get("delta_context")?.unwrap_or_default();
         let mut context: DeltaContext = if context_json.is_empty() {
@@ -275,7 +326,11 @@ impl<'a> SyncEngine<'a> {
                 })
                 .cloned()
                 .collect();
-            let percent_deleted = if local_ids.is_empty() { 0.0 } else { deleted.len() as f64 / local_ids.len() as f64 };
+            let percent_deleted = if local_ids.is_empty() {
+                0.0
+            } else {
+                deleted.len() as f64 / local_ids.len() as f64
+            };
             if percent_deleted >= FAILSAFE_THRESHOLD {
                 return Err(Error::Sync(format!(
                     "fail-safe: {:.0}% of items ({}) would be deleted - refusing. If this is intended, clear the local database.",
@@ -290,7 +345,7 @@ impl<'a> SyncEngine<'a> {
             }
         }
 
-        // ---- download loop (paginated by OUTPUT_LIMIT like basicDelta) ----
+        // ---- download loop ----
         let total = to_download.len();
         for (done, stat) in to_download.iter().enumerate() {
             if done % 10 == 0 {
@@ -300,7 +355,9 @@ impl<'a> SyncEngine<'a> {
             let text = match self.client.get_text(&stat.path).await? {
                 Some(t) => t,
                 None => {
-                    outcome.errors.push(format!(" vanished mid-sync: {}", stat.path));
+                    outcome
+                        .errors
+                        .push(format!(" vanished mid-sync: {}", stat.path));
                     continue;
                 }
             };
@@ -316,15 +373,20 @@ impl<'a> SyncEngine<'a> {
             let final_item = if text.starts_with("JED") {
                 let Some(km) = key_material.as_ref() else {
                     outcome.skipped_unsupported += 1;
-                    outcome.pending_decryption.push(items::path_to_id(&stat.path));
+                    outcome
+                        .pending_decryption
+                        .push(items::path_to_id(&stat.path));
                     // Store a minimal encrypted placeholder so the id is tracked.
                     let mut placeholder = items::unserialize(&format!(
                         "{}\n\nid: {}\nencryption_applied: 1\ntype_: 1",
-                        "(encrypted)", items::path_to_id(&stat.path)
+                        "(encrypted)",
+                        items::path_to_id(&stat.path)
                     ))?;
                     placeholder.body = String::new();
                     if let Err(e) = self.storage.upsert_item(&placeholder) {
-                        outcome.errors.push(format!("{}: store placeholder: {e}", stat.path));
+                        outcome
+                            .errors
+                            .push(format!("{}: store placeholder: {e}", stat.path));
                     }
                     continue;
                 };
@@ -332,7 +394,9 @@ impl<'a> SyncEngine<'a> {
                     Ok(plain) => match items::unserialize(&plain) {
                         Ok(p) => p,
                         Err(e) => {
-                            outcome.errors.push(format!("{}: decrypt parse: {e}", stat.path));
+                            outcome
+                                .errors
+                                .push(format!("{}: decrypt parse: {e}", stat.path));
                             continue;
                         }
                     },
@@ -354,22 +418,45 @@ impl<'a> SyncEngine<'a> {
                         continue;
                     }
                 };
-                let cipher_text = parsed.props.get("encryption_cipher_text").and_then(Value::as_str).unwrap_or_default().to_string();
-                if parsed.props.get("encryption_applied").and_then(Value::as_i64).unwrap_or(0) == 1 && !cipher_text.is_empty() {
+                let cipher_text = parsed
+                    .props
+                    .get("encryption_cipher_text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if parsed
+                    .props
+                    .get("encryption_applied")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0)
+                    == 1
+                    && !cipher_text.is_empty()
+                {
                     match &key_material {
                         Some(km) => match Self::decrypt_item_blob(&cipher_text, km) {
                             Ok(plain) => match items::unserialize(&plain) {
                                 Ok(mut p) => {
                                     // Restore the keepKeys that Joplin preserves on the outside.
-                                    for keep_key in ["id", "type_", "updated_time", "parent_id", "note_id", "tag_id"] {
+                                    for keep_key in [
+                                        "id",
+                                        "type_",
+                                        "updated_time",
+                                        "parent_id",
+                                        "note_id",
+                                        "tag_id",
+                                    ] {
                                         if let Some(v) = parsed.props.get(keep_key) {
-                                            p.props.entry(keep_key.to_string()).or_insert_with(|| v.clone());
+                                            p.props
+                                                .entry(keep_key.to_string())
+                                                .or_insert_with(|| v.clone());
                                         }
                                     }
                                     p
                                 }
                                 Err(e) => {
-                                    outcome.errors.push(format!("{}: decrypt parse: {e}", stat.path));
+                                    outcome
+                                        .errors
+                                        .push(format!("{}: decrypt parse: {e}", stat.path));
                                     continue;
                                 }
                             },
@@ -385,7 +472,9 @@ impl<'a> SyncEngine<'a> {
                         },
                         None => {
                             outcome.skipped_unsupported += 1;
-                            outcome.pending_decryption.push(items::path_to_id(&stat.path));
+                            outcome
+                                .pending_decryption
+                                .push(items::path_to_id(&stat.path));
                             parsed
                         }
                     }
@@ -398,7 +487,8 @@ impl<'a> SyncEngine<'a> {
                 outcome.errors.push(format!("{}: store: {e}", stat.path));
                 continue;
             }
-            self.storage.save_sync_time(&id, crate::time_ms(), stat.updated_time)?;
+            self.storage
+                .save_sync_time(&id, crate::time_ms(), stat.updated_time)?;
             outcome.downloaded += 1;
         }
 
@@ -406,17 +496,27 @@ impl<'a> SyncEngine<'a> {
         context.timestamp = new_timestamp;
         context.files_at_timestamp = files_at_timestamp;
         context.deleted_items_processed = false;
-        self.storage.kv_set("delta_context", &serde_json::to_string(&context).unwrap_or_default())?;
+        self.storage.kv_set(
+            "delta_context",
+            &serde_json::to_string(&context).unwrap_or_default(),
+        )?;
 
         // ---- retry items that were stored encrypted (password now available) ----
         if let Some(km) = &key_material {
             let still_encrypted = self.storage.items_still_encrypted()?;
             if !still_encrypted.is_empty() {
-                progress(&format!("retrying {} encrypted items", still_encrypted.len()));
+                progress(&format!(
+                    "retrying {} encrypted items",
+                    still_encrypted.len()
+                ));
                 for id in still_encrypted {
                     let path = items::system_path(&id);
-                    let Some(text) = self.client.get_text(&path).await? else { continue };
-                    match Self::decrypt_item_blob(&text, km).and_then(|plain| items::unserialize(&plain)) {
+                    let Some(text) = self.client.get_text(&path).await? else {
+                        continue;
+                    };
+                    match Self::decrypt_item_blob(&text, km)
+                        .and_then(|plain| items::unserialize(&plain))
+                    {
                         Ok(item) => {
                             if let Err(e) = self.storage.upsert_item(&item) {
                                 outcome.errors.push(format!("{path}: store: {e}"));
@@ -447,14 +547,23 @@ impl<'a> SyncEngine<'a> {
         Ok(outcome)
     }
 
-    async fn sync_resources(&self, key_material: Option<&str>, progress: &mut dyn FnMut(&str)) -> Result<(usize, usize, Vec<String>)> {
+    async fn sync_resources(
+        &self,
+        key_material: Option<&str>,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<(usize, usize, Vec<String>)> {
         let mut downloaded = 0;
         let mut pending = 0;
         let mut pending_errors = Vec::new();
         let resources = self.storage.items_by_type(crate::items::TYPE_RESOURCE)?;
         let total = resources.len();
         for (idx, res) in resources.iter().enumerate() {
-            let id = res.props.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+            let id = res
+                .props
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
             if id.is_empty() {
                 continue;
             }
@@ -464,7 +573,11 @@ impl<'a> SyncEngine<'a> {
             // Skip only when a blob is cached AND its blob_updated_time hasn't
             // advanced since the last fetch.
             let cached = self.storage.resource_blob(&id)?.is_some();
-            let blob_time = res.props.get("blob_updated_time").and_then(Value::as_i64).unwrap_or(0);
+            let blob_time = res
+                .props
+                .get("blob_updated_time")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
             let fetched_at = self.storage.resource_fetched_time(&id)?;
             if cached && fetched_at >= blob_time {
                 continue; // already downloaded and fresh
@@ -477,7 +590,8 @@ impl<'a> SyncEngine<'a> {
                 None => continue,
             };
             let data = if raw.starts_with(b"JED") {
-                let text = String::from_utf8(raw).map_err(|e| Error::Crypto(format!("resource {id}: not utf8: {e}")))?;
+                let text = String::from_utf8(raw)
+                    .map_err(|e| Error::Crypto(format!("resource {id}: not utf8: {e}")))?;
                 match key_material {
                     Some(km) => match Self::decrypt_resource_blob(&text, km) {
                         Ok(d) => d,
@@ -496,7 +610,8 @@ impl<'a> SyncEngine<'a> {
                 raw
             };
             self.storage.save_resource_blob(&id, &data)?;
-            self.storage.set_resource_fetched_time(&id, crate::time_ms())?;
+            self.storage
+                .set_resource_fetched_time(&id, crate::time_ms())?;
             downloaded += 1;
         }
         Ok((downloaded, pending, pending_errors))
@@ -514,7 +629,10 @@ fn decode_utf16_lossy_combine(units: &[u16]) -> String {
     let mut i = 0;
     while i < units.len() {
         let u = units[i];
-        if (0xD800..0xDC00).contains(&u) && i + 1 < units.len() && (0xDC00..0xE000).contains(&units[i + 1]) {
+        if (0xD800..0xDC00).contains(&u)
+            && i + 1 < units.len()
+            && (0xDC00..0xE000).contains(&units[i + 1])
+        {
             let cp = 0x10000 + ((u as u32 - 0xD800) << 10) + (units[i + 1] as u32 - 0xDC00);
             out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
             i += 2;

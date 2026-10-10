@@ -10,7 +10,11 @@ use std::io::Write;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "joplin-rs", version, about = "Read-only Joplin client (WebDAV + E2EE)")]
+#[command(
+    name = "joplin-rs",
+    version,
+    about = "Read-only Joplin client (WebDAV + E2EE)"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -46,9 +50,9 @@ enum Command {
         #[arg(long)]
         query: Option<String>,
     },
-    /// Show a note (markdown body) or item properties
+    /// Show a note (markdown body)
     Show { id: String },
-    /// Export a note to a markdown file (optionally with decrypted resources)
+    /// Export a note to a markdown file
     Export {
         id: String,
         /// Output file (default: stdout)
@@ -71,13 +75,18 @@ struct Config {
 
 fn config_path(cli: &Cli) -> PathBuf {
     cli.config.clone().unwrap_or_else(|| {
-        dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("joplin-rs").join("config.toml")
+        dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("joplin-rs")
+            .join("config.toml")
     })
 }
 
 fn data_dir(cli: &Cli) -> PathBuf {
     cli.data_dir.clone().unwrap_or_else(|| {
-        dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("joplin-rs")
+        dirs::data_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("joplin-rs")
     })
 }
 
@@ -121,7 +130,11 @@ async fn main() -> Result<()> {
         Command::Sync { password } => {
             let cfg = load_config(cli)?;
             let storage = db(cli)?;
-            let client = WebDavClient::new(&cfg.webdav_url, &cfg.username, cfg.password.as_deref().unwrap_or(""))?;
+            let client = WebDavClient::new(
+                &cfg.webdav_url,
+                &cfg.username,
+                cfg.password.as_deref().unwrap_or(""),
+            )?;
             let engine = SyncEngine::new(&client, &storage);
             let password = resolve_password(&cfg, password.clone())?;
             let outcome = engine
@@ -145,7 +158,11 @@ async fn main() -> Result<()> {
         }
         Command::Doctor { password } => {
             let cfg = load_config(cli)?;
-            let client = WebDavClient::new(&cfg.webdav_url, &cfg.username, cfg.password.as_deref().unwrap_or(""))?;
+            let client = WebDavClient::new(
+                &cfg.webdav_url,
+                &cfg.username,
+                cfg.password.as_deref().unwrap_or(""),
+            )?;
             println!("url: {}", cfg.webdav_url);
             let tmp_storage = Storage::open_in_memory()?;
             let engine = SyncEngine::new(&client, &tmp_storage);
@@ -165,7 +182,11 @@ async fn main() -> Result<()> {
                 println!("master key: n/a (encryption disabled)");
             }
         }
-        Command::List { item_type, folder, query } => {
+        Command::List {
+            item_type,
+            folder,
+            query,
+        } => {
             let storage = db(cli)?;
             let t = type_from_str(item_type)?;
             let items: Vec<joplin_rs_core::items::Item> = if t == joplin_rs_core::items::TYPE_NOTE {
@@ -178,10 +199,30 @@ async fn main() -> Result<()> {
                 storage.items_by_type(t)?
             };
             for item in items {
-                let id = item.props.get("id").and_then(serde_json::Value::as_str).unwrap_or("?");
-                let title = item.props.get("title").and_then(serde_json::Value::as_str).unwrap_or("(no title)");
-                let flag = if item.props.get("is_todo").and_then(serde_json::Value::as_i64).unwrap_or(0) == 1 {
-                    if item.props.get("todo_completed").and_then(serde_json::Value::as_i64).unwrap_or(0) > 0 {
+                let id = item
+                    .props
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?");
+                let title = item
+                    .props
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("(no title)");
+                let flag = if item
+                    .props
+                    .get("is_todo")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0)
+                    == 1
+                {
+                    if item
+                        .props
+                        .get("todo_completed")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0)
+                        > 0
+                    {
                         "[x] "
                     } else {
                         "[ ] "
@@ -195,7 +236,11 @@ async fn main() -> Result<()> {
         Command::Show { id } => {
             let storage = db(cli)?;
             let note = storage.note(id)?.context("note not found")?;
-            let title = note.props.get("title").and_then(serde_json::Value::as_str).unwrap_or("");
+            let title = note
+                .props
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
             println!("{title}");
             println!("{}", "=".repeat(title.len()));
             println!("{}", note.body);
@@ -203,7 +248,11 @@ async fn main() -> Result<()> {
         Command::Export { id, output } => {
             let storage = db(cli)?;
             let note = storage.note(id)?.context("note not found")?;
-            let title = note.props.get("title").and_then(serde_json::Value::as_str).unwrap_or("note");
+            let title = note
+                .props
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("note");
             let content = format!("# {title}\n\n{}", note.body);
             match output {
                 Some(path) => {

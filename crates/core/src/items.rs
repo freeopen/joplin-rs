@@ -177,7 +177,10 @@ pub struct Item {
 }
 
 fn is_timestamp_field(name: &str) -> bool {
-    matches!(name, "created_time" | "updated_time" | "user_created_time" | "user_updated_time")
+    matches!(
+        name,
+        "created_time" | "updated_time" | "user_created_time" | "user_updated_time"
+    )
 }
 
 /// Convert a serialized string prop to its typed value (unserialize_format).
@@ -185,7 +188,8 @@ fn unserialize_prop(field_type: i64, name: &str, value: &str) -> Result<Value> {
     if name.ends_with('_') {
         return Ok(Value::String(value.to_string()));
     }
-    let fields = table_fields(field_type).ok_or_else(|| Error::Storage(format!("unknown item type {field_type}")))?;
+    let fields = table_fields(field_type)
+        .ok_or_else(|| Error::Storage(format!("unknown item type {field_type}")))?;
     let ftype = fields
         .iter()
         .find(|(n, _)| *n == name)
@@ -208,7 +212,9 @@ fn unserialize_prop(field_type: i64, name: &str, value: &str) -> Result<Value> {
             if v.is_empty() {
                 Value::Number(0.into())
             } else {
-                let n: f64 = v.parse().map_err(|_| Error::Storage(format!("bad int field {name}={v}")))?;
+                let n: f64 = v
+                    .parse()
+                    .map_err(|_| Error::Storage(format!("bad int field {name}={v}")))?;
                 Value::Number((n as i64).into())
             }
         }
@@ -216,8 +222,12 @@ fn unserialize_prop(field_type: i64, name: &str, value: &str) -> Result<Value> {
             if v.is_empty() {
                 Value::Number(0.into())
             } else {
-                let n: f64 = v.parse().map_err(|_| Error::Storage(format!("bad numeric field {name}={v}")))?;
-                serde_json::Number::from_f64(n).map(Value::Number).unwrap_or(Value::Number(0.into()))
+                let n: f64 = v
+                    .parse()
+                    .map_err(|_| Error::Storage(format!("bad numeric field {name}={v}")))?;
+                serde_json::Number::from_f64(n)
+                    .map(Value::Number)
+                    .unwrap_or(Value::Number(0.into()))
             }
         }
         FieldType::Text => Value::String(v),
@@ -236,7 +246,13 @@ fn parse_iso8601_ms(s: &str) -> Result<i64> {
 pub fn serialize_prop(name: &str, value: &Value) -> String {
     let raw = match value {
         Value::Null => String::new(),
-        Value::Bool(b) => if *b { "1".into() } else { "0".into() },
+        Value::Bool(b) => {
+            if *b {
+                "1".into()
+            } else {
+                "0".into()
+            }
+        }
         Value::Number(n) => n.to_string(),
         Value::String(s) => s.clone(),
         other => other.to_string(),
@@ -255,7 +271,8 @@ pub fn serialize_prop(name: &str, value: &Value) -> String {
 fn format_ms_iso8601(ms: i64) -> String {
     let secs = ms.div_euclid(1000);
     let millis = ms.rem_euclid(1000);
-    let t = time::OffsetDateTime::from_unix_timestamp(secs).unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+    let t =
+        time::OffsetDateTime::from_unix_timestamp(secs).unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
     let year = t.year();
     let month = u8::from(t.month());
     let day = t.day();
@@ -269,7 +286,6 @@ fn escape_prop(s: &str) -> String {
         .replace('\n', "\\n")
         .replace('\r', "\\r")
 }
-
 
 /// Unserialize an item blob (BaseItem.unserialize).
 pub fn unserialize(content: &str) -> Result<Item> {
@@ -295,10 +311,15 @@ pub fn unserialize(content: &str) -> Result<Item> {
         props.insert(key, value);
     }
 
-    let type_str = props.get("type_").ok_or_else(|| Error::Storage("missing required property: type_".into()))?;
-    let item_type: i64 = type_str.parse().map_err(|_| Error::Storage(format!("bad type_: {type_str}")))?;
+    let type_str = props
+        .get("type_")
+        .ok_or_else(|| Error::Storage("missing required property: type_".into()))?;
+    let item_type: i64 = type_str
+        .parse()
+        .map_err(|_| Error::Storage(format!("bad type_: {type_str}")))?;
 
-    let fields = table_fields(item_type).ok_or_else(|| Error::Storage(format!("unknown item type {item_type}")))?;
+    let fields = table_fields(item_type)
+        .ok_or_else(|| Error::Storage(format!("unknown item type {item_type}")))?;
     let mut out_props = BTreeMap::new();
     for (key, value) in &props {
         if !fields.iter().any(|(n, _)| n == key) && key != "type_" {
@@ -317,8 +338,10 @@ pub fn unserialize(content: &str) -> Result<Item> {
         let mut body_lines: Vec<&str> = lines[..end].to_vec();
         if !body_lines.is_empty() {
             let title = body_lines.remove(0); // title is the first line
-            // TS unserialize sets output.title from the first body line for all items.
-            out_props.entry("title".to_string()).or_insert_with(|| Value::String(title.to_string()));
+                                              // TS unserialize sets output.title from the first body line for all items.
+            out_props
+                .entry("title".to_string())
+                .or_insert_with(|| Value::String(title.to_string()));
             // Skip the blank line between title and body.
             while body_lines.first().is_some_and(|l| l.trim().is_empty()) {
                 body_lines.remove(0);
@@ -327,7 +350,11 @@ pub fn unserialize(content: &str) -> Result<Item> {
         }
     }
 
-    Ok(Item { item_type, props: out_props, body })
+    Ok(Item {
+        item_type,
+        props: out_props,
+        body,
+    })
 }
 
 fn is_valid_item_id(id: &str) -> bool {
@@ -350,7 +377,10 @@ pub fn path_to_id(path: &str) -> String {
 pub fn is_system_path(path: &str) -> bool {
     let last = path.split('/').next_back().unwrap_or(path);
     let parts: Vec<&str> = last.split('.').collect();
-    parts.len() == 2 && parts[0].len() == 32 && parts[1] == "md" && parts[0].chars().all(|c| c.is_ascii_hexdigit())
+    parts.len() == 2
+        && parts[0].len() == 32
+        && parts[1] == "md"
+        && parts[0].chars().all(|c| c.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
@@ -378,16 +408,25 @@ mod tests {
     fn unserialize_note() {
         let item = unserialize(SAMPLE).unwrap();
         assert_eq!(item.item_type, TYPE_NOTE);
-        assert_eq!(item.props["id"], Value::String("0f1e2d3c4b5a69788796a5b4c3d2e1f0".into()));
+        assert_eq!(
+            item.props["id"],
+            Value::String("0f1e2d3c4b5a69788796a5b4c3d2e1f0".into())
+        );
         assert_eq!(item.props["is_todo"], Value::Number(1.into()));
-        assert_eq!(item.props["todo_completed"], Value::Number(1700000000000u64.into()));
+        assert_eq!(
+            item.props["todo_completed"],
+            Value::Number(1700000000000u64.into())
+        );
         assert_eq!(item.body, "Hello world\nsecond line");
         assert!(item.props.contains_key("markup_language"));
     }
 
     #[test]
     fn path_helpers() {
-        assert_eq!(path_to_id("0f1e2d3c4b5a69788796a5b4c3d2e1f0.md"), "0f1e2d3c4b5a69788796a5b4c3d2e1f0");
+        assert_eq!(
+            path_to_id("0f1e2d3c4b5a69788796a5b4c3d2e1f0.md"),
+            "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+        );
         assert_eq!(path_to_id(".resource/abc123"), "abc123");
         assert!(is_system_path("0f1e2d3c4b5a69788796a5b4c3d2e1f0.md"));
         assert!(!is_system_path(".resource/abc123"));
@@ -397,7 +436,8 @@ mod tests {
 
     #[test]
     fn unserialize_skips_unknown_fields() {
-        let blob = "Note\n\nbody\n\nid: 0f1e2d3c4b5a69788796a5b4c3d2e1f0\nsome_unknown: 1\ntype_: 1";
+        let blob =
+            "Note\n\nbody\n\nid: 0f1e2d3c4b5a69788796a5b4c3d2e1f0\nsome_unknown: 1\ntype_: 1";
         let item = unserialize(blob).unwrap();
         assert!(!item.props.contains_key("some_unknown"));
         assert_eq!(item.body, "body");

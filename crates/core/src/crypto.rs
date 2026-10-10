@@ -44,7 +44,12 @@ fn is_valid_header_identifier(id: &str) -> bool {
 
 /// Decode the JED01 header from the start of an encrypted blob.
 pub fn decode_header(data: &str) -> Result<EncryptionHeader> {
-    let invalid = || Error::Crypto(format!("invalid encryption identifier: {}", &data.chars().take(16).collect::<String>()));
+    let invalid = || {
+        Error::Crypto(format!(
+            "invalid encryption identifier: {}",
+            &data.chars().take(16).collect::<String>()
+        ))
+    };
     if data.len() < 5 + 6 {
         return Err(invalid());
     }
@@ -55,14 +60,20 @@ pub fn decode_header(data: &str) -> Result<EncryptionHeader> {
     let md_size_hex = &data[5..11];
     let md_size = usize::from_str_radix(md_size_hex, 16).map_err(|_| invalid())?;
     if md_size == 0 || data.len() < 11 + md_size {
-        return Err(Error::Crypto(format!("invalid header metadata size: {md_size_hex}")));
+        return Err(Error::Crypto(format!(
+            "invalid header metadata size: {md_size_hex}"
+        )));
     }
     let metadata = &data[11..11 + md_size];
     if metadata.len() < 2 + 32 {
         return Err(Error::Crypto("header metadata too short".into()));
     }
-    let method = i64::from_str_radix(&metadata[..2], 16).map_err(|_| Error::Crypto("bad method hex".into()))?;
-    Ok(EncryptionHeader { method, master_key_id: metadata[2..34].to_string() })
+    let method = i64::from_str_radix(&metadata[..2], 16)
+        .map_err(|_| Error::Crypto("bad method hex".into()))?;
+    Ok(EncryptionHeader {
+        method,
+        master_key_id: metadata[2..34].to_string(),
+    })
 }
 
 /// Parse the remaining chunks after the header: (6-hex length, payload) pairs.
@@ -75,7 +86,8 @@ pub fn decode_chunks(data: &str) -> Result<Vec<String>> {
             return Err(Error::Crypto(format!("invalid block size at {index}")));
         }
         let length_hex = &data[index..index + 6];
-        let length = usize::from_str_radix(length_hex, 16).map_err(|_| Error::Crypto(format!("invalid block size: {length_hex}")))?;
+        let length = usize::from_str_radix(length_hex, 16)
+            .map_err(|_| Error::Crypto(format!("invalid block size: {length_hex}")))?;
         index += 6;
         if length == 0 {
             continue;
@@ -102,12 +114,22 @@ pub struct NativeEnvelope {
 }
 
 pub fn parse_native_envelope(json: &str) -> Result<NativeEnvelope> {
-    let v: Value = serde_json::from_str(json).map_err(|e| Error::Crypto(format!("bad envelope json: {e}")))?;
+    let v: Value =
+        serde_json::from_str(json).map_err(|e| Error::Crypto(format!("bad envelope json: {e}")))?;
     let b64 = |key: &str| -> Result<Vec<u8>> {
-        let s = v.get(key).and_then(Value::as_str).ok_or_else(|| Error::Crypto(format!("missing {key}")))?;
-        base64::engine::general_purpose::STANDARD.decode(s).map_err(|e| Error::Crypto(format!("bad base64 in {key}: {e}")))
+        let s = v
+            .get(key)
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Crypto(format!("missing {key}")))?;
+        base64::engine::general_purpose::STANDARD
+            .decode(s)
+            .map_err(|e| Error::Crypto(format!("bad base64 in {key}: {e}")))
     };
-    Ok(NativeEnvelope { salt: b64("salt")?, iv: b64("iv")?, ct: b64("ct")? })
+    Ok(NativeEnvelope {
+        salt: b64("salt")?,
+        iv: b64("iv")?,
+        ct: b64("ct")?,
+    })
 }
 
 fn derive_key(password: &str, salt: &[u8], iterations: u32) -> Result<[u8; 32]> {
@@ -125,8 +147,16 @@ pub fn native_decrypt(password: &str, envelope_json: &str, iterations: u32) -> R
     let nonce = Nonce::from_slice(&env.iv);
     // Joplin uses an empty associated data payload.
     let plain = cipher
-        .decrypt(nonce, Payload { msg: &env.ct, aad: &[] })
-        .map_err(|_| Error::Crypto("AES-GCM decrypt failed (wrong password or corrupted data)".into()))?;
+        .decrypt(
+            nonce,
+            Payload {
+                msg: &env.ct,
+                aad: &[],
+            },
+        )
+        .map_err(|_| {
+            Error::Crypto("AES-GCM decrypt failed (wrong password or corrupted data)".into())
+        })?;
     Ok(plain)
 }
 
@@ -137,7 +167,13 @@ pub fn native_encrypt(password: &str, salt: &[u8], data: &[u8], iterations: u32)
     use rand::RngCore;
     rand::rngs::OsRng.fill_bytes(&mut iv);
     let ct = cipher
-        .encrypt(Nonce::from_slice(&iv), Payload { msg: data, aad: &[] })
+        .encrypt(
+            Nonce::from_slice(&iv),
+            Payload {
+                msg: data,
+                aad: &[],
+            },
+        )
         .map_err(|e| Error::Crypto(format!("AES-GCM encrypt failed: {e}")))?;
     let b64 = base64::engine::general_purpose::STANDARD;
     Ok(serde_json::json!({
@@ -165,19 +201,28 @@ pub struct SjclParams {
 }
 
 pub fn parse_sjcl(json: &str) -> Result<SjclParams> {
-    let v: Value = serde_json::from_str(json).map_err(|e| Error::Crypto(format!("bad sjcl json: {e}")))?;
+    let v: Value =
+        serde_json::from_str(json).map_err(|e| Error::Crypto(format!("bad sjcl json: {e}")))?;
     let get = |key: &str| v.get(key).cloned().unwrap_or(Value::Null);
     let b64 = |val: &Value| -> Result<Vec<u8>> {
-        let s = val.as_str().ok_or_else(|| Error::Crypto("sjcl field not a string".into()))?;
+        let s = val
+            .as_str()
+            .ok_or_else(|| Error::Crypto("sjcl field not a string".into()))?;
         // SJCL uses base64url-ish charset without padding; canonical base64 also decodes it.
         base64::engine::general_purpose::STANDARD
             .decode(s)
-            .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(s.trim_end_matches('=')))
+            .or_else(|_| {
+                base64::engine::general_purpose::STANDARD_NO_PAD.decode(s.trim_end_matches('='))
+            })
             .map_err(|e| Error::Crypto(format!("bad sjcl base64: {e}")))
     };
     let salt_value = get("salt");
     let empty_salt = Value::String(String::new());
-    let salt_ref = if salt_value.is_null() { &empty_salt } else { &salt_value };
+    let salt_ref = if salt_value.is_null() {
+        &empty_salt
+    } else {
+        &salt_value
+    };
     Ok(SjclParams {
         iv: b64(&get("iv"))?,
         salt: b64(salt_ref)?,
@@ -195,10 +240,16 @@ pub fn parse_sjcl(json: &str) -> Result<SjclParams> {
 /// message length field (2..4, chosen from the plaintext size).
 pub fn sjcl_ccm_decrypt(password: &str, params: &SjclParams) -> Result<Vec<u8>> {
     if params.mode != "ccm" {
-        return Err(Error::Unsupported(format!("sjcl mode {} not supported", params.mode)));
+        return Err(Error::Unsupported(format!(
+            "sjcl mode {} not supported",
+            params.mode
+        )));
     }
     if params.cipher != "aes" || (params.ks != 128 && params.ks != 256) {
-        return Err(Error::Crypto(format!("unsupported sjcl cipher {} ks {}", params.cipher, params.ks)));
+        return Err(Error::Crypto(format!(
+            "unsupported sjcl cipher {} ks {}",
+            params.cipher, params.ks
+        )));
     }
 
     let key_len = (params.ks / 8) as usize;
@@ -219,7 +270,10 @@ pub fn sjcl_ccm_decrypt(password: &str, params: &SjclParams) -> Result<Vec<u8>> 
     };
     let nonce_len = 15 - f;
     if params.iv.len() < nonce_len {
-        return Err(Error::Crypto(format!("sjcl iv too short: {} < {nonce_len}", params.iv.len())));
+        return Err(Error::Crypto(format!(
+            "sjcl iv too short: {} < {nonce_len}",
+            params.iv.len()
+        )));
     }
     let nonce = &params.iv[..nonce_len];
 
@@ -232,7 +286,10 @@ pub fn sjcl_ccm_decrypt(password: &str, params: &SjclParams) -> Result<Vec<u8>> 
 }
 fn ccm_decrypt_inner<A>(key: &[u8], nonce: &[u8], tag_len: usize, ct: &[u8]) -> Result<Vec<u8>>
 where
-    A: aes::cipher::BlockCipher + aes::cipher::BlockEncrypt + aes::cipher::KeyInit + aes::cipher::BlockSizeUser<BlockSize = aes::cipher::typenum::U16>,
+    A: aes::cipher::BlockCipher
+        + aes::cipher::BlockEncrypt
+        + aes::cipher::KeyInit
+        + aes::cipher::BlockSizeUser<BlockSize = aes::cipher::typenum::U16>,
 {
     // SJCL CCM (NOT standard CCM). Mirrors sjcl.mode.ccm.decrypt:
     // 1. data = CTR-decrypt(msg) with keystream blocks E((L-1) || nonce || counter) for counter = 1..
@@ -304,7 +361,9 @@ where
     cipher.encrypt_block(&mut s0);
     for idx in 0..tag_len {
         if mac[idx] ^ s0[idx] != tag[idx] {
-            return Err(Error::Crypto("AES-CCM tag mismatch (wrong password or corrupted data)".into()));
+            return Err(Error::Crypto(
+                "AES-CCM tag mismatch (wrong password or corrupted data)".into(),
+            ));
         }
     }
     Ok(plaintext)
@@ -345,8 +404,12 @@ pub fn debug_ccm_trace(key: &[u8], nonce: &[u8], tag_len: usize, ct: &[u8]) -> V
     while i < msg_len {
         let n = (msg_len - i).min(16);
         let mut cur = [0u8; 16];
-        for j in 0..n { cur[j] = mac[j] ^ msg[i + j]; }
-        for j in n..16 { cur[j] = mac[j]; }
+        for j in 0..n {
+            cur[j] = mac[j] ^ msg[i + j];
+        }
+        for j in n..16 {
+            cur[j] = mac[j];
+        }
         mac = Block::clone_from_slice(&cur);
         cipher.encrypt_block(&mut mac);
         i += n;
@@ -392,12 +455,14 @@ pub fn sjcl_unescape(s: &str) -> Result<String> {
             && i + 6 <= bytes.len()
         {
             // %uXXXX (with surrogate pair combining)
-            let hex_str = std::str::from_utf8(&bytes[i + 2..i + 6]).map_err(|_| Error::Crypto("bad escape".into()))?;
+            let hex_str = std::str::from_utf8(&bytes[i + 2..i + 6])
+                .map_err(|_| Error::Crypto("bad escape".into()))?;
             if let Ok(unit) = u32::from_str_radix(hex_str, 16) {
                 if (0xD800..0xDC00).contains(&unit) {
                     // High surrogate: try to consume a following %uXXXX low surrogate.
                     if i + 12 <= bytes.len() && bytes[i + 6] == b'%' && bytes[i + 7] == b'u' {
-                        let low_hex = std::str::from_utf8(&bytes[i + 8..i + 12]).map_err(|_| Error::Crypto("bad escape".into()))?;
+                        let low_hex = std::str::from_utf8(&bytes[i + 8..i + 12])
+                            .map_err(|_| Error::Crypto("bad escape".into()))?;
                         if let Ok(low) = u32::from_str_radix(low_hex, 16) {
                             if (0xDC00..0xE000).contains(&low) {
                                 let cp = 0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00);
@@ -423,7 +488,8 @@ pub fn sjcl_unescape(s: &str) -> Result<String> {
             out.push('%');
             i += 1;
         } else if bytes[i] == b'%' && i + 2 < bytes.len() + 1 && i + 3 <= bytes.len() {
-            let hex_str = std::str::from_utf8(&bytes[i + 1..i + 3]).map_err(|_| Error::Crypto("bad escape".into()))?;
+            let hex_str = std::str::from_utf8(&bytes[i + 1..i + 3])
+                .map_err(|_| Error::Crypto("bad escape".into()))?;
             match u8::from_str_radix(hex_str, 16) {
                 Ok(byte) => {
                     // JS unescape maps %XX to char U+00XX (latin-1 range).
@@ -439,7 +505,10 @@ pub fn sjcl_unescape(s: &str) -> Result<String> {
             // Copy as a UTF-8 sequence (multi-byte chars pass through unescaped).
             let ch_len = utf8_len(bytes[i]);
             let end = (i + ch_len).min(bytes.len());
-            out.push_str(std::str::from_utf8(&bytes[i..end]).map_err(|_| Error::Crypto("bad utf8".into()))?);
+            out.push_str(
+                std::str::from_utf8(&bytes[i..end])
+                    .map_err(|_| Error::Crypto("bad utf8".into()))?,
+            );
             i = end;
         }
     }

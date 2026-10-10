@@ -21,7 +21,8 @@ A read-only Joplin client written in Rust:
   - item payloads encrypted with legacy SJCL (method 1a/1b/3/4) as well as `StringV1`
   - `SJCL`/`SJCL2` (OCB2) and PPK (RSA) master keys are reported as unsupported
     per item instead of failing the sync
-- Local storage: SQLite (`items` + `sync_items` + `kv` + `resource_blobs`)
+- Local storage: SQLite (`items` + `sync_items` + `kv` + `resource_blobs` +
+  `resource_fetch_times`)
 - CLI: `sync`, `doctor`, `list`, `show`, `export`
 - Encrypted-then-decrypt flow: sync without a password stores items
   encrypted (`pending decryption`); a later sync with the password decrypts
@@ -87,6 +88,10 @@ cargo test --workspace
 - `crates/core/tests/e2e_sync.rs`: full sync against a fake WebDAV server
   serving a TS-generated encrypted vault; asserts note/folder/tag/resource
   parity, no-op re-sync, deletions, fail-safe and wrong-password behaviour
+- `crates/core/tests/legacy_sjcl_sync.rs`: full sync of a legacy SJCL vault
+  (SJCL4 master key + SJCL1b items)
+- `crates/core/tests/plaintext_resource.rs`: unencrypted vault with a binary
+  resource must round-trip byte-exact
 
 ## Not implemented (by design)
 

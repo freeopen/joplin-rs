@@ -15,14 +15,19 @@ struct Config {
 }
 
 fn config_path() -> PathBuf {
-    dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("joplin-rs").join("config.toml")
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("joplin-rs")
+        .join("config.toml")
 }
 
 fn data_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("JOPLIN_RS_DATA_DIR") {
         return PathBuf::from(dir);
     }
-    dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("joplin-rs")
+    dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("joplin-rs")
 }
 
 struct App {
@@ -87,8 +92,18 @@ impl App {
             .collect();
         let mut map: std::collections::HashMap<String, Vec<String>> = Default::default();
         for nt in note_tags {
-            let note_id = nt.props.get("note_id").and_then(serde_json::Value::as_str).unwrap_or_default().to_string();
-            let tag_id = nt.props.get("tag_id").and_then(serde_json::Value::as_str).unwrap_or_default().to_string();
+            let note_id = nt
+                .props
+                .get("note_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let tag_id = nt
+                .props
+                .get("tag_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
             if let Some(title) = tag_titles.get(&tag_id) {
                 map.entry(note_id).or_default().push(title.clone());
             }
@@ -98,7 +113,9 @@ impl App {
 
     fn load_notes(&mut self) {
         self.notes = if self.search.is_empty() {
-            self.storage.notes(self.selected_folder.as_deref().unwrap_or(""), true).unwrap_or_default()
+            self.storage
+                .notes(self.selected_folder.as_deref().unwrap_or(""), true)
+                .unwrap_or_default()
         } else {
             self.storage.search_notes(&self.search).unwrap_or_default()
         };
@@ -106,20 +123,27 @@ impl App {
 
     fn open_note(&mut self, id: &str) {
         if let Ok(Some(note)) = self.storage.note(id) {
-            self.note_title = note.props.get("title").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+            self.note_title = note
+                .props
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
             let mut body = note.body.clone();
             // Rewrite Joplin resource links ":/id" to decrypted temp files.
             self.resource_dir = data_dir().join("resources");
             let _ = std::fs::create_dir_all(&self.resource_dir);
             let resource_ids = crate_resource_ids(&body);
             for rid in resource_ids {
-                let mime = self
-                    .storage
-                    .resource(&rid)
-                    .ok()
-                    .flatten()
-                    .and_then(|r| r.props.get("mime").and_then(serde_json::Value::as_str).map(String::from));
-                let Some(data) = self.storage.resource_blob(&rid).ok().flatten() else { continue };
+                let mime = self.storage.resource(&rid).ok().flatten().and_then(|r| {
+                    r.props
+                        .get("mime")
+                        .and_then(serde_json::Value::as_str)
+                        .map(String::from)
+                });
+                let Some(data) = self.storage.resource_blob(&rid).ok().flatten() else {
+                    continue;
+                };
                 let ext = match mime.as_deref() {
                     Some("image/png") => "png",
                     Some("image/jpeg") => "jpg",
@@ -159,7 +183,10 @@ impl App {
         let ctx = ctx.clone();
 
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
             let status_async = status.clone();
             let result = rt.block_on(async move {
                 let storage = Storage::open(&data_dir.join("joplin-rs.db"))?;
@@ -195,7 +222,11 @@ impl eframe::App for App {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label("E2EE password:");
-                ui.add(egui::TextEdit::singleline(&mut self.e2ee_password).password(true).desired_width(140.0));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.e2ee_password)
+                        .password(true)
+                        .desired_width(140.0),
+                );
                 if ui.button("Sync").clicked() {
                     self.start_sync(ctx);
                 }
@@ -223,67 +254,118 @@ impl eframe::App for App {
         });
 
         // Left: folders + note list
-        egui::SidePanel::left("left").min_width(280.0).show(ctx, |ui| {
-            ui.heading("Notebooks");
-            if ui.selectable_label(self.selected_folder.is_none(), "All notes").clicked() {
-                self.selected_folder = None;
-                self.load_notes();
-            }
-            egui::ScrollArea::vertical().max_height(180.0).id_salt("folders").show(ui, |ui| {
-                let folders = self.folders.clone();
-                for folder in &folders {
-                    let id = folder.props.get("id").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
-                    let title = folder.props.get("title").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
-                    if ui.selectable_label(self.selected_folder.as_deref() == Some(id.as_str()), &title).clicked() {
-                        self.selected_folder = Some(id);
-                        self.load_notes();
-                    }
+        egui::SidePanel::left("left")
+            .min_width(280.0)
+            .show(ctx, |ui| {
+                ui.heading("Notebooks");
+                if ui
+                    .selectable_label(self.selected_folder.is_none(), "All notes")
+                    .clicked()
+                {
+                    self.selected_folder = None;
+                    self.load_notes();
                 }
-            });
-            ui.separator();
-            ui.heading("Notes");
-            egui::ScrollArea::vertical().auto_shrink(false).id_salt("notes").show(ui, |ui| {
-                let notes = self.notes.clone();
-                let note_tags = self.note_tags.clone();
-                for note in &notes {
-                    let id = note.props.get("id").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
-                    let title = note.props.get("title").and_then(serde_json::Value::as_str).unwrap_or("(no title)").to_string();
-                    let is_todo = note.props.get("is_todo").and_then(serde_json::Value::as_i64).unwrap_or(0) == 1;
-                    let done = note.props.get("todo_completed").and_then(serde_json::Value::as_i64).unwrap_or(0) > 0;
-                    let label = if is_todo {
-                        format!("{} {}", if done { "\u{2611}" } else { "\u{2610}" }, title)
-                    } else {
-                        title.clone()
-                    };
-                    let selected = self.selected_note.as_deref() == Some(id.as_str());
-                    if ui.selectable_label(selected, label).clicked() {
-                        self.open_note(&id);
-                    }
-                    if let Some(tags) = note_tags.get(&id) {
-                        if !tags.is_empty() {
-                            ui.horizontal(|ui| {
-                                for t in tags {
-                                    ui.small(format!("#{t}"));
-                                }
-                            });
+                egui::ScrollArea::vertical()
+                    .max_height(180.0)
+                    .id_salt("folders")
+                    .show(ui, |ui| {
+                        let folders = self.folders.clone();
+                        for folder in &folders {
+                            let id = folder
+                                .props
+                                .get("id")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                            let title = folder
+                                .props
+                                .get("title")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                            if ui
+                                .selectable_label(
+                                    self.selected_folder.as_deref() == Some(id.as_str()),
+                                    &title,
+                                )
+                                .clicked()
+                            {
+                                self.selected_folder = Some(id);
+                                self.load_notes();
+                            }
                         }
-                    }
-                }
+                    });
+                ui.separator();
+                ui.heading("Notes");
+                egui::ScrollArea::vertical()
+                    .auto_shrink(false)
+                    .id_salt("notes")
+                    .show(ui, |ui| {
+                        let notes = self.notes.clone();
+                        let note_tags = self.note_tags.clone();
+                        for note in &notes {
+                            let id = note
+                                .props
+                                .get("id")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                            let title = note
+                                .props
+                                .get("title")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("(no title)")
+                                .to_string();
+                            let is_todo = note
+                                .props
+                                .get("is_todo")
+                                .and_then(serde_json::Value::as_i64)
+                                .unwrap_or(0)
+                                == 1;
+                            let done = note
+                                .props
+                                .get("todo_completed")
+                                .and_then(serde_json::Value::as_i64)
+                                .unwrap_or(0)
+                                > 0;
+                            let label = if is_todo {
+                                format!("{} {}", if done { "\u{2611}" } else { "\u{2610}" }, title)
+                            } else {
+                                title.clone()
+                            };
+                            let selected = self.selected_note.as_deref() == Some(id.as_str());
+                            if ui.selectable_label(selected, label).clicked() {
+                                self.open_note(&id);
+                            }
+                            if let Some(tags) = note_tags.get(&id) {
+                                if !tags.is_empty() {
+                                    ui.horizontal(|ui| {
+                                        for t in tags {
+                                            ui.small(format!("#{t}"));
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                    });
             });
-        });
 
         // Right: rendered note
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.selected_note.is_none() {
-                ui.centered_and_justified(|ui| ui.weak("Select a note, then press Sync to download the vault."));
+                ui.centered_and_justified(|ui| {
+                    ui.weak("Select a note, then press Sync to download the vault.")
+                });
                 return;
             }
             ui.heading(&self.note_title);
             ui.separator();
-            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-                let mut cache = egui_commonmark::CommonMarkCache::default();
-                egui_commonmark::CommonMarkViewer::new().show(ui, &mut cache, &self.note_body);
-            });
+            egui::ScrollArea::vertical()
+                .auto_shrink(false)
+                .show(ui, |ui| {
+                    let mut cache = egui_commonmark::CommonMarkCache::default();
+                    egui_commonmark::CommonMarkViewer::new().show(ui, &mut cache, &self.note_body);
+                });
         });
     }
 }

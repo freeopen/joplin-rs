@@ -10,7 +10,7 @@
 //! columns (title/body/parent_id/timestamps) power list queries and search.
 
 use crate::error::{Error, Result};
-use crate::items::{Item, unserialize};
+use crate::items::{unserialize, Item};
 use rusqlite::Connection;
 use serde_json::Value;
 use std::path::Path;
@@ -31,7 +31,8 @@ impl Storage {
     }
 
     pub fn open_in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory().map_err(|e| Error::Storage(format!("open db: {e}")))?;
+        let conn =
+            Connection::open_in_memory().map_err(|e| Error::Storage(format!("open db: {e}")))?;
         let storage = Self { conn };
         storage.migrate()?;
         Ok(storage)
@@ -90,15 +91,30 @@ impl Storage {
 
     /// Upsert an item from its parsed form.
     pub fn upsert_item(&self, item: &Item) -> Result<()> {
-        let id = item.props.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+        let id = item
+            .props
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
         if id.is_empty() {
             return Err(Error::Storage("item without id".into()));
         }
-        let get_str = |k: &str| item.props.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+        let get_str = |k: &str| {
+            item.props
+                .get(k)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
         let get_int = |k: &str| item.props.get(k).and_then(Value::as_i64).unwrap_or(0);
         let title = get_str("title");
         let parent_id = get_str("parent_id");
-        let body = if item.item_type == crate::items::TYPE_NOTE { item.body.clone() } else { String::new() };
+        let body = if item.item_type == crate::items::TYPE_NOTE {
+            item.body.clone()
+        } else {
+            String::new()
+        };
         // Store the body inside the payload too so items round-trip when read back.
         let mut payload_props = item.props.clone();
         if item.item_type == crate::items::TYPE_NOTE {
@@ -106,7 +122,8 @@ impl Storage {
         }
         // Searchable text: body + title. For encrypted notes, no plaintext.
         let body_text = format!("{}\n{}", title, body);
-        let payload = serde_json::to_string(&payload_props).map_err(|e| Error::Storage(format!("payload: {e}")))?;
+        let payload = serde_json::to_string(&payload_props)
+            .map_err(|e| Error::Storage(format!("payload: {e}")))?;
         self.conn
             .execute(
                 r#"INSERT INTO items (id, type_, parent_id, title, body, created_time, updated_time, deleted_time,
@@ -140,7 +157,12 @@ impl Storage {
     }
 
     /// Record sync metadata for an item.
-    pub fn save_sync_time(&self, item_id: &str, sync_time: i64, remote_updated_time: i64) -> Result<()> {
+    pub fn save_sync_time(
+        &self,
+        item_id: &str,
+        sync_time: i64,
+        remote_updated_time: i64,
+    ) -> Result<()> {
         self.conn
             .execute(
                 r#"INSERT INTO sync_items (item_id, sync_time, remote_updated_time) VALUES (?1, ?2, ?3)
@@ -156,9 +178,17 @@ impl Storage {
             .conn
             .prepare("SELECT sync_time, remote_updated_time FROM sync_items WHERE item_id = ?1")
             .map_err(|e| Error::Storage(format!("sync_time: {e}")))?;
-        let mut rows = stmt.query([item_id]).map_err(|e| Error::Storage(format!("sync_time: {e}")))?;
-        if let Some(row) = rows.next().map_err(|e| Error::Storage(format!("sync_time: {e}")))? {
-            Ok(Some((row.get(0).map_err(|e| Error::Storage(e.to_string()))?, row.get(1).map_err(|e| Error::Storage(e.to_string()))?)))
+        let mut rows = stmt
+            .query([item_id])
+            .map_err(|e| Error::Storage(format!("sync_time: {e}")))?;
+        if let Some(row) = rows
+            .next()
+            .map_err(|e| Error::Storage(format!("sync_time: {e}")))?
+        {
+            Ok(Some((
+                row.get(0).map_err(|e| Error::Storage(e.to_string()))?,
+                row.get(1).map_err(|e| Error::Storage(e.to_string()))?,
+            )))
         } else {
             Ok(None)
         }
@@ -194,8 +224,13 @@ impl Storage {
     }
 
     pub fn kv_get(&self, key: &str) -> Result<Option<String>> {
-        let mut stmt = self.conn.prepare("SELECT value FROM kv WHERE key = ?1").map_err(|e| Error::Storage(e.to_string()))?;
-        let mut rows = stmt.query([key]).map_err(|e| Error::Storage(e.to_string()))?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT value FROM kv WHERE key = ?1")
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let mut rows = stmt
+            .query([key])
+            .map_err(|e| Error::Storage(e.to_string()))?;
         if let Some(row) = rows.next().map_err(|e| Error::Storage(e.to_string()))? {
             Ok(Some(row.get(0).map_err(|e| Error::Storage(e.to_string()))?))
         } else {
@@ -228,7 +263,9 @@ impl Storage {
             .conn
             .prepare("SELECT fetched_time FROM resource_fetch_times WHERE resource_id = ?1")
             .map_err(|e| Error::Storage(e.to_string()))?;
-        let mut rows = stmt.query([resource_id]).map_err(|e| Error::Storage(e.to_string()))?;
+        let mut rows = stmt
+            .query([resource_id])
+            .map_err(|e| Error::Storage(e.to_string()))?;
         if let Some(row) = rows.next().map_err(|e| Error::Storage(e.to_string()))? {
             Ok(row.get(0).map_err(|e| Error::Storage(e.to_string()))?)
         } else {
@@ -251,7 +288,9 @@ impl Storage {
             .conn
             .prepare("SELECT data FROM resource_blobs WHERE resource_id = ?1")
             .map_err(|e| Error::Storage(e.to_string()))?;
-        let mut rows = stmt.query([resource_id]).map_err(|e| Error::Storage(e.to_string()))?;
+        let mut rows = stmt
+            .query([resource_id])
+            .map_err(|e| Error::Storage(e.to_string()))?;
         if let Some(row) = rows.next().map_err(|e| Error::Storage(e.to_string()))? {
             Ok(Some(row.get(0).map_err(|e| Error::Storage(e.to_string()))?))
         } else {
@@ -278,12 +317,14 @@ impl Storage {
             .conn
             .prepare("SELECT payload FROM items WHERE type_ = ?1 AND deleted_time = 0 ORDER BY title COLLATE NOCASE")
             .map_err(|e| Error::Storage(e.to_string()))?;
-        let rows = stmt.query_map([t], |r| r.get::<_, String>(0)).map_err(|e| Error::Storage(e.to_string()))?;
+        let rows = stmt
+            .query_map([t], |r| r.get::<_, String>(0))
+            .map_err(|e| Error::Storage(e.to_string()))?;
         let mut out = Vec::new();
         for row in rows {
             let payload: String = row.map_err(|e| Error::Storage(e.to_string()))?;
-            let props: serde_json::Map<String, Value> =
-                serde_json::from_str(&payload).map_err(|e| Error::Storage(format!("payload parse: {e}")))?;
+            let props: serde_json::Map<String, Value> = serde_json::from_str(&payload)
+                .map_err(|e| Error::Storage(format!("payload parse: {e}")))?;
             out.push(Item {
                 item_type: t,
                 props: props.into_iter().collect(),
@@ -304,14 +345,23 @@ impl Storage {
             )
         };
         let _ = include_todos;
-        let mut stmt = self.conn.prepare(&sql).map_err(|e| Error::Storage(e.to_string()))?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).map_err(|e| Error::Storage(e.to_string()))?;
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| Error::Storage(e.to_string()))?;
         let mut out = Vec::new();
         for row in rows {
             let payload: String = row.map_err(|e| Error::Storage(e.to_string()))?;
-            let props: serde_json::Map<String, Value> =
-                serde_json::from_str(&payload).map_err(|e| Error::Storage(format!("payload parse: {e}")))?;
-            let body = props.get("body").and_then(Value::as_str).unwrap_or_default().to_string();
+            let props: serde_json::Map<String, Value> = serde_json::from_str(&payload)
+                .map_err(|e| Error::Storage(format!("payload parse: {e}")))?;
+            let body = props
+                .get("body")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
             out.push(Item {
                 item_type: crate::items::TYPE_NOTE,
                 props: props.into_iter().collect(),
@@ -326,12 +376,18 @@ impl Storage {
             .conn
             .prepare("SELECT payload FROM items WHERE id = ?1 AND type_ = 1")
             .map_err(|e| Error::Storage(e.to_string()))?;
-        let mut rows = stmt.query([note_id]).map_err(|e| Error::Storage(e.to_string()))?;
+        let mut rows = stmt
+            .query([note_id])
+            .map_err(|e| Error::Storage(e.to_string()))?;
         if let Some(row) = rows.next().map_err(|e| Error::Storage(e.to_string()))? {
             let payload: String = row.get(0).map_err(|e| Error::Storage(e.to_string()))?;
-            let props: serde_json::Map<String, Value> =
-                serde_json::from_str(&payload).map_err(|e| Error::Storage(format!("payload parse: {e}")))?;
-            let body = props.get("body").and_then(Value::as_str).unwrap_or_default().to_string();
+            let props: serde_json::Map<String, Value> = serde_json::from_str(&payload)
+                .map_err(|e| Error::Storage(format!("payload parse: {e}")))?;
+            let body = props
+                .get("body")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
             return Ok(Some(Item {
                 item_type: crate::items::TYPE_NOTE,
                 props: props.into_iter().collect(),
@@ -346,11 +402,13 @@ impl Storage {
             .conn
             .prepare("SELECT payload FROM items WHERE id = ?1 AND type_ = 4")
             .map_err(|e| Error::Storage(e.to_string()))?;
-        let mut rows = stmt.query([resource_id]).map_err(|e| Error::Storage(e.to_string()))?;
+        let mut rows = stmt
+            .query([resource_id])
+            .map_err(|e| Error::Storage(e.to_string()))?;
         if let Some(row) = rows.next().map_err(|e| Error::Storage(e.to_string()))? {
             let payload: String = row.get(0).map_err(|e| Error::Storage(e.to_string()))?;
-            let props: serde_json::Map<String, Value> =
-                serde_json::from_str(&payload).map_err(|e| Error::Storage(format!("payload parse: {e}")))?;
+            let props: serde_json::Map<String, Value> = serde_json::from_str(&payload)
+                .map_err(|e| Error::Storage(format!("payload parse: {e}")))?;
             return Ok(Some(Item {
                 item_type: crate::items::TYPE_RESOURCE,
                 props: props.into_iter().collect(),
@@ -382,7 +440,9 @@ impl Storage {
             .conn
             .prepare("SELECT COUNT(*) FROM items WHERE type_ = ?1")
             .map_err(|e| Error::Storage(e.to_string()))?;
-        let n: i64 = stmt.query_row([t], |r| r.get(0)).map_err(|e| Error::Storage(e.to_string()))?;
+        let n: i64 = stmt
+            .query_row([t], |r| r.get(0))
+            .map_err(|e| Error::Storage(e.to_string()))?;
         Ok(n as usize)
     }
 
@@ -393,13 +453,19 @@ impl Storage {
             .conn
             .prepare("SELECT payload FROM items WHERE type_ = 1 AND deleted_time = 0 AND body_text LIKE ?1 ORDER BY updated_time DESC LIMIT 200")
             .map_err(|e| Error::Storage(e.to_string()))?;
-        let rows = stmt.query_map([&pattern], |r| r.get::<_, String>(0)).map_err(|e| Error::Storage(e.to_string()))?;
+        let rows = stmt
+            .query_map([&pattern], |r| r.get::<_, String>(0))
+            .map_err(|e| Error::Storage(e.to_string()))?;
         let mut out = Vec::new();
         for row in rows {
             let payload: String = row.map_err(|e| Error::Storage(e.to_string()))?;
-            let props: serde_json::Map<String, Value> =
-                serde_json::from_str(&payload).map_err(|e| Error::Storage(format!("payload parse: {e}")))?;
-            let body = props.get("body").and_then(Value::as_str).unwrap_or_default().to_string();
+            let props: serde_json::Map<String, Value> = serde_json::from_str(&payload)
+                .map_err(|e| Error::Storage(format!("payload parse: {e}")))?;
+            let body = props
+                .get("body")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
             out.push(Item {
                 item_type: crate::items::TYPE_NOTE,
                 props: props.into_iter().collect(),
@@ -420,25 +486,33 @@ mod tests {
     use super::*;
     use crate::items::unserialize;
 
-    const NOTE_BLOB: &str = "Test note\n\nHello body\n\nid: 0f1e2d3c4b5a69788796a5b4c3d2e1f0\ntype_: 1";
+    const NOTE_BLOB: &str =
+        "Test note\n\nHello body\n\nid: 0f1e2d3c4b5a69788796a5b4c3d2e1f0\ntype_: 1";
 
     #[test]
     fn upsert_and_query() {
         let storage = Storage::open_in_memory().unwrap();
         let item = unserialize(NOTE_BLOB).unwrap();
         storage.upsert_item(&item).unwrap();
-        storage.save_sync_time(&item.props["id"].as_str().unwrap(), 123, 456).unwrap();
+        storage
+            .save_sync_time(&item.props["id"].as_str().unwrap(), 123, 456)
+            .unwrap();
 
         let notes = storage.notes("", true).unwrap();
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].props["title"], Value::String("Test note".into()));
         assert_eq!(notes[0].body, "Hello body");
 
-        let st = storage.sync_time("0f1e2d3c4b5a69788796a5b4c3d2e1f0").unwrap().unwrap();
+        let st = storage
+            .sync_time("0f1e2d3c4b5a69788796a5b4c3d2e1f0")
+            .unwrap()
+            .unwrap();
         assert_eq!((st.0, st.1), (123, 456));
 
         assert_eq!(storage.all_item_ids().unwrap().len(), 1);
-        storage.delete_items(&["0f1e2d3c4b5a69788796a5b4c3d2e1f0".to_string()]).unwrap();
+        storage
+            .delete_items(&["0f1e2d3c4b5a69788796a5b4c3d2e1f0".to_string()])
+            .unwrap();
         assert_eq!(storage.all_item_ids().unwrap().len(), 0);
     }
 

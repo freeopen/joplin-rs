@@ -36,8 +36,14 @@ struct Expected {
 
 #[tokio::test]
 async fn legacy_sjcl_vault_syncs() {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/legacy_vault.json");
-    let vault: Vault = serde_json::from_str(&std::fs::read_to_string(path).expect("run tools/generate_fixtures.js")).unwrap();
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../fixtures/legacy_vault.json"
+    );
+    let vault: Vault = serde_json::from_str(
+        &std::fs::read_to_string(path).expect("run tools/generate_fixtures.js"),
+    )
+    .unwrap();
 
     let mut files: HashMap<String, Vec<u8>> = HashMap::new();
     files.insert("info.json".into(), vault.info_json.clone().into_bytes());
@@ -100,22 +106,45 @@ async fn legacy_sjcl_vault_syncs() {
         .await
         .expect("legacy sync failed");
     assert_eq!(outcome.errors, Vec::<String>::new(), "legacy sync errors");
-    assert_eq!(outcome.skipped_unsupported, 0, "legacy vault must not be skipped: {outcome:?}");
+    assert_eq!(
+        outcome.skipped_unsupported, 0,
+        "legacy vault must not be skipped: {outcome:?}"
+    );
 
     let notes = storage.notes("", true).unwrap();
     assert_eq!(notes.len(), vault.expected.notes.len());
     let expect = &vault.expected.notes[0];
-    assert_eq!(notes[0].props["title"].as_str().unwrap(), expect["title"].as_str().unwrap());
-    assert_eq!(notes[0].body, expect["body"].as_str().unwrap(), "legacy SJCL1b body must round-trip");
-    assert!(notes[0].body.contains("你好"), "legacy unicode must survive");
+    assert_eq!(
+        notes[0].props["title"].as_str().unwrap(),
+        expect["title"].as_str().unwrap()
+    );
+    assert_eq!(
+        notes[0].body,
+        expect["body"].as_str().unwrap(),
+        "legacy SJCL1b body must round-trip"
+    );
+    assert!(
+        notes[0].body.contains("你好"),
+        "legacy unicode must survive"
+    );
 
     let folders = storage.folders().unwrap();
     assert_eq!(folders.len(), vault.expected.folders.len());
-    assert_eq!(folders[0].props["title"].as_str().unwrap(), vault.expected.folders[0]["title"].as_str().unwrap());
+    assert_eq!(
+        folders[0].props["title"].as_str().unwrap(),
+        vault.expected.folders[0]["title"].as_str().unwrap()
+    );
 
     // Wrong password must fail hard for SJCL master keys too.
     let fresh = Storage::open_in_memory().unwrap();
     let engine2 = SyncEngine::new(&client, &fresh);
-    let err = engine2.sync(Some("nope"), &mut |_| {}).await.unwrap_err().to_string();
-    assert!(err.contains("ccm") || err.contains("tag") || err.contains("decrypt"), "wrong pw error: {err}");
+    let err = engine2
+        .sync(Some("nope"), &mut |_| {})
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("ccm") || err.contains("tag") || err.contains("decrypt"),
+        "wrong pw error: {err}"
+    );
 }

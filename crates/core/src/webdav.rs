@@ -26,7 +26,8 @@ pub struct ItemStat {
 
 impl WebDavClient {
     pub fn new(base_url: &str, username: &str, password: &str) -> Result<Self> {
-        let mut url = Url::parse(base_url).map_err(|e| Error::WebDav(format!("bad base url: {e}")))?;
+        let mut url =
+            Url::parse(base_url).map_err(|e| Error::WebDav(format!("bad base url: {e}")))?;
         if !url.path().ends_with('/') {
             url.set_path(&format!("{}/", url.path()));
         }
@@ -38,7 +39,11 @@ impl WebDavClient {
             .user_agent("joplin-rs/0.1")
             .build()
             .map_err(|e| Error::WebDav(format!("http client: {e}")))?;
-        Ok(Self { base_url: url, auth_header, http })
+        Ok(Self {
+            base_url: url,
+            auth_header,
+            http,
+        })
     }
 
     fn url_for(&self, path: &str) -> String {
@@ -56,14 +61,27 @@ impl WebDavClient {
         }
     }
 
-    async fn request(&self, method: &str, path: &str, body: Option<String>) -> Result<reqwest::Response> {
+    async fn request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<String>,
+    ) -> Result<reqwest::Response> {
         let url = self.url_for(path);
-        let mut req = self.http.request(reqwest::Method::from_bytes(method.as_bytes()).unwrap_or_default(), &url);
+        let mut req = self.http.request(
+            reqwest::Method::from_bytes(method.as_bytes()).unwrap_or_default(),
+            &url,
+        );
         req = req.header(reqwest::header::AUTHORIZATION, &self.auth_header);
         if let Some(b) = body {
-            req = req.header(reqwest::header::CONTENT_TYPE, "application/xml").body(b);
+            req = req
+                .header(reqwest::header::CONTENT_TYPE, "application/xml")
+                .body(b);
         }
-        let resp = req.send().await.map_err(|e| Error::WebDav(format!("{method} {path}: {e}")))?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| Error::WebDav(format!("{method} {path}: {e}")))?;
         Ok(resp)
     }
 
@@ -73,7 +91,10 @@ impl WebDavClient {
             return Ok(None);
         }
         let status = resp.status();
-        let text = resp.text().await.map_err(|e| Error::WebDav(format!("stat body: {e}")))?;
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| Error::WebDav(format!("stat body: {e}")))?;
         if !status.is_success() {
             return Err(Error::WebDav(format!("PROPFIND {path}: HTTP {status}")));
         }
@@ -99,7 +120,10 @@ impl WebDavClient {
 
     pub async fn list(&self, path: &str) -> Result<Vec<ItemStat>> {
         let resp = self.propfind(path, 1).await?;
-        let text = resp.text().await.map_err(|e| Error::WebDav(format!("list body: {e}")))?;
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| Error::WebDav(format!("list body: {e}")))?;
         parse_multistatus(&text)
     }
 
@@ -108,7 +132,10 @@ impl WebDavClient {
         match resp.status() {
             reqwest::StatusCode::NOT_FOUND => Ok(None),
             s if s.is_success() => {
-                let bytes = resp.bytes().await.map_err(|e| Error::WebDav(format!("get body: {e}")))?;
+                let bytes = resp
+                    .bytes()
+                    .await
+                    .map_err(|e| Error::WebDav(format!("get body: {e}")))?;
                 Ok(Some(bytes.to_vec()))
             }
             s => Err(Error::WebDav(format!("GET {path}: HTTP {s}"))),
@@ -212,7 +239,11 @@ pub fn parse_multistatus(xml: &str) -> Result<Vec<ItemStat>> {
                 if name == "response" {
                     if let Some(href) = current_href.take() {
                         if !in_propstat_status_404 {
-                            items.push(ItemStat { path: href, is_dir: current_is_dir, updated_time: current_mtime });
+                            items.push(ItemStat {
+                                path: href,
+                                is_dir: current_is_dir,
+                                updated_time: current_mtime,
+                            });
                         }
                     }
                 }
@@ -257,7 +288,8 @@ fn percent_decode(s: &str) -> String {
 
 fn parse_http_date(s: &str) -> Option<i64> {
     // RFC 1123: Mon, 02 Jan 2024 03:04:05 GMT
-    let t = time::OffsetDateTime::parse(s.trim(), &time::format_description::well_known::Rfc2822).ok()?;
+    let t = time::OffsetDateTime::parse(s.trim(), &time::format_description::well_known::Rfc2822)
+        .ok()?;
     Some(t.unix_timestamp() * 1000)
 }
 
@@ -295,7 +327,10 @@ mod tests {
         assert!(items[0].is_dir);
         assert_eq!(items[0].path, "remote.php/dav/files/user/joplin");
         assert!(!items[1].is_dir);
-        assert_eq!(items[1].path, "remote.php/dav/files/user/joplin/0f1e2d3c4b5a69788796a5b4c3d2e1f0.md");
+        assert_eq!(
+            items[1].path,
+            "remote.php/dav/files/user/joplin/0f1e2d3c4b5a69788796a5b4c3d2e1f0.md"
+        );
         assert!(items[1].updated_time > 0);
     }
 
@@ -310,7 +345,10 @@ mod tests {
     #[test]
     fn url_for_joins_paths() {
         let client = WebDavClient::new("http://localhost:1234/dav/", "u", "p").unwrap();
-        assert_eq!(client.url_for("info.json"), "http://localhost:1234/dav/info.json");
+        assert_eq!(
+            client.url_for("info.json"),
+            "http://localhost:1234/dav/info.json"
+        );
         assert_eq!(client.url_for(""), "http://localhost:1234/dav/");
     }
 }

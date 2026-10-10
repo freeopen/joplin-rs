@@ -53,8 +53,12 @@ struct MasterKeyCase {
 }
 
 fn load() -> Fixtures {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/crypto_fixtures.json");
-    let data = std::fs::read_to_string(path).expect("fixtures file (run tools/generate_fixtures.js)");
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../fixtures/crypto_fixtures.json"
+    );
+    let data =
+        std::fs::read_to_string(path).expect("fixtures file (run tools/generate_fixtures.js)");
     serde_json::from_str(&data).expect("parse fixtures")
 }
 
@@ -63,14 +67,16 @@ fn sjcl_ccm_cases() {
     let fixtures = load();
     assert!(!fixtures.sjcl.is_empty());
     for case in &fixtures.sjcl {
-        let params = jcrypto::parse_sjcl(&case.cipher).unwrap_or_else(|e| panic!("{}: parse: {e}", case.method));
+        let params = jcrypto::parse_sjcl(&case.cipher)
+            .unwrap_or_else(|e| panic!("{}: parse: {e}", case.method));
         let result = jcrypto::sjcl_ccm_decrypt(&case.key, &params);
         match result {
             Ok(plain) => {
                 let expected: String = match case.method.as_str() {
                     "SJCL1a" | "SJCL1b" => {
                         // escape()'d data: unescape first
-                        let escaped = String::from_utf8(plain).unwrap_or_else(|e| panic!("utf8: {e}"));
+                        let escaped =
+                            String::from_utf8(plain).unwrap_or_else(|e| panic!("utf8: {e}"));
                         jcrypto::sjcl_unescape(&escaped).unwrap_or_else(|e| panic!("unescape: {e}"))
                     }
                     _ => String::from_utf8(plain).unwrap_or_else(|e| panic!("utf8: {e}")),
@@ -139,15 +145,23 @@ fn jed01_container_cases() {
         // Chunks start after the full header: 5 (JED01) + 6 (size hex) + metadata size.
         let md_size = usize::from_str_radix(&blob[5..11], 16).unwrap();
         let chunks_start = 11 + md_size;
-        let chunks = jcrypto::decode_chunks(&blob[chunks_start..]).unwrap_or_else(|e| panic!("chunks: {e}"));
+        let chunks =
+            jcrypto::decode_chunks(&blob[chunks_start..]).unwrap_or_else(|e| panic!("chunks: {e}"));
         let mut full = String::new();
         for chunk in chunks {
-            let plain = jcrypto::native_decrypt(key_material, &chunk, 3).unwrap_or_else(|e| panic!("chunk: {e}"));
+            let plain = jcrypto::native_decrypt(key_material, &chunk, 3)
+                .unwrap_or_else(|e| panic!("chunk: {e}"));
             // StringV1 payload is utf16le
-            let units: Vec<u16> = plain.chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect();
+            let units: Vec<u16> = plain
+                .chunks_exact(2)
+                .map(|p| u16::from_le_bytes([p[0], p[1]]))
+                .collect();
             full.push_str(&String::from_utf16(&units).unwrap_or_else(|e| panic!("utf16: {e}")));
         }
-        assert_eq!(full, plain_text, "container roundtrip (password {password})");
+        assert_eq!(
+            full, plain_text,
+            "container roundtrip (password {password})"
+        );
     }
     assert!(container_count >= 3);
 }
@@ -160,7 +174,8 @@ fn serialization_cases() {
             Some(s) => s,
             None => continue,
         };
-        let parsed = joplin_rs_core::items::unserialize(serialized).unwrap_or_else(|e| panic!("unserialize: {e}"));
+        let parsed = joplin_rs_core::items::unserialize(serialized)
+            .unwrap_or_else(|e| panic!("unserialize: {e}"));
         let expect = item.get("expect").unwrap();
         if let Some(title) = expect.get("title").and_then(|v| v.as_str()) {
             assert_eq!(parsed.props["title"].as_str().unwrap(), title);
@@ -175,7 +190,10 @@ fn serialization_cases() {
             assert_eq!(parsed.props["updated_time"].as_i64().unwrap(), updated);
         }
         if let Some(applied) = expect.get("encryption_applied").and_then(|v| v.as_i64()) {
-            assert_eq!(parsed.props["encryption_applied"].as_i64().unwrap(), applied);
+            assert_eq!(
+                parsed.props["encryption_applied"].as_i64().unwrap(),
+                applied
+            );
         }
     }
 }
@@ -189,7 +207,10 @@ fn sjcl_master_key_unlock_cases() {
     use joplin_rs_core::webdav::WebDavClient;
 
     let fixtures = load();
-    assert!(!fixtures.sjcl_master_keys.is_empty(), "SJCL master key fixtures missing");
+    assert!(
+        !fixtures.sjcl_master_keys.is_empty(),
+        "SJCL master key fixtures missing"
+    );
     let storage = Storage::open_in_memory().unwrap();
     let client = WebDavClient::new("http://localhost:1/", "u", "p").unwrap();
     let engine = SyncEngine::new(&client, &storage);
@@ -214,7 +235,11 @@ fn sjcl_master_key_unlock_cases() {
         let key = engine
             .unlock_master_key(&info, &case.password)
             .unwrap_or_else(|e| panic!("method {}: {e}", case.encryption_method));
-        assert_eq!(key, case.key_material, "method {} key material", case.encryption_method);
+        assert_eq!(
+            key, case.key_material,
+            "method {} key material",
+            case.encryption_method
+        );
 
         // Wrong password must fail for SJCL too.
         assert!(

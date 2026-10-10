@@ -44,7 +44,9 @@ struct FakeDav {
 }
 
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 impl FakeDav {
@@ -72,13 +74,21 @@ impl FakeDav {
 
 #[tokio::test]
 async fn e2e_sync_encrypted_vault() {
-    let vault_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/test_vault.json");
-    let vault: Vault =
-        serde_json::from_str(&std::fs::read_to_string(vault_path).expect("run tools/generate_fixtures.js")).unwrap();
+    let vault_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../fixtures/test_vault.json"
+    );
+    let vault: Vault = serde_json::from_str(
+        &std::fs::read_to_string(vault_path).expect("run tools/generate_fixtures.js"),
+    )
+    .unwrap();
 
     // Build the fake server filesystem.
     let mut files: HashMap<String, Vec<u8>> = HashMap::new();
-    files.insert("info.json".to_string(), vault.info_json.clone().into_bytes());
+    files.insert(
+        "info.json".to_string(),
+        vault.info_json.clone().into_bytes(),
+    );
     for (path, content) in &vault.items {
         files.insert(path.clone(), content.as_bytes().to_vec());
     }
@@ -86,7 +96,11 @@ async fn e2e_sync_encrypted_vault() {
         files.insert(path.clone(), content.as_bytes().to_vec());
     }
     let files = Arc::new(Mutex::new(files));
-    let dav = FakeDav { files: files.clone(), username: "user".into(), password: "pass".into() };
+    let dav = FakeDav {
+        files: files.clone(),
+        username: "user".into(),
+        password: "pass".into(),
+    };
     let dav_clone = dav.clone();
 
     let app = axum::Router::new().fallback(move |req: Request| {
@@ -94,13 +108,21 @@ async fn e2e_sync_encrypted_vault() {
         async move {
             let (parts, body) = req.into_parts();
             // Basic auth check
-            let auth = parts.headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
+            let auth = parts
+                .headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
             let expected = format!(
                 "Basic {}",
-                base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", dav.username, dav.password))
+                base64::engine::general_purpose::STANDARD
+                    .encode(format!("{}:{}", dav.username, dav.password))
             );
             if auth != expected {
-                return axum::http::Response::builder().status(StatusCode::UNAUTHORIZED).body(Body::empty()).unwrap();
+                return axum::http::Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .body(Body::empty())
+                    .unwrap();
             }
             let path = parts.uri.path().trim_start_matches('/');
             match parts.method.as_str() {
@@ -123,19 +145,37 @@ async fn e2e_sync_encrypted_vault() {
                         .status(StatusCode::OK)
                         .body(Body::from(data.clone()))
                         .unwrap(),
-                    None => axum::http::Response::builder().status(StatusCode::NOT_FOUND).body(Body::empty()).unwrap(),
+                    None => axum::http::Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(Body::empty())
+                        .unwrap(),
                 },
                 "PUT" => {
                     let bytes = body.collect().await.unwrap().to_bytes();
-                    dav.files.lock().unwrap().insert(path.to_string(), bytes.to_vec());
-                    axum::http::Response::builder().status(StatusCode::CREATED).body(Body::empty()).unwrap()
+                    dav.files
+                        .lock()
+                        .unwrap()
+                        .insert(path.to_string(), bytes.to_vec());
+                    axum::http::Response::builder()
+                        .status(StatusCode::CREATED)
+                        .body(Body::empty())
+                        .unwrap()
                 }
-                "MKCOL" => axum::http::Response::builder().status(StatusCode::CREATED).body(Body::empty()).unwrap(),
+                "MKCOL" => axum::http::Response::builder()
+                    .status(StatusCode::CREATED)
+                    .body(Body::empty())
+                    .unwrap(),
                 "DELETE" => {
                     dav.files.lock().unwrap().remove(path);
-                    axum::http::Response::builder().status(StatusCode::NO_CONTENT).body(Body::empty()).unwrap()
+                    axum::http::Response::builder()
+                        .status(StatusCode::NO_CONTENT)
+                        .body(Body::empty())
+                        .unwrap()
                 }
-                _ => axum::http::Response::builder().status(StatusCode::METHOD_NOT_ALLOWED).body(Body::empty()).unwrap(),
+                _ => axum::http::Response::builder()
+                    .status(StatusCode::METHOD_NOT_ALLOWED)
+                    .body(Body::empty())
+                    .unwrap(),
             }
         }
     });
@@ -152,15 +192,25 @@ async fn e2e_sync_encrypted_vault() {
     let engine = SyncEngine::new(&client, &storage);
     let mut messages = Vec::new();
     let outcome = engine
-        .sync(Some(&vault.password), &mut |msg| messages.push(msg.to_string()))
+        .sync(Some(&vault.password), &mut |msg| {
+            messages.push(msg.to_string())
+        })
         .await
         .expect("sync failed");
     println!("messages: {messages:?}");
     println!("outcome: {outcome:?}");
 
     assert_eq!(outcome.errors, Vec::<String>::new(), "sync errors");
-    assert_eq!(outcome.downloaded, vault.items.len(), "all items downloaded");
-    assert_eq!(outcome.resources_downloaded, vault.resources.len(), "resources downloaded");
+    assert_eq!(
+        outcome.downloaded,
+        vault.items.len(),
+        "all items downloaded"
+    );
+    assert_eq!(
+        outcome.resources_downloaded,
+        vault.resources.len(),
+        "resources downloaded"
+    );
 
     // ---- Parity assertions vs the TS-side expected values ----
     let notes = storage.notes("", true).unwrap();
@@ -169,7 +219,11 @@ async fn e2e_sync_encrypted_vault() {
         let id = expect["id"].as_str().unwrap();
         let found = notes.iter().find(|n| n.props["id"].as_str() == Some(id));
         let note = found.unwrap_or_else(|| panic!("note {id} missing"));
-        assert_eq!(note.props["title"].as_str().unwrap(), expect["title"].as_str().unwrap(), "title of {id}");
+        assert_eq!(
+            note.props["title"].as_str().unwrap(),
+            expect["title"].as_str().unwrap(),
+            "title of {id}"
+        );
         if let Some(body) = expect["body"].as_str() {
             assert_eq!(note.body, body, "body of {id}");
         }
@@ -184,14 +238,24 @@ async fn e2e_sync_encrypted_vault() {
             );
             assert!(note.body.contains("한글"), "multi-chunk unicode of {id}");
             assert!(note.body.contains("🎉"), "multi-chunk emoji of {id}");
-            assert!(note.body.contains("Paragraph line 0 "), "chunk 0 content of {id}");
-            assert!(note.body.contains("Paragraph line 3999"), "last chunk content of {id}");
+            assert!(
+                note.body.contains("Paragraph line 0 "),
+                "chunk 0 content of {id}"
+            );
+            assert!(
+                note.body.contains("Paragraph line 3999"),
+                "last chunk content of {id}"
+            );
         }
         if let Some(link) = expect["resource_link"].as_str() {
             assert!(note.body.contains(link), "resource link in body of {id}");
         }
         if let Some(ml) = expect["markup_language"].as_i64() {
-            assert_eq!(note.props["markup_language"].as_i64().unwrap(), ml, "markup_language of {id}");
+            assert_eq!(
+                note.props["markup_language"].as_i64().unwrap(),
+                ml,
+                "markup_language of {id}"
+            );
         }
         if let Some(parent) = expect["parent_id"].as_str() {
             assert_eq!(note.props["parent_id"].as_str().unwrap(), parent);
@@ -200,11 +264,17 @@ async fn e2e_sync_encrypted_vault() {
 
     let folders = storage.folders().unwrap();
     assert_eq!(folders.len(), vault.expected.folders.len());
-    assert_eq!(folders[0].props["title"].as_str().unwrap(), vault.expected.folders[0]["title"].as_str().unwrap());
+    assert_eq!(
+        folders[0].props["title"].as_str().unwrap(),
+        vault.expected.folders[0]["title"].as_str().unwrap()
+    );
 
     let tags = storage.tags().unwrap();
     assert_eq!(tags.len(), vault.expected.tags.len());
-    assert_eq!(tags[0].props["title"].as_str().unwrap(), vault.expected.tags[0]["title"].as_str().unwrap());
+    assert_eq!(
+        tags[0].props["title"].as_str().unwrap(),
+        vault.expected.tags[0]["title"].as_str().unwrap()
+    );
 
     let note_tags = storage.note_tags().unwrap();
     assert_eq!(note_tags.len(), vault.expected.note_tags.len());
@@ -217,81 +287,170 @@ async fn e2e_sync_encrypted_vault() {
             .unwrap()
             .unwrap_or_else(|| panic!("resource {id} missing"));
         // Starts with PNG magic
-        assert_eq!(&blob[..8], b"\x89PNG\r\n\x1a\n", "resource {id} must be the decrypted PNG");
+        assert_eq!(
+            &blob[..8],
+            b"\x89PNG\r\n\x1a\n",
+            "resource {id} must be the decrypted PNG"
+        );
         let res = storage.resource(id).unwrap().unwrap();
-        assert_eq!(res.props["mime"].as_str().unwrap(), expect["mime"].as_str().unwrap());
+        assert_eq!(
+            res.props["mime"].as_str().unwrap(),
+            expect["mime"].as_str().unwrap()
+        );
     }
 
     // ---- Second sync must be a no-op ----
     let mut messages2 = Vec::new();
-    let outcome2 = engine.sync(Some(&vault.password), &mut |m| messages2.push(m.to_string())).await.unwrap();
+    let outcome2 = engine
+        .sync(Some(&vault.password), &mut |m| {
+            messages2.push(m.to_string())
+        })
+        .await
+        .unwrap();
     println!("messages2: {messages2:?}");
     println!("outcome2: {outcome2:?}");
-    assert_eq!(outcome2.downloaded, 0, "second sync should download nothing");
+    assert_eq!(
+        outcome2.downloaded, 0,
+        "second sync should download nothing"
+    );
     assert_eq!(outcome2.deleted, 0, "second sync should delete nothing");
 
     // ---- Deletion: remove a note remotely, sync, verify local delete ----
     let note2_path = format!("{}.md", vault.expected.notes[1]["id"].as_str().unwrap());
     files.lock().unwrap().remove(&note2_path);
-    let outcome3 = engine.sync(Some(&vault.password), &mut |_| {}).await.unwrap();
-    assert_eq!(outcome3.deleted, 1, "deleted note should be removed locally");
-    assert!(storage.note(vault.expected.notes[1]["id"].as_str().unwrap()).unwrap().is_none());
-    assert!(storage.note(vault.expected.notes[0]["id"].as_str().unwrap()).unwrap().is_some());
+    let outcome3 = engine
+        .sync(Some(&vault.password), &mut |_| {})
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome3.deleted, 1,
+        "deleted note should be removed locally"
+    );
+    assert!(storage
+        .note(vault.expected.notes[1]["id"].as_str().unwrap())
+        .unwrap()
+        .is_none());
+    assert!(storage
+        .note(vault.expected.notes[0]["id"].as_str().unwrap())
+        .unwrap()
+        .is_some());
 
-    // ---- Failsafe: wipe the whole remote, sync must refuse ----
-    files.lock().unwrap().clear();
+    // ---- Failsafe: wipe the item files (info.json stays), sync must refuse ----
+    // (A fully wiped target errors earlier: info.json itself is gone. The
+    // failsafe guards the realistic accident of items being deleted.)
+    {
+        let mut f = files.lock().unwrap();
+        f.retain(|k, _| k == "info.json");
+    }
     let result = engine.sync(Some(&vault.password), &mut |_| {}).await;
     assert!(result.is_err(), "failsafe must refuse mass deletion");
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("fail-safe"), "error should mention fail-safe: {err}");
+    assert!(
+        err.contains("fail-safe"),
+        "error should mention fail-safe: {err}"
+    );
     // Local data intact
-    assert!(storage.note(vault.expected.notes[0]["id"].as_str().unwrap()).unwrap().is_some());
+    assert!(storage
+        .note(vault.expected.notes[0]["id"].as_str().unwrap())
+        .unwrap()
+        .is_some());
 
     // ---- No-password sync: items stored encrypted, then retried with password ----
-    files.lock().unwrap().insert("info.json".to_string(), vault.info_json.clone().into_bytes());
+    files.lock().unwrap().insert(
+        "info.json".to_string(),
+        vault.info_json.clone().into_bytes(),
+    );
     for (p_, c_) in &vault.items {
-        files.lock().unwrap().insert(p_.clone(), c_.as_bytes().to_vec());
+        files
+            .lock()
+            .unwrap()
+            .insert(p_.clone(), c_.as_bytes().to_vec());
     }
     for (p_, c_) in &vault.resources {
-        files.lock().unwrap().insert(p_.clone(), c_.as_bytes().to_vec());
+        files
+            .lock()
+            .unwrap()
+            .insert(p_.clone(), c_.as_bytes().to_vec());
     }
     let storage_no_pw = Storage::open_in_memory().unwrap();
     let engine_no_pw = SyncEngine::new(&client, &storage_no_pw);
-    let outcome4 = engine_no_pw.sync(None, &mut |_| {}).await.expect("no-password sync should not fail");
-    assert!(outcome4.pending_decryption.len() >= vault.expected.notes.len(), "notes must be pending: {outcome4:?}");
-    assert_eq!(outcome4.resources_downloaded, 0, "no resource plaintext without password");
+    let outcome4 = engine_no_pw
+        .sync(None, &mut |_| {})
+        .await
+        .expect("no-password sync should not fail");
+    assert!(
+        outcome4.pending_decryption.len() >= vault.expected.notes.len(),
+        "notes must be pending: {outcome4:?}"
+    );
+    assert_eq!(
+        outcome4.resources_downloaded, 0,
+        "no resource plaintext without password"
+    );
     // Encrypted notes must NOT expose plaintext
     for expect in &vault.expected.notes {
         let id = expect["id"].as_str().unwrap();
         let note = storage_no_pw.note(id).unwrap().expect("placeholder stored");
-        let title = note.props.get("title").and_then(Value::as_str).unwrap_or("");
-        assert_ne!(title, expect["title"].as_str().unwrap(), "title must not be plaintext without password");
-        assert!(note.body.is_empty() || !note.body.contains(expect["body"].as_str().unwrap().split('\n').next().unwrap()));
+        let title = note
+            .props
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert_ne!(
+            title,
+            expect["title"].as_str().unwrap(),
+            "title must not be plaintext without password"
+        );
+        assert!(
+            note.body.is_empty()
+                || !note
+                    .body
+                    .contains(expect["body"].as_str().unwrap().split('\n').next().unwrap())
+        );
     }
 
     // Retry with password on the same storage: everything decrypts.
-    let outcome5 = engine_no_pw.sync(Some(&vault.password), &mut |_| {}).await.expect("retry sync failed");
-    assert!(outcome5.downloaded >= vault.expected.notes.len(), "retry must decrypt pending items: {outcome5:?}");
+    let outcome5 = engine_no_pw
+        .sync(Some(&vault.password), &mut |_| {})
+        .await
+        .expect("retry sync failed");
+    assert!(
+        outcome5.downloaded >= vault.expected.notes.len(),
+        "retry must decrypt pending items: {outcome5:?}"
+    );
     for expect in &vault.expected.notes {
         let id = expect["id"].as_str().unwrap();
         let note = storage_no_pw.note(id).unwrap().expect("note present");
-        assert_eq!(note.props["title"].as_str().unwrap(), expect["title"].as_str().unwrap(), "retry: title of {id}");
+        assert_eq!(
+            note.props["title"].as_str().unwrap(),
+            expect["title"].as_str().unwrap(),
+            "retry: title of {id}"
+        );
         if let Some(body) = expect["body"].as_str() {
             assert_eq!(note.body, body, "retry: body of {id}");
         }
         if expect["body_len"].as_i64().is_some() {
-            assert!(note.body.contains("Paragraph line 3999"), "retry: big note content of {id}");
+            assert!(
+                note.body.contains("Paragraph line 3999"),
+                "retry: big note content of {id}"
+            );
         }
     }
     let blob = storage_no_pw
         .resource_blob(vault.expected.resources[0]["id"].as_str().unwrap())
         .unwrap()
         .expect("resource decrypted on retry");
-    assert_eq!(&blob[..8], b"\x89PNG\r\n\x1a\n", "resource must decrypt on retry");
+    assert_eq!(
+        &blob[..8],
+        b"\x89PNG\r\n\x1a\n",
+        "resource must decrypt on retry"
+    );
 
     // ---- Wrong password must fail with a crypto error ----
     // (restore the remote info.json; the failsafe step cleared everything)
-    files.lock().unwrap().insert("info.json".to_string(), vault.info_json.clone().into_bytes());
+    files.lock().unwrap().insert(
+        "info.json".to_string(),
+        vault.info_json.clone().into_bytes(),
+    );
     let storage_fresh = Storage::open_in_memory().unwrap();
     let engine2 = SyncEngine::new(&client, &storage_fresh);
     let result = engine2.sync(Some("wrong-password"), &mut |_| {}).await;
