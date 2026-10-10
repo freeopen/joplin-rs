@@ -174,7 +174,12 @@ impl<'a> SyncEngine<'a> {
                     // right, so hex-encode to the expected form.
                     Err(_) => {
                         let raw = jcrypto::native_decrypt(password, &mk.content, 220000)?;
-                        if raw.len() == 32 {
+                        if raw.len() == 256 {
+                            // 256 raw bytes: the key material stored without hex
+                            // encoding. hex-encode to the standard 512-char form.
+                            hex::encode(raw)
+                        } else if raw.len() == 32 {
+                            // 256-bit key as raw bytes.
                             hex::encode(raw)
                         } else {
                             let all_hex = raw.iter().all(|b| b.is_ascii_hexdigit());
