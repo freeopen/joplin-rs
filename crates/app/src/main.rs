@@ -59,6 +59,8 @@ struct App {
     note_body: String,
     note_title: String,
     search: String,
+    /// Search-hit snippets keyed by note id (shown under the note title).
+    search_hits: std::collections::HashMap<String, String>,
     e2ee_password: String,
     status: String,
     sync_running: Arc<Mutex<bool>>,
@@ -84,6 +86,7 @@ impl App {
             note_body: String::new(),
             note_title: String::new(),
             search: String::new(),
+            search_hits: Default::default(),
             e2ee_password: config
                 .e2ee_password
                 .clone()
@@ -134,12 +137,29 @@ impl App {
     }
 
     fn load_notes(&mut self) {
+        self.search_hits.clear();
         self.notes = if self.search.is_empty() {
             self.storage
                 .notes(self.selected_folder.as_deref().unwrap_or(""), true)
                 .unwrap_or_default()
         } else {
-            self.storage.search_notes(&self.search).unwrap_or_default()
+            // Search honours the selected notebook too.
+            let opts = joplin_rs_core::storage::SearchOptions {
+                folder_id: self.selected_folder.clone(),
+                ..Default::default()
+            };
+            let hits = self
+                .storage
+                .search_notes(&self.search, &opts)
+                .unwrap_or_default();
+            // Map hits back to notes so the note list reuses the same rendering.
+            self.search_hits = hits
+                .iter()
+                .map(|h| (h.id.clone(), h.snippet.clone()))
+                .collect();
+            hits.iter()
+                .filter_map(|h| self.storage.note(&h.id).ok().flatten())
+                .collect()
         };
     }
 
@@ -331,6 +351,7 @@ impl eframe::App for App {
                     .show(ui, |ui| {
                         let notes = self.notes.clone();
                         let note_tags = self.note_tags.clone();
+                        let search_hits = self.search_hits.clone();
                         for note in &notes {
                             let id = note
                                 .props
@@ -373,6 +394,9 @@ impl eframe::App for App {
                                         }
                                     });
                                 }
+                            }
+                            if let Some(snippet) = search_hits.get(&id) {
+                                ui.small(egui::RichText::new(snippet).weak().size(11.0));
                             }
                         }
                     });

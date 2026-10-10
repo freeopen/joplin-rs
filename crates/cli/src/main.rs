@@ -2,7 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use joplin_rs_core::storage::Storage;
+use joplin_rs_core::storage::{SearchOptions, Storage};
 use joplin_rs_core::sync::SyncEngine;
 use joplin_rs_core::webdav::{TlsOptions, WebDavClient};
 use serde::{Deserialize, Serialize};
@@ -52,6 +52,29 @@ enum Command {
     },
     /// Show a note (markdown body)
     Show { id: String },
+    /// Search notes over title and body (all words must match)
+    Search {
+        /// Query words (AND); e.g. search meeting notes
+        query: String,
+        /// Restrict to a notebook id (see: list --item-type folder)
+        #[arg(long)]
+        folder: Option<String>,
+        /// Restrict to notes with a tag whose title matches this text
+        #[arg(long)]
+        tag: Option<String>,
+        /// Only todos
+        #[arg(long)]
+        todo: bool,
+        /// Only completed todos (implies --todo)
+        #[arg(long)]
+        completed: bool,
+        /// Show a content snippet under each hit
+        #[arg(long)]
+        snippets: bool,
+        /// Machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
     /// Export a note to a markdown file
     Export {
         id: String,
@@ -130,6 +153,42 @@ fn type_from_str(s: &str) -> Result<i64> {
         "resource" => Ok(joplin_rs_core::items::TYPE_RESOURCE),
         other => bail!("unknown item type {other} (note|folder|tag|resource)"),
     }
+}
+
+/// One line in `list` output: id + todo flag + title.
+fn print_list_item(item: &joplin_rs_core::items::Item) {
+    let id = item
+        .props
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?");
+    let title = item
+        .props
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("(no title)");
+    let flag = if item
+        .props
+        .get("is_todo")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0)
+        == 1
+    {
+        if item
+            .props
+            .get("todo_completed")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0)
+            > 0
+        {
+            "[x] "
+        } else {
+            "[ ] "
+        }
+    } else {
+        ""
+    };
+    println!("{id}  {flag}{title}");
 }
 
 #[tokio::main]
@@ -214,48 +273,88 @@ async fn main() -> Result<()> {
         } => {
             let storage = db(cli)?;
             let t = type_from_str(item_type)?;
-            let items: Vec<joplin_rs_core::items::Item> = if t == joplin_rs_core::items::TYPE_NOTE {
+            // Convenience path: `list --query` behaves like a plain search.
+            if t == joplin_rs_core::items::TYPE_NOTE {
                 if let Some(q) = query {
-                    storage.search_notes(q)?
-                } else {
-                    storage.notes(folder.as_deref().unwrap_or(""), true)?
-                }
-            } else {
-                storage.items_by_type(t)?
-            };
-            for item in items {
-                let id = item
-                    .props
-                    .get("id")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("?");
-                let title = item
-                    .props
-                    .get("title")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("(no title)");
-                let flag = if item
-                    .props
-                    .get("is_todo")
-                    .and_then(serde_json::Value::as_i64)
-                    .unwrap_or(0)
-                    == 1
-                {
-                    if item
-                        .props
-                        .get("todo_completed")
-                        .and_then(serde_json::Value::as_i64)
-                        .unwrap_or(0)
-                        > 0
-                    {
-                        "[x] "
-                    } else {
-                        "[ ] "
+                    let hits = storage.search_notes(q, &SearchOptions::default())?;
+                    for h in &hits {
+                        let flag = if h.is_todo {
+                            if h.completed {
+                                "[x] "
+                            } else {
+                                "[ ] "
+                            }
+                        } else {
+                            ""
+                        };
+                        println!("{}  {}{}", h.id, flag, h.title);
                     }
                 } else {
-                    ""
-                };
-                println!("{id}  {flag}{title}");
+                    let items = storage.notes(folder.as_deref().unwrap_or(""), true)?;
+                    for item in &items {
+                        print_list_item(item);
+                    }
+                }
+            } else {
+                for item in storage.items_by_type(t)? {
+                    print_list_item(&item);
+                }
+            }
+        }
+        Command::Search {
+            query,
+            folder,
+            tag,
+            todo,
+            completed,
+            snippets,
+            json,
+        } => {
+            let storage = db(cli)?;
+            let opts = SearchOptions {
+                folder_id: folder.clone(),
+                tag: tag.clone(),
+                todo_only: *todo || *completed,
+                completed_only: *completed,
+            };
+            let hits = storage.search_notes(query, &opts)?;
+            if *json {
+                let rows: Vec<serde_json::Value> = hits
+                    .iter()
+                    .map(|h| {
+                        serde_json::json!({
+                            "id": h.id,
+                            "title": h.title,
+                            "snippet": h.snippet,
+                            "is_todo": h.is_todo,
+                            "completed": h.completed,
+                            "folder_id": h.folder_id,
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&rows).unwrap_or_else(|_| "[]".into())
+                );
+            } else {
+                if hits.is_empty() {
+                    println!("no matches");
+                }
+                for h in &hits {
+                    let flag = if h.is_todo {
+                        if h.completed {
+                            "[x] "
+                        } else {
+                            "[ ] "
+                        }
+                    } else {
+                        ""
+                    };
+                    println!("{}  {}{}", h.id, flag, h.title);
+                    if *snippets {
+                        println!("        {}", h.snippet);
+                    }
+                }
             }
         }
         Command::Show { id } => {

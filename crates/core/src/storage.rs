@@ -15,6 +15,30 @@ use rusqlite::Connection;
 use serde_json::Value;
 use std::path::Path;
 
+/// Filters for note search.
+#[derive(Debug, Clone, Default)]
+pub struct SearchOptions {
+    /// Restrict to a notebook (folder id).
+    pub folder_id: Option<String>,
+    /// Restrict to notes carrying a tag whose title contains this text.
+    pub tag: Option<String>,
+    /// Only notes that are todos.
+    pub todo_only: bool,
+    /// Only completed todos.
+    pub completed_only: bool,
+}
+
+/// A search result with a snippet around the first match.
+#[derive(Debug, Clone)]
+pub struct SearchHit {
+    pub id: String,
+    pub title: String,
+    pub snippet: String,
+    pub is_todo: bool,
+    pub completed: bool,
+    pub folder_id: String,
+}
+
 pub struct Storage {
     conn: Connection,
 }
@@ -446,31 +470,156 @@ impl Storage {
         Ok(n as usize)
     }
 
-    /// Simple LIKE-based search over title/body.
-    pub fn search_notes(&self, query: &str) -> Result<Vec<Item>> {
-        let pattern = format!("%{}%", query.replace('\'', "''"));
+    /// Full-note search over title/body. Whitespace-separated query words must
+    /// all match (case-insensitive, AND). Optional filters: notebook id,
+    /// tag title (any of the note's tags matches), todo-only, completed-only.
+    /// Returns matches newest-first with a short snippet around the first hit.
+    pub fn search_notes(&self, query: &str, opts: &SearchOptions) -> Result<Vec<SearchHit>> {
+        let words: Vec<String> = query.split_whitespace().map(|w| w.to_lowercase()).collect();
+        let mut sql =
+            String::from("SELECT payload FROM items WHERE type_ = 1 AND deleted_time = 0");
+        if let Some(folder) = &opts.folder_id {
+            sql.push_str(&format!(
+                " AND parent_id = '{}'",
+                folder.replace('\'', "''")
+            ));
+        }
+        if opts.todo_only {
+            sql.push_str(" AND is_todo = 1");
+        }
+        if opts.completed_only {
+            sql.push_str(" AND todo_completed > 0");
+        }
+        sql.push_str(" ORDER BY updated_time DESC LIMIT 500");
+
         let mut stmt = self
             .conn
-            .prepare("SELECT payload FROM items WHERE type_ = 1 AND deleted_time = 0 AND body_text LIKE ?1 ORDER BY updated_time DESC LIMIT 200")
+            .prepare(&sql)
             .map_err(|e| Error::Storage(e.to_string()))?;
         let rows = stmt
-            .query_map([&pattern], |r| r.get::<_, String>(0))
+            .query_map([], |r| r.get::<_, String>(0))
             .map_err(|e| Error::Storage(e.to_string()))?;
+
+        // Tag filter: collect note ids having any matching tag title.
+        let tag_note_ids: Option<std::collections::HashSet<String>> = if let Some(tag) = &opts.tag {
+            let mut ids = std::collections::HashSet::new();
+            // note_tag join: note_tag items carry note_id + tag_id; tag titles live in tag items.
+            let mut stmt = self
+                .conn
+                .prepare("SELECT payload FROM items WHERE type_ = 5")
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            let tag_rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            let mut matching_tag_ids: Vec<String> = Vec::new();
+            for row in tag_rows {
+                let payload: String = row.map_err(|e| Error::Storage(e.to_string()))?;
+                let v: Value = serde_json::from_str(&payload)
+                    .map_err(|e| Error::Storage(format!("payload parse: {e}")))?;
+                let title = v
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_lowercase();
+                if title.contains(&tag.to_lowercase()) {
+                    if let Some(id) = v.get("id").and_then(Value::as_str) {
+                        matching_tag_ids.push(id.to_string());
+                    }
+                }
+            }
+            let mut stmt = self
+                .conn
+                .prepare("SELECT payload FROM items WHERE type_ = 6")
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            let nt_rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            for row in nt_rows {
+                let payload: String = row.map_err(|e| Error::Storage(e.to_string()))?;
+                let v: Value = serde_json::from_str(&payload)
+                    .map_err(|e| Error::Storage(format!("payload parse: {e}")))?;
+                let tag_id = v.get("tag_id").and_then(Value::as_str).unwrap_or_default();
+                if matching_tag_ids.iter().any(|t| t == tag_id) {
+                    if let Some(nid) = v.get("note_id").and_then(Value::as_str) {
+                        ids.insert(nid.to_string());
+                    }
+                }
+            }
+            Some(ids)
+        } else {
+            None
+        };
+
         let mut out = Vec::new();
         for row in rows {
             let payload: String = row.map_err(|e| Error::Storage(e.to_string()))?;
             let props: serde_json::Map<String, Value> = serde_json::from_str(&payload)
                 .map_err(|e| Error::Storage(format!("payload parse: {e}")))?;
+            if let Some(ids) = &tag_note_ids {
+                let nid = props.get("id").and_then(Value::as_str).unwrap_or_default();
+                if !ids.contains(nid) {
+                    continue;
+                }
+            }
+            let title = props
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             let body = props
                 .get("body")
                 .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            out.push(Item {
-                item_type: crate::items::TYPE_NOTE,
-                props: props.into_iter().collect(),
-                body,
+                .unwrap_or_default();
+            let haystack = format!("{title}\n{body}").to_lowercase();
+            if !words.is_empty() && !words.iter().all(|w| haystack.contains(w)) {
+                continue;
+            }
+            // Snippet around the first matching word (about 70 chars context).
+            let snippet = words
+                .iter()
+                .find_map(|w| {
+                    haystack.find(w).map(|pos| {
+                        let mut bs = pos.saturating_sub(30);
+                        while bs > 0 && !haystack.is_char_boundary(bs) {
+                            bs -= 1;
+                        }
+                        let mut be = (pos + 40).min(haystack.len());
+                        while be < haystack.len() && !haystack.is_char_boundary(be) {
+                            be += 1;
+                        }
+                        let mut snip = haystack[bs..be].replace('\n', " ");
+                        if bs > 0 {
+                            snip = format!("...{snip}");
+                        }
+                        if be < haystack.len() {
+                            snip.push_str("...");
+                        }
+                        snip
+                    })
+                })
+                .unwrap_or_else(|| body.chars().take(80).collect::<String>().replace('\n', " "));
+            out.push(SearchHit {
+                id: props
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                title: title.to_string(),
+                snippet,
+                is_todo: props.get("is_todo").and_then(Value::as_i64).unwrap_or(0) == 1,
+                completed: props
+                    .get("todo_completed")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0)
+                    > 0,
+                folder_id: props
+                    .get("parent_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
             });
+            if out.len() >= 200 {
+                break;
+            }
         }
         Ok(out)
     }
@@ -523,5 +672,122 @@ mod tests {
         storage.kv_set("k", "v1").unwrap();
         storage.kv_set("k", "v2").unwrap();
         assert_eq!(storage.kv_get("k").unwrap().unwrap(), "v2");
+    }
+
+    fn seed_note(
+        storage: &Storage,
+        id: &str,
+        title: &str,
+        body: &str,
+        folder: &str,
+        todo: bool,
+        done: bool,
+    ) {
+        let mut ser = format!(
+            "{title}\n\n{body}\n\nid: {id}\ntype_: 1\nparent_id: {folder}\nupdated_time: 2026-01-01T00:00:00.000Z"
+        );
+        if todo {
+            ser.push_str("\nis_todo: 1");
+            if done {
+                ser.push_str("\ntodo_completed: 1700000000000");
+            }
+        }
+        storage.upsert_item(&unserialize(&ser).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn search_multi_word_and_filters() {
+        let storage = Storage::open_in_memory().unwrap();
+        seed_note(
+            &storage,
+            &"1".repeat(32),
+            "Meeting notes",
+            "Discussed the project roadmap",
+            "f1",
+            false,
+            false,
+        );
+        seed_note(
+            &storage,
+            &"2".repeat(32),
+            "Groceries",
+            "buy apples and pears",
+            "f1",
+            false,
+            false,
+        );
+        seed_note(
+            &storage,
+            &"3".repeat(32),
+            "Todo A",
+            "project meeting follow-up",
+            "f2",
+            true,
+            false,
+        );
+        seed_note(
+            &storage,
+            &"4".repeat(32),
+            "Todo done",
+            "finished project meeting",
+            "f2",
+            true,
+            true,
+        );
+
+        // Multi-word AND, case-insensitive. (3 notes have both words: two
+        // todos' titles say "project meeting" and the first note's body.)
+        let hits = storage
+            .search_notes("PROJECT meeting", &SearchOptions::default())
+            .unwrap();
+        assert_eq!(hits.len(), 3, "three notes contain both words: {hits:?}");
+
+        // Folder filter.
+        let hits = storage
+            .search_notes(
+                "meeting",
+                &SearchOptions {
+                    folder_id: Some("f2".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+
+        // Todo filters.
+        let hits = storage
+            .search_notes(
+                "meeting",
+                &SearchOptions {
+                    todo_only: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        let hits = storage
+            .search_notes(
+                "meeting",
+                &SearchOptions {
+                    completed_only: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].completed);
+
+        // Snippet contains the matched word with ellipses trimmed to context.
+        let hits = storage
+            .search_notes("roadmap", &SearchOptions::default())
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].snippet.contains("roadmap"));
+
+        // No match -> empty.
+        assert!(storage
+            .search_notes("nonexistentword", &SearchOptions::default())
+            .unwrap()
+            .is_empty());
     }
 }

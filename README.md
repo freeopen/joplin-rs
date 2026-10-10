@@ -27,6 +27,9 @@ A read-only Joplin client written in Rust:
 - Encrypted-then-decrypt flow: sync without a password stores items
   encrypted (`pending decryption`); a later sync with the password decrypts
   and replaces them automatically
+- Search: multi-word AND search over title+body (CLI `search` and GUI),
+  with notebook/tag/todo filters (`--folder`, `--tag`, `--todo`,
+  `--completed`), snippets (`--snippets`) and JSON output (`--json`)
 - GUI (egui): notebook list, note list (todos/tags), full-text search,
   Markdown rendering (GFM via egui_commonmark) with decrypted resource
   images, in-app E2EE password field, background sync
@@ -57,6 +60,10 @@ joplin-rs doctor                  # checks info.json + master key password
 JOPLIN_RS_PASSWORD=e2ee-password joplin-rs sync
 joplin-rs list                    # or: list --item-type folder / tag
 joplin-rs list --query "hello"
+joplin-rs search "meeting notes"  # multi-word AND search
+joplin-rs search project --folder <笔记本id> --snippets
+joplin-rs search todo --todo --completed   # only completed todos
+joplin-rs search xxx --json       # machine-readable output
 joplin-rs show <note-id>
 joplin-rs export <note-id> --output note.md
 ```
