@@ -470,14 +470,16 @@ impl<'a> SyncEngine<'a> {
                 continue; // already downloaded and fresh
             }
             let path = format!(".resource/{id}");
-            let raw = match self.client.get_text(&path).await? {
-                Some(t) => t,
+            // Binary-safe download: unencrypted resources are raw bytes, so
+            // decoding as UTF-8 here would corrupt them (lossy replacement).
+            let raw = match self.client.get(&path).await? {
+                Some(bytes) => bytes,
                 None => continue,
             };
-            let encrypted = raw.starts_with("JED");
-            let data = if encrypted {
+            let data = if raw.starts_with(b"JED") {
+                let text = String::from_utf8(raw).map_err(|e| Error::Crypto(format!("resource {id}: not utf8: {e}")))?;
                 match key_material {
-                    Some(km) => match Self::decrypt_resource_blob(&raw, km) {
+                    Some(km) => match Self::decrypt_resource_blob(&text, km) {
                         Ok(d) => d,
                         Err(e) => {
                             tracing::warn!("resource {id}: {e}");
@@ -491,7 +493,7 @@ impl<'a> SyncEngine<'a> {
                     }
                 }
             } else {
-                raw.into_bytes()
+                raw
             };
             self.storage.save_resource_blob(&id, &data)?;
             self.storage.set_resource_fetched_time(&id, crate::time_ms())?;
