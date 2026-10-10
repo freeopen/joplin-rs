@@ -32,20 +32,22 @@ impl Config {
     }
 }
 
-fn config_path() -> PathBuf {
-    dirs::config_dir()
+/// Default base directory for config and data: ~/.joplin/
+fn default_base_dir() -> PathBuf {
+    dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("joplin-rs")
-        .join("config.toml")
+        .join(".joplin")
+}
+
+fn config_path() -> PathBuf {
+    default_base_dir().join("config.toml")
 }
 
 fn data_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("JOPLIN_RS_DATA_DIR") {
         return PathBuf::from(dir);
     }
-    dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("joplin-rs")
+    default_base_dir()
 }
 
 struct App {

@@ -18,10 +18,10 @@ use std::path::PathBuf;
 struct Cli {
     #[command(subcommand)]
     command: Command,
-    /// Config file path (default: platform config dir /joplin-rs/config.toml)
+    /// Config file path (default: ~/.joplin/config.toml)
     #[arg(long, global = true)]
     config: Option<PathBuf>,
-    /// Data directory (default: platform data dir /joplin-rs)
+    /// Data directory (default: ~/.joplin)
     #[arg(long, global = true)]
     data_dir: Option<PathBuf>,
 }
@@ -111,21 +111,23 @@ impl Config {
     }
 }
 
+/// Default base directory for config and data: ~/.joplin/
+fn default_base_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".joplin")
+}
+
 fn config_path(cli: &Cli) -> PathBuf {
-    cli.config.clone().unwrap_or_else(|| {
-        dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("joplin-rs")
-            .join("config.toml")
-    })
+    cli.config
+        .clone()
+        .unwrap_or_else(|| default_base_dir().join("config.toml"))
 }
 
 fn data_dir(cli: &Cli) -> PathBuf {
-    cli.data_dir.clone().unwrap_or_else(|| {
-        dirs::data_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("joplin-rs")
-    })
+    cli.data_dir
+        .clone()
+        .unwrap_or_else(default_base_dir)
 }
 
 fn load_config(cli: &Cli) -> Result<Config> {

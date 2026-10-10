@@ -42,8 +42,7 @@ cargo build --release
 
 ## CLI usage
 
-Create `config.toml` (default location: `~/Library/Application Support/joplin-rs/config.toml`
-on macOS, `$XDG_CONFIG_HOME/joplin-rs/config.toml` on Linux):
+Create `config.toml` (default location: `~/.joplin/config.toml`):
 
 ```toml
 webdav_url = "https://example.com/remote.php/dav/files/user/joplin"
@@ -68,7 +67,8 @@ joplin-rs show <note-id>
 joplin-rs export <note-id> --output note.md
 ```
 
-Data directory (SQLite db): `~/Library/Application Support/joplin-rs/` on macOS.
+Data directory (SQLite db): `~/.joplin/` (override with `--data-dir` or
+`JOPLIN_RS_DATA_DIR`).
 
 ## GUI usage
 
