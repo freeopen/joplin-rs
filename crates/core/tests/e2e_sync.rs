@@ -14,7 +14,6 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use tower::Service;
 
 #[derive(Debug, Deserialize)]
 struct Vault {
