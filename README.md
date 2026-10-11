@@ -32,10 +32,10 @@ A read-only Joplin client written in Rust:
   `--completed`), snippets (`--snippets`) and JSON output (`--json`)
 - GUI (egui): notebook list, note list (todos/tags), full-text search,
   Markdown rendering (GFM via egui_commonmark) with decrypted resource
-  images, E2EE password prompted before the first sync (stored encrypted in
-  config.toml via `joplin-rs set-password --e2ee` for a promptless launch),
-  background sync, optional reading password that locks the app on every
-  launch
+  images, official Joplin window/About icon with version info, E2EE
+  password prompted before the first sync (stored encrypted in config.toml
+  via `joplin-rs set-password --e2ee` for a promptless launch), background
+  sync, optional reading password that locks the app on every launch
 
 ## Build
 

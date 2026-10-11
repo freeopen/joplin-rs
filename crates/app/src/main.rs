@@ -2,6 +2,9 @@
 
 mod read_password;
 
+/// App version, taken from Cargo.toml at compile time.
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 use joplin_rs_core::items::Item;
 use joplin_rs_core::secret::LocalKey;
 use joplin_rs_core::storage::Storage;
@@ -164,6 +167,8 @@ enum Dialog {
     ReaderPasswordSettings,
     /// Prompt for the E2EE master-key password before a sync.
     E2eePrompt,
+    /// App info: official icon, name, version.
+    About,
 }
 
 struct App {
@@ -218,6 +223,10 @@ struct App {
     /// e2ee_password or the WebDAV password) is wrong. Until restart, use only
     /// the password typed in the prompt instead of failing again.
     e2ee_stored_rejected: bool,
+
+    // ---- about dialog ----
+    /// Official Joplin icon texture for the About dialog (loaded lazily).
+    about_icon: Option<egui::TextureHandle>,
 }
 
 impl App {
@@ -259,6 +268,7 @@ impl App {
             e2ee_prompt_error: None,
             e2ee_pending_sync: false,
             e2ee_stored_rejected: false,
+            about_icon: None,
         };
         if app.unlocked {
             app.reload_meta();
@@ -616,6 +626,9 @@ impl eframe::App for App {
                 }
                 ui.label(&self.status);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("关于").clicked() {
+                        self.dialog = Dialog::About;
+                    }
                     if ui.button("阅读密码").clicked() {
                         self.open_reader_pw_settings();
                     }
@@ -760,6 +773,7 @@ impl eframe::App for App {
             Dialog::None => {}
             Dialog::ReaderPasswordSettings => self.show_reader_pw_dialog(ctx),
             Dialog::E2eePrompt => self.show_e2ee_prompt_dialog(ctx),
+            Dialog::About => self.show_about_dialog(ctx),
         }
     }
 }
@@ -782,15 +796,19 @@ impl App {
                 .hint_text("阅读密码")
                 .desired_width(280.0);
             let input_response = ui.add(input);
-            // Keep focus on the password field (including after a failed
-            // attempt clears it) so typing and Enter always land here.
-            if !input_response.has_focus() {
+            // Keep focus on the password field so typing always lands here,
+            // but do NOT steal it back on the frame Enter was pressed:
+            // pressing Enter makes the singleline editor surrender focus,
+            // and re-requesting it in the same frame would suppress the
+            // lost_focus signal below (the bug where Enter did not unlock).
+            let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if !input_response.has_focus() && !enter_pressed {
                 input_response.request_focus();
             }
-            // egui's recommended singleline submit pattern: Enter surrenders
-            // focus on the same frame, so lost_focus + Enter fires once.
-            let submit =
-                input_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            // egui's singleline submit pattern: Enter surrenders focus on
+            // the same frame, so lost_focus + Enter fires exactly once.
+            let submit = enter_pressed
+                && (input_response.lost_focus() || !self.lock_input.is_empty());
 
             if let Some(err) = &self.lock_error {
                 ui.add_space(4.0);
@@ -896,11 +914,14 @@ impl App {
                 .hint_text("E2EE master key password")
                 .desired_width(320.0);
             let input_response = ui.add(input);
-            if !input_response.has_focus() {
+            // Same focus rule as the lock modal: never steal focus back on
+            // the Enter frame or the surrender/lost_focus signal is eaten.
+            let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if !input_response.has_focus() && !enter_pressed {
                 input_response.request_focus();
             }
-            let submit =
-                input_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let submit = enter_pressed
+                && (input_response.lost_focus() || !self.e2ee_input.is_empty());
 
             if let Some(err) = &self.e2ee_prompt_error {
                 ui.add_space(4.0);
@@ -928,6 +949,48 @@ impl App {
         });
         if response.should_close() {
             self.e2ee_pending_sync = false;
+            self.dialog = Dialog::None;
+        }
+    }
+
+    fn show_about_dialog(&mut self, ctx: &egui::Context) {
+        let response = egui::Modal::new(egui::Id::new("about_modal")).show(ctx, |ui| {
+            ui.set_min_width(340.0);
+            ui.vertical_centered(|ui| {
+                // Lazily decode the embedded official icon into a GPU texture.
+                if self.about_icon.is_none() {
+                    self.about_icon =
+                        eframe::icon_data::from_png_bytes(APP_ICON_PNG)
+                            .ok()
+                            .map(|ic| {
+                                let image = egui::ColorImage::from_rgba_unmultiplied(
+                                    [ic.width as usize, ic.height as usize],
+                                    &ic.rgba,
+                                );
+                                ctx.load_texture("about_icon", image, egui::TextureOptions::LINEAR)
+                            });
+                }
+                if let Some(tex) = &self.about_icon {
+                    ui.add(
+                        egui::Image::from_texture(tex).fit_to_exact_size(egui::vec2(72.0, 72.0)),
+                    );
+                }
+                ui.add_space(8.0);
+                ui.heading("joplin-rs");
+                ui.label(format!("版本 {APP_VERSION}"));
+                ui.add_space(4.0);
+                ui.label("只读的 Joplin 客户端（WebDAV + 端到端加密）");
+                ui.small(
+                    egui::RichText::new("应用图标为 Joplin 官方图标，版权归 Joplin 项目所有")
+                        .weak(),
+                );
+                ui.add_space(10.0);
+                if ui.button("关闭").clicked() {
+                    self.dialog = Dialog::None;
+                }
+            });
+        });
+        if response.should_close() {
             self.dialog = Dialog::None;
         }
     }
@@ -1059,11 +1122,19 @@ fn configure_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+/// Official Joplin app icon (512x512 PNG), embedded for the window/taskbar
+/// icon and the About dialog. Sourced from joplin-dev Assets/SquareIcon512.png.
+const APP_ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
+
 fn main() -> eframe::Result {
+    let icon = eframe::icon_data::from_png_bytes(APP_ICON_PNG)
+        .expect("embedded app icon must be a valid PNG");
     eframe::run_native(
         "joplin-rs",
         eframe::NativeOptions {
-            viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 720.0]),
+            viewport: egui::ViewportBuilder::default()
+                .with_inner_size([1100.0, 720.0])
+                .with_icon(std::sync::Arc::new(icon)),
             ..Default::default()
         },
         Box::new(|cc| {
@@ -1076,6 +1147,20 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_icon_decodes_to_square_rgba() {
+        // Guards both the window icon and the About dialog texture: the
+        // PNG must decode to square RGBA so ColorImage::from_rgba_unmultiplied
+        // never panics on a length mismatch.
+        let ic = eframe::icon_data::from_png_bytes(APP_ICON_PNG).expect("icon png decodes");
+        assert_eq!(ic.width, ic.height);
+        assert!(ic.width >= 64);
+        assert_eq!(
+            ic.rgba.len(),
+            ic.width as usize * ic.height as usize * 4
+        );
+    }
 
     const ID: &str = "0123456789abcdef0123456789abcdef";
 
