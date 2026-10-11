@@ -3,7 +3,8 @@ name: Release
 # 正式发布（非 prerelease）：
 # - push master：从 git 提交记录自动推导版本 X.Y.Z（feat 升次版本、fix 升
 #   补丁），CI 在当前提交上自动建 tag vX.Y.Z 并发布 Release（GITHUB_TOKEN
-#   建的 tag 不会再次触发本流水线，无递归风险）
+#   建的 tag 不会再次触发本流水线，无递归风险）；若该版本号的 tag 已存在
+#   （本次 push 没有 feat/fix 提交，版本未变），则跳过发布
 # - push 人工 tag vX.Y.Z：发布绑定该 tag 的正式 Release
 on:
   push:
@@ -119,12 +120,19 @@ jobs:
           else
             # 日常 push：版本号即纯 SemVer，直接加 v 前缀作为 tag
             TAG_NAME="v${VERSION}"
+            # 版本号没变（本次 push 无 feat/fix 提交）时 tag 已存在，跳过发布，
+            # 避免把新产物挂到旧提交的 tag 上
+            if gh api "repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG_NAME}" >/dev/null 2>&1; then
+              echo "Tag ${TAG_NAME} already exists at an older commit; skipping release."
+              echo "SKIP_RELEASE=true" >> "$GITHUB_ENV"
+            fi
           fi
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "TAG_NAME=$TAG_NAME" >> "$GITHUB_ENV"
           echo "Releasing $VERSION as $TAG_NAME"
 
       - name: Publish Release
+        if: env.SKIP_RELEASE != 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.TAG_NAME }}
