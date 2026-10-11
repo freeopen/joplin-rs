@@ -46,9 +46,6 @@ enum Command {
         /// Folder id to filter notes by
         #[arg(long)]
         folder: Option<String>,
-        /// Search query over title/body
-        #[arg(long)]
-        query: Option<String>,
     },
     /// Show a note (markdown body)
     Show { id: String },
@@ -277,34 +274,14 @@ async fn main() -> Result<()> {
                 println!("master key: n/a (encryption disabled)");
             }
         }
-        Command::List {
-            item_type,
-            folder,
-            query,
-        } => {
+        Command::List { item_type, folder } => {
             let storage = db(cli)?;
             let t = type_from_str(item_type)?;
-            // Convenience path: `list --query` behaves like a plain search.
+            // Full-text/title+body search lives in the `search` command.
             if t == joplin_rs_core::items::TYPE_NOTE {
-                if let Some(q) = query {
-                    let hits = storage.search_notes(q, &SearchOptions::default())?;
-                    for h in &hits {
-                        let flag = if h.is_todo {
-                            if h.completed {
-                                "[x] "
-                            } else {
-                                "[ ] "
-                            }
-                        } else {
-                            ""
-                        };
-                        println!("{}  {}{}", h.id, flag, h.title);
-                    }
-                } else {
-                    let items = storage.notes(folder.as_deref().unwrap_or(""), true)?;
-                    for item in &items {
-                        print_list_item(item);
-                    }
+                let items = storage.notes(folder.as_deref().unwrap_or(""), true)?;
+                for item in &items {
+                    print_list_item(item);
                 }
             } else {
                 for item in storage.items_by_type(t)? {

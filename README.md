@@ -58,7 +58,7 @@ Then:
 joplin-rs doctor                  # checks info.json + master key password
 JOPLIN_RS_PASSWORD=e2ee-password joplin-rs sync
 joplin-rs list                    # or: list --item-type folder / tag
-joplin-rs list --query "hello"
+joplin-rs search "hello"          # title/body search
 joplin-rs search "meeting notes"  # multi-word AND search
 joplin-rs search project --folder <笔记本id> --snippets
 joplin-rs search todo --todo --completed   # only completed todos
