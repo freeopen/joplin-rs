@@ -165,10 +165,36 @@ enum Dialog {
     None,
     /// Set / change / remove the reading password.
     ReaderPasswordSettings,
-    /// Prompt for the E2EE master-key password before a sync.
+    /// Prompt for the E2EE master-key password after a sync downloaded items.
     E2eePrompt,
     /// App info: official icon, name, version.
     About,
+}
+
+/// Stage-1 (password-less download) result handed from the worker thread.
+#[derive(Clone)]
+struct Stage1Summary {
+    downloaded: usize,
+    deleted: usize,
+    resources: usize,
+}
+
+/// Stage-2 (E2EE decryption) result handed from the worker thread.
+#[derive(Clone)]
+struct DecryptSummary {
+    items: usize,
+    resources: usize,
+    still_encrypted: usize,
+}
+
+/// One-shot result posted by the background sync/decrypt job.
+enum JobEvent {
+    /// Stage 1 (password-less download) finished. Carries the summary and the
+    /// number of items still stored encrypted after it.
+    SyncDone(Result<(Stage1Summary, usize), String>),
+    /// Stage 2 (E2EE decryption) finished. An Err means the password was wrong
+    /// or unsupported; placeholders remain in the list.
+    DecryptDone(Result<DecryptSummary, String>),
 }
 
 struct App {
@@ -179,21 +205,23 @@ struct App {
     selected_folder: Option<String>,
     notes: Vec<Item>,
     selected_note: Option<String>,
+    /// The selected note is stored as an encrypted placeholder (no plaintext).
+    selected_note_encrypted: bool,
     note_body: String,
     note_title: String,
     search: String,
     /// Search-hit snippets keyed by note id (shown under the note title).
     search_hits: std::collections::HashMap<String, String>,
-    /// E2EE password entered via the pre-sync prompt. Session-only: never
+    /// E2EE password typed in the post-sync prompt. Session-only: never
     /// persisted by the GUI. Empty until the user is prompted (or a previous
-    /// attempt supplied it).
+    /// decryption supplied it).
     e2ee_session_password: String,
     status: String,
+    /// True while either the download sync or the decryption pass runs.
     sync_running: Arc<Mutex<bool>>,
     status_shared: Arc<Mutex<String>>,
-    /// Last sync error text; used to spot a wrong E2EE password so the next
-    /// Sync click can re-prompt instead of silently failing again.
-    sync_error: Arc<Mutex<Option<String>>>,
+    /// One-shot event posted by the background job, consumed by update().
+    job_event: Arc<Mutex<Option<JobEvent>>>,
     resource_dir: PathBuf,
     note_tags: std::collections::HashMap<String, Vec<String>>, // note_id -> tag titles
 
@@ -216,13 +244,8 @@ struct App {
     // E2EE prompt dialog fields:
     e2ee_input: String,
     e2ee_prompt_error: Option<String>,
-    /// A sync click opened the E2EE prompt; once the password is submitted the
-    /// sync should start automatically.
-    e2ee_pending_sync: bool,
-    /// A previous sync proved the stored/fallback E2EE password (config
-    /// e2ee_password or the WebDAV password) is wrong. Until restart, use only
-    /// the password typed in the prompt instead of failing again.
-    e2ee_stored_rejected: bool,
+    /// Number of encrypted items awaiting the password shown in the prompt.
+    e2ee_pending_count: usize,
 
     // ---- about dialog ----
     /// Official Joplin icon texture for the About dialog (loaded lazily).
@@ -244,6 +267,7 @@ impl App {
             selected_folder: None,
             notes: Vec::new(),
             selected_note: None,
+            selected_note_encrypted: false,
             note_body: String::new(),
             note_title: String::new(),
             search: String::new(),
@@ -252,7 +276,7 @@ impl App {
             status: "ready".into(),
             sync_running: Arc::new(Mutex::new(false)),
             status_shared: Arc::new(Mutex::new(String::new())),
-            sync_error: Arc::new(Mutex::new(None)),
+            job_event: Arc::new(Mutex::new(None)),
             resource_dir: PathBuf::new(),
             note_tags: Default::default(),
             unlocked: !has_reader_pw,
@@ -266,8 +290,7 @@ impl App {
             rp_error: None,
             e2ee_input: String::new(),
             e2ee_prompt_error: None,
-            e2ee_pending_sync: false,
-            e2ee_stored_rejected: false,
+            e2ee_pending_count: 0,
             about_icon: None,
         };
         if app.unlocked {
@@ -308,6 +331,12 @@ impl App {
             }
         }
         self.note_tags = map;
+
+        // A decrypt pass may have just replaced the open placeholder with its
+        // plaintext; refresh the open note so its body/lock state updates.
+        if let Some(id) = self.selected_note.clone() {
+            self.open_note(&id);
+        }
     }
 
     fn load_notes(&mut self) {
@@ -339,6 +368,7 @@ impl App {
 
     fn open_note(&mut self, id: &str) {
         if let Ok(Some(note)) = self.storage.note(id) {
+            self.selected_note_encrypted = is_encrypted_placeholder(&note);
             self.note_title = note
                 .props
                 .get("title")
@@ -471,23 +501,13 @@ impl App {
         }
     }
 
-    // ---- E2EE password prompt before sync ----
+    // ---- E2EE decryption (separate stage after download) ----
 
-    /// Effective E2EE password for the next sync:
-    /// 1. the session password typed in the pre-sync prompt (never persisted),
-    /// 2. config.toml `e2ee_password` (decrypted from enc:v1: at startup),
-    /// 3. the WebDAV password fallback (many users set both to the same
-    ///    value).
-    ///
-    /// Once a stored/fallback password has been rejected by the server it is
-    /// ignored for the rest of the session so the user is prompted again.
-    fn effective_e2ee_password(&self) -> Option<String> {
-        if !self.e2ee_session_password.is_empty() {
-            return Some(self.e2ee_session_password.clone());
-        }
-        if self.e2ee_stored_rejected {
-            return None;
-        }
+    /// Persisted/fallback E2EE password available without prompting: the
+    /// decrypted config value, else the WebDAV password (users often reuse
+    /// one). Used for the automatic post-sync decryption; the prompt is shown
+    /// when none exists.
+    fn stored_e2ee_password(&self) -> Option<String> {
         self.config
             .e2ee_password
             .clone()
@@ -495,34 +515,22 @@ impl App {
             .or_else(|| self.config.password.clone().filter(|p| !p.is_empty()))
     }
 
-    /// Sync button entry point. If no E2EE password is known (or the previous
-    /// sync failed because the stored one was wrong), prompt before syncing.
-    fn request_sync(&mut self, ctx: &egui::Context) {
-        let previous_wrong = self
-            .sync_error
-            .lock()
-            .unwrap()
-            .as_deref()
-            .is_some_and(looks_like_wrong_e2ee_password);
-        if previous_wrong {
-            // Drop any remembered password and stop trusting config/fallback
-            // values for this session, forcing the prompt to appear again.
-            self.e2ee_session_password.clear();
-            self.e2ee_stored_rejected = true;
-            *self.sync_error.lock().unwrap() = None;
+    /// Password to use for the decrypt pass: session prompt first, then the
+    /// stored/fallback value.
+    fn e2ee_password_for_decrypt(&self) -> Option<String> {
+        if !self.e2ee_session_password.is_empty() {
+            return Some(self.e2ee_session_password.clone());
         }
-        if self.effective_e2ee_password().is_some() {
-            self.start_sync(ctx);
-        } else {
-            self.e2ee_input.clear();
-            self.e2ee_prompt_error = None;
-            self.e2ee_pending_sync = true;
-            self.dialog = Dialog::E2eePrompt;
-        }
+        self.stored_e2ee_password()
     }
 
-    /// Accept the E2EE prompt input: remember it for this session and, if the
-    /// prompt was opened by a Sync click, start syncing immediately.
+    /// Sync button: always start with the password-less download pass. E2EE
+    /// decryption is a separate step triggered after the download finishes.
+    fn request_sync(&mut self, ctx: &egui::Context) {
+        self.start_download(ctx);
+    }
+
+    /// Accept the E2EE prompt shown after a download and run decryption.
     fn submit_e2ee_prompt(&mut self, ctx: &egui::Context) {
         if self.e2ee_input.is_empty() {
             self.e2ee_prompt_error = Some("密码不能为空".into());
@@ -531,33 +539,37 @@ impl App {
         self.e2ee_session_password = self.e2ee_input.clone();
         self.e2ee_input.clear();
         self.e2ee_prompt_error = None;
-        let start = self.e2ee_pending_sync;
-        self.e2ee_pending_sync = false;
         self.dialog = Dialog::None;
-        if start {
-            self.start_sync(ctx);
-        }
+        self.start_decrypt(ctx);
     }
 
-    fn start_sync(&mut self, ctx: &egui::Context) {
-        {
-            let running = self.sync_running.lock().unwrap();
-            if *running {
-                return;
-            }
+    /// Cancel the post-sync E2EE prompt: placeholders stay in the list.
+    fn cancel_e2ee_prompt(&mut self) {
+        self.e2ee_input.clear();
+        self.e2ee_prompt_error = None;
+        self.dialog = Dialog::None;
+    }
+
+    fn busy(&self) -> bool {
+        *self.sync_running.lock().unwrap()
+    }
+
+    // ---- stage 1: password-less download sync ----
+
+    fn start_download(&mut self, ctx: &egui::Context) {
+        if self.busy() {
+            return;
         }
         *self.sync_running.lock().unwrap() = true;
-        *self.sync_error.lock().unwrap() = None;
-        self.status = "syncing...".into();
+        *self.job_event.lock().unwrap() = None;
+        *self.status_shared.lock().unwrap() = "开始同步…".into();
+        self.status = "开始同步…".into();
 
-        let mut config = self.config.clone();
-        // Single source of truth: the in-app/prompt field, then config, then
-        // the WebDAV-password fallback (see effective_e2ee_password).
-        config.e2ee_password = self.effective_e2ee_password();
+        let config = self.config.clone();
         let data_dir = data_dir();
         let status = self.status_shared.clone();
         let running = self.sync_running.clone();
-        let sync_error = self.sync_error.clone();
+        let job_event = self.job_event.clone();
         let ctx = ctx.clone();
 
         std::thread::spawn(move || {
@@ -565,7 +577,6 @@ impl App {
                 .enable_all()
                 .build()
                 .unwrap();
-            let status_async = status.clone();
             let result = rt.block_on(async move {
                 let storage = Storage::open(&data_dir.join("joplin-rs.db"))?;
                 let client = joplin_rs_core::webdav::WebDavClient::new_with_tls(
@@ -575,27 +586,158 @@ impl App {
                     &config.tls_options(),
                 )?;
                 let engine = joplin_rs_core::sync::SyncEngine::new(&client, &storage);
-                let e2ee_pw = config.e2ee_password.as_deref();
-                engine
-                    .sync(e2ee_pw, &mut |msg| {
-                        *status_async.lock().unwrap() = msg.to_string();
+                // No E2EE password here: encrypted items download as
+                // placeholders and are decrypted in the separate pass.
+                let outcome = engine
+                    .sync(None, &mut |msg| {
+                        *status.lock().unwrap() = msg.to_string();
                     })
-                    .await
+                    .await?;
+                let pending = storage.items_still_encrypted().unwrap_or_default().len();
+                Ok::<_, anyhow::Error>((
+                    Stage1Summary {
+                        downloaded: outcome.downloaded,
+                        deleted: outcome.deleted,
+                        resources: outcome.resources_downloaded,
+                    },
+                    pending,
+                ))
             });
-            let final_status = match &result {
-                Ok(outcome) => format!(
-                    "sync done: {} downloaded, {} deleted, {} resources",
-                    outcome.downloaded, outcome.deleted, outcome.resources_downloaded
-                ),
-                Err(e) => {
-                    *sync_error.lock().unwrap() = Some(e.to_string());
-                    format!("sync failed: {e}")
-                }
-            };
-            *status.lock().unwrap() = final_status;
             *running.lock().unwrap() = false;
+            // Post the event only after clearing the busy flag: the UI reacts
+            // to this event by possibly starting the decrypt job, which is
+            // skipped while busy() is still true.
+            *job_event.lock().unwrap() =
+                Some(JobEvent::SyncDone(result.map_err(|e| e.to_string())));
             ctx.request_repaint();
         });
+    }
+
+    // ---- stage 2: E2EE decryption ----
+
+    fn start_decrypt(&mut self, ctx: &egui::Context) {
+        if self.busy() {
+            return;
+        }
+        let Some(password) = self.e2ee_password_for_decrypt() else {
+            self.e2ee_input.clear();
+            self.e2ee_prompt_error = None;
+            self.dialog = Dialog::E2eePrompt;
+            return;
+        };
+        *self.sync_running.lock().unwrap() = true;
+        *self.job_event.lock().unwrap() = None;
+        *self.status_shared.lock().unwrap() = "开始解密…".into();
+        self.status = "开始解密…".into();
+
+        let config = self.config.clone();
+        let data_dir = data_dir();
+        let status = self.status_shared.clone();
+        let running = self.sync_running.clone();
+        let job_event = self.job_event.clone();
+        let ctx = ctx.clone();
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let result = rt.block_on(async move {
+                let storage = Storage::open(&data_dir.join("joplin-rs.db"))?;
+                let client = joplin_rs_core::webdav::WebDavClient::new_with_tls(
+                    &config.webdav_url,
+                    &config.username,
+                    config.password.as_deref().unwrap_or(""),
+                    &config.tls_options(),
+                )?;
+                let engine = joplin_rs_core::sync::SyncEngine::new(&client, &storage);
+                let info = engine.fetch_sync_info().await?;
+                let out = engine
+                    .decrypt_pending(&info, &password, &mut |msg| {
+                        *status.lock().unwrap() = msg.to_string();
+                    })
+                    .await?;
+                Ok::<_, anyhow::Error>(DecryptSummary {
+                    items: out.items_decrypted,
+                    resources: out.resources_decrypted,
+                    still_encrypted: out.still_encrypted,
+                })
+            });
+            *running.lock().unwrap() = false;
+            *job_event.lock().unwrap() =
+                Some(JobEvent::DecryptDone(result.map_err(|e| e.to_string())));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Consume the background-job event on the UI thread.
+    fn handle_job_event(&mut self, ctx: &egui::Context) {
+        let event = self.job_event.lock().unwrap().take();
+        let Some(event) = event else { return };
+        match event {
+            JobEvent::SyncDone(result) => match result {
+                Ok((summary, pending)) => {
+                    self.reload_meta();
+                    self.e2ee_pending_count = pending;
+                    let base = format!(
+                        "同步完成：{} 项已下载，{} 项已删除，{} 个资源",
+                        summary.downloaded, summary.deleted, summary.resources
+                    );
+                    if pending == 0 {
+                        self.set_status(base);
+                    } else if self.e2ee_password_for_decrypt().is_some() {
+                        self.set_status(format!("{base}；正在解密 {pending} 项…"));
+                        self.start_decrypt(ctx);
+                    } else {
+                        self.set_status(format!("{base}；{pending} 项已加密，等待 E2EE 密码"));
+                        self.e2ee_input.clear();
+                        self.e2ee_prompt_error = None;
+                        self.dialog = Dialog::E2eePrompt;
+                    }
+                }
+                Err(e) => self.set_status(format!("同步失败: {e}")),
+            },
+            JobEvent::DecryptDone(result) => {
+                self.reload_meta();
+                match result {
+                    Ok(sum) => {
+                        self.e2ee_pending_count = sum.still_encrypted;
+                        if sum.still_encrypted == 0 {
+                            self.set_status(format!(
+                                "解密完成：{} 项、{} 个资源",
+                                sum.items, sum.resources
+                            ));
+                        } else {
+                            self.set_status(format!(
+                                "已解密 {} 项，仍有 {} 项保持加密",
+                                sum.items, sum.still_encrypted
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        // Wrong/unsupported E2EE password: drop the session
+                        // password and prompt again; placeholders remain.
+                        let looks_wrong = looks_like_wrong_e2ee_password(&e);
+                        self.e2ee_session_password.clear();
+                        self.e2ee_input.clear();
+                        self.set_status(format!("E2EE 解密失败: {e}"));
+                        if self.e2ee_pending_count > 0 {
+                            self.e2ee_prompt_error = Some(if looks_wrong {
+                                "E2EE 密码错误，未解密笔记保持加密状态".into()
+                            } else {
+                                format!("解密失败: {e}")
+                            });
+                            self.dialog = Dialog::E2eePrompt;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn set_status(&mut self, text: String) {
+        self.status = text.clone();
+        *self.status_shared.lock().unwrap() = text;
     }
 }
 
@@ -614,21 +756,41 @@ impl eframe::App for App {
             return;
         }
 
+        // Consume any finished background sync/decrypt job before drawing.
+        self.handle_job_event(ctx);
+
+        // Menu bar: app menu hosts the About entry.
+        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
+            egui::MenuBar::new().ui(ui, |ui| {
+                ui.menu_button("joplin-rs-app", |ui| {
+                    if ui.button("About joplin-rs-app").clicked() {
+                        self.dialog = Dialog::About;
+                        ui.close();
+                    }
+                });
+            });
+        });
+
         // Top bar
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("Sync").clicked() {
+                let sync_label = if self.busy() { "Sync…" } else { "Sync" };
+                let sync_clicked = ui
+                    .add_enabled(!self.busy(), egui::Button::new(sync_label))
+                    .clicked();
+                if sync_clicked {
                     self.request_sync(ctx);
                 }
-                self.status = self.status_shared.lock().unwrap().clone();
+                // Reflect live worker progress (download / decrypt status).
+                let worker_status = self.status_shared.lock().unwrap().clone();
+                if !worker_status.is_empty() {
+                    self.status = worker_status;
+                }
                 if self.status.is_empty() {
                     self.status = "ready".into();
                 }
                 ui.label(&self.status);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("关于").clicked() {
-                        self.dialog = Dialog::About;
-                    }
                     if ui.button("阅读密码").clicked() {
                         self.open_reader_pw_settings();
                     }
@@ -707,12 +869,24 @@ impl eframe::App for App {
                                 .and_then(serde_json::Value::as_str)
                                 .unwrap_or("")
                                 .to_string();
-                            let title = note
+                            let encrypted = is_encrypted_placeholder(note);
+                            let raw_title = note
                                 .props
                                 .get("title")
                                 .and_then(serde_json::Value::as_str)
-                                .unwrap_or("(no title)")
+                                .unwrap_or("")
                                 .to_string();
+                            let title = if encrypted {
+                                if raw_title.is_empty() {
+                                    format!("🔒 已加密 {}", short_id(&id))
+                                } else {
+                                    format!("🔒 {raw_title}")
+                                }
+                            } else if raw_title.is_empty() {
+                                "(no title)".to_string()
+                            } else {
+                                raw_title
+                            };
                             let is_todo = note
                                 .props
                                 .get("is_todo")
@@ -744,7 +918,11 @@ impl eframe::App for App {
                                 }
                             }
                             if let Some(snippet) = search_hits.get(&id) {
-                                ui.small(egui::RichText::new(snippet).weak().size(11.0));
+                                // Encrypted placeholders have no plaintext body;
+                                // showing an empty/garbled snippet is pointless.
+                                if !encrypted {
+                                    ui.small(egui::RichText::new(snippet).weak().size(11.0));
+                                }
                             }
                         }
                     });
@@ -755,6 +933,19 @@ impl eframe::App for App {
             if self.selected_note.is_none() {
                 ui.centered_and_justified(|ui| {
                     ui.weak("Select a note, then press Sync to download the vault.")
+                });
+                return;
+            }
+            // Encrypted placeholder selected: show its raw (locked) state rather
+            // than rendering an empty/encrypted body.
+            if self.selected_note_encrypted {
+                ui.heading(&self.note_title);
+                ui.separator();
+                ui.vertical_centered(|ui| {
+                    ui.add_space(40.0);
+                    ui.heading("🔒");
+                    ui.label("此笔记已端到端加密，尚未解密");
+                    ui.label("先完成同步，再提供正确的 E2EE 密码即可查看");
                 });
                 return;
             }
@@ -807,8 +998,8 @@ impl App {
             }
             // egui's singleline submit pattern: Enter surrenders focus on
             // the same frame, so lost_focus + Enter fires exactly once.
-            let submit = enter_pressed
-                && (input_response.lost_focus() || !self.lock_input.is_empty());
+            let submit =
+                enter_pressed && (input_response.lost_focus() || !self.lock_input.is_empty());
 
             if let Some(err) = &self.lock_error {
                 ui.add_space(4.0);
@@ -902,17 +1093,24 @@ impl App {
     }
 
     fn show_e2ee_prompt_dialog(&mut self, ctx: &egui::Context) {
+        let pending = self.e2ee_pending_count;
         let response = egui::Modal::new(egui::Id::new("e2ee_prompt_modal")).show(ctx, |ui| {
-            ui.set_min_width(360.0);
+            ui.set_min_width(380.0);
             ui.heading("E2EE 密码");
             ui.add_space(6.0);
-            ui.label("同步需要 E2EE 主密钥密码，请输入后回车开始同步:");
+            if pending > 0 {
+                ui.label(format!(
+                    "同步已完成，有 {pending} 项处于加密状态。输入 E2EE 主密钥密码后回车开始解密："
+                ));
+            } else {
+                ui.label("输入 E2EE 主密钥密码后回车开始解密：");
+            }
             ui.add_space(8.0);
 
             let input = egui::TextEdit::singleline(&mut self.e2ee_input)
                 .password(true)
                 .hint_text("E2EE master key password")
-                .desired_width(320.0);
+                .desired_width(340.0);
             let input_response = ui.add(input);
             // Same focus rule as the lock modal: never steal focus back on
             // the Enter frame or the surrender/lost_focus signal is eaten.
@@ -920,8 +1118,8 @@ impl App {
             if !input_response.has_focus() && !enter_pressed {
                 input_response.request_focus();
             }
-            let submit = enter_pressed
-                && (input_response.lost_focus() || !self.e2ee_input.is_empty());
+            let submit =
+                enter_pressed && (input_response.lost_focus() || !self.e2ee_input.is_empty());
 
             if let Some(err) = &self.e2ee_prompt_error {
                 ui.add_space(4.0);
@@ -932,24 +1130,22 @@ impl App {
             let mut confirmed = false;
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("取消").clicked() {
+                    if ui.button("取消（保持加密）").clicked() {
                         cancelled = true;
                     }
-                    if ui.button("开始同步").clicked() {
+                    if ui.button("开始解密").clicked() {
                         confirmed = true;
                     }
                 });
             });
             if cancelled {
-                self.e2ee_pending_sync = false;
-                self.dialog = Dialog::None;
+                self.cancel_e2ee_prompt();
             } else if confirmed || submit {
                 self.submit_e2ee_prompt(ctx);
             }
         });
         if response.should_close() {
-            self.e2ee_pending_sync = false;
-            self.dialog = Dialog::None;
+            self.cancel_e2ee_prompt();
         }
     }
 
@@ -1000,6 +1196,25 @@ impl App {
 /// decide whether the next Sync click must prompt for the password again.
 fn looks_like_wrong_e2ee_password(err: &str) -> bool {
     err.contains("wrong password") || err.contains("no master key matched the password")
+}
+
+/// Whether a stored note is still an encrypted placeholder (`encryption_applied=1`)
+/// downloaded by the password-less sync and not yet decrypted.
+fn is_encrypted_placeholder(item: &Item) -> bool {
+    item.props
+        .get("encryption_applied")
+        .and_then(serde_json::Value::as_i64)
+        .is_some_and(|v| v == 1)
+}
+
+/// Short, human-friendly id tail used in the placeholder list label.
+fn short_id(id: &str) -> String {
+    let n = id.chars().count();
+    if n > 8 {
+        id.chars().skip(n - 8).collect()
+    } else {
+        id.to_string()
+    }
 }
 
 /// Extract Joplin resource ids referenced as ":/<32-hex>" in a note body.
@@ -1156,10 +1371,28 @@ mod tests {
         let ic = eframe::icon_data::from_png_bytes(APP_ICON_PNG).expect("icon png decodes");
         assert_eq!(ic.width, ic.height);
         assert!(ic.width >= 64);
-        assert_eq!(
-            ic.rgba.len(),
-            ic.width as usize * ic.height as usize * 4
-        );
+        assert_eq!(ic.rgba.len(), ic.width as usize * ic.height as usize * 4);
+    }
+
+    #[test]
+    fn encrypted_placeholder_detection_and_short_id() {
+        let plain = Item {
+            item_type: 1,
+            props: std::collections::BTreeMap::new(),
+            body: "hello".into(),
+        };
+        assert!(!is_encrypted_placeholder(&plain));
+        assert_eq!(short_id("0123456789abcdef"), "89abcdef");
+        assert_eq!(short_id("abc"), "abc");
+
+        let mut enc_props = std::collections::BTreeMap::new();
+        enc_props.insert("encryption_applied".to_string(), serde_json::Value::from(1));
+        let enc = Item {
+            item_type: 1,
+            props: enc_props,
+            body: String::new(),
+        };
+        assert!(is_encrypted_placeholder(&enc));
     }
 
     const ID: &str = "0123456789abcdef0123456789abcdef";

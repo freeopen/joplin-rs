@@ -100,6 +100,23 @@ pub struct SyncOutcome {
     pub pending_decryption: Vec<String>,
 }
 
+/// Result of the separate decryption pass ([`SyncEngine::decrypt_pending`]).
+#[derive(Debug, Clone, Default)]
+pub struct DecryptOutcome {
+    /// Encrypted items successfully decrypted and replaced.
+    pub items_decrypted: usize,
+    /// Encrypted resource blobs downloaded and decrypted.
+    pub resources_decrypted: usize,
+    /// Resources still encrypted (wrong key for a given blob, etc.).
+    pub resources_pending: usize,
+    pub errors: Vec<String>,
+    /// Items skipped because their encryption method is unsupported.
+    pub skipped_unsupported: usize,
+    /// Number of items that remain encrypted after the pass (wrong password
+    /// leaves all of them; an unsupported method leaves some).
+    pub still_encrypted: usize,
+}
+
 /// Delta context persisted between syncs (basicDelta context).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DeltaContext {
@@ -630,41 +647,11 @@ impl<'a> SyncEngine<'a> {
 
         // ---- retry items that were stored encrypted (password now available) ----
         if let Some(km) = &key_material {
-            let still_encrypted = self.storage.items_still_encrypted()?;
-            if !still_encrypted.is_empty() {
-                progress(&format!(
-                    "retrying {} encrypted items",
-                    still_encrypted.len()
-                ));
-                for id in still_encrypted {
-                    let path = items::system_path(&id);
-                    let Some(text) = self.client.get_text(&path).await? else {
-                        continue;
-                    };
-                    match Self::process_item_text(&text, Some(km)) {
-                        ProcessResult::Item(item) => {
-                            if let Err(e) = self.storage.upsert_item(&item) {
-                                outcome.errors.push(format!("{path}: store: {e}"));
-                            } else {
-                                self.storage.save_sync_time(&id, crate::time_ms(), 0)?;
-                                outcome.downloaded += 1;
-                            }
-                        }
-                        // A password is present here, so Pending should be
-                        // impossible; treat it as an error if it ever occurs.
-                        ProcessResult::Pending(_) => outcome
-                            .errors
-                            .push(format!("{path}: retry: still encrypted")),
-                        ProcessResult::Unsupported(msg) => {
-                            outcome.skipped_unsupported += 1;
-                            outcome.errors.push(format!("{path}: {msg}"));
-                        }
-                        ProcessResult::Error(msg) => {
-                            outcome.errors.push(format!("{path}: retry: {msg}"))
-                        }
-                    }
-                }
-            }
+            let (retried, mut retry_errors, retry_unsupported) =
+                self.retry_encrypted_items(km, progress).await?;
+            outcome.downloaded += retried;
+            outcome.skipped_unsupported += retry_unsupported;
+            outcome.errors.append(&mut retry_errors);
         }
 
         // ---- resource prefetch ----
@@ -681,6 +668,97 @@ impl<'a> SyncEngine<'a> {
         }
 
         Ok(outcome)
+    }
+
+    /// Retry every item still marked encrypted, re-downloading its blob and
+    /// decrypting with `km`. Returns (decrypted count, errors, unsupported
+    /// notes); shared by the normal sync retry and the standalone
+    /// [`Self::decrypt_pending`] pass.
+    async fn retry_encrypted_items(
+        &self,
+        km: &str,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<(usize, Vec<String>, usize)> {
+        let still_encrypted = self.storage.items_still_encrypted()?;
+        let mut decrypted = 0usize;
+        let mut errors = Vec::new();
+        let mut unsupported = 0usize;
+        if still_encrypted.is_empty() {
+            return Ok((decrypted, errors, unsupported));
+        }
+        progress(&format!("decrypting {} items", still_encrypted.len()));
+        for (idx, id) in still_encrypted.iter().enumerate() {
+            if idx % 20 == 0 {
+                progress(&format!("decrypting {}/{}", idx + 1, still_encrypted.len()));
+            }
+            let path = items::system_path(id);
+            let Some(text) = self.client.get_text(&path).await? else {
+                continue;
+            };
+            match Self::process_item_text(&text, Some(km)) {
+                ProcessResult::Item(item) => {
+                    if let Err(e) = self.storage.upsert_item(&item) {
+                        errors.push(format!("{path}: store: {e}"));
+                    } else {
+                        self.storage.save_sync_time(id, crate::time_ms(), 0)?;
+                        decrypted += 1;
+                    }
+                }
+                // A password is present here, so Pending should be impossible;
+                // treat it as an error if it ever occurs.
+                ProcessResult::Pending(_) => {
+                    errors.push(format!("{path}: retry: still encrypted"));
+                }
+                ProcessResult::Unsupported(msg) => {
+                    unsupported += 1;
+                    errors.push(format!("{path}: {msg}"));
+                }
+                ProcessResult::Error(msg) => {
+                    errors.push(format!("{path}: retry: {msg}"));
+                }
+            }
+        }
+        Ok((decrypted, errors, unsupported))
+    }
+
+    /// Separate decryption pass run AFTER a password-less sync has finished:
+    /// unlocks the master key with `password`, re-downloads and decrypts the
+    /// items stored encrypted, then decrypts pending resource blobs.
+    ///
+    /// Unlike [`Self::sync`], a wrong password does NOT abort the run: the
+    /// master-key unlock error is returned for the caller to report while the
+    /// downloaded/placeheld notes stay in the local list untouched.
+    pub async fn decrypt_pending(
+        &self,
+        info: &SyncInfo,
+        password: &str,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<DecryptOutcome> {
+        let mut out = DecryptOutcome::default();
+        let km = match self.unlock_master_key(info, password) {
+            Ok(km) => km,
+            Err(e) => {
+                // Wrong/unsupported password: nothing is changed; report how
+                // many items remain encrypted and return the unlock error.
+                out.still_encrypted = self.storage.items_still_encrypted()?.len();
+                return Err(e);
+            }
+        };
+
+        let (decrypted, mut errors, unsupported) =
+            self.retry_encrypted_items(&km, progress).await?;
+        out.items_decrypted = decrypted;
+        out.skipped_unsupported = unsupported;
+
+        // Decrypt resource blobs that were downloaded but left encrypted.
+        let (res_dec, res_pending, mut res_errors) =
+            self.sync_resources(Some(&km), progress).await?;
+        out.resources_decrypted = res_dec;
+        out.resources_pending = res_pending;
+        errors.append(&mut res_errors);
+        out.errors = errors;
+        out.still_encrypted = self.storage.items_still_encrypted()?.len();
+        Ok(out)
     }
 
     async fn sync_resources(
