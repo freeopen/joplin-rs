@@ -34,7 +34,8 @@ A read-only Joplin client written in Rust:
   Markdown rendering (GFM via egui_commonmark) with decrypted resource
   images, two-stage sync (download first with live status, then a separate
   E2EE decryption pass; notes without a password stay in the list as locked
-  placeholders), official Joplin window/About icon with version info,
+  placeholders), rounded macOS Joplin app icon (dock/window) and About via
+  the native app-name menu (in-window app menu on other platforms),
   optional reading password that locks the app on every launch
 
 ## Build

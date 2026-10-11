@@ -2,6 +2,9 @@
 
 mod read_password;
 
+#[cfg(target_os = "macos")]
+mod macos_about;
+
 /// App version, taken from Cargo.toml at compile time.
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -167,7 +170,9 @@ enum Dialog {
     ReaderPasswordSettings,
     /// Prompt for the E2EE master-key password after a sync downloaded items.
     E2eePrompt,
-    /// App info: official icon, name, version.
+    /// App info: official icon, name, version. Non-macOS only: macOS uses the
+    /// native system-menu About panel (see macos_about).
+    #[cfg(not(target_os = "macos"))]
     About,
 }
 
@@ -247,8 +252,9 @@ struct App {
     /// Number of encrypted items awaiting the password shown in the prompt.
     e2ee_pending_count: usize,
 
-    // ---- about dialog ----
+    // ---- about dialog (non-macOS; macOS uses native panel) ----
     /// Official Joplin icon texture for the About dialog (loaded lazily).
+    #[cfg(not(target_os = "macos"))]
     about_icon: Option<egui::TextureHandle>,
 }
 
@@ -291,6 +297,7 @@ impl App {
             e2ee_input: String::new(),
             e2ee_prompt_error: None,
             e2ee_pending_count: 0,
+            #[cfg(not(target_os = "macos"))]
             about_icon: None,
         };
         if app.unlocked {
@@ -759,7 +766,10 @@ impl eframe::App for App {
         // Consume any finished background sync/decrypt job before drawing.
         self.handle_job_event(ctx);
 
-        // Menu bar: app menu hosts the About entry.
+        // On macOS the About entry lives in the OS menu bar (next to the
+        // Apple logo), wired up in macos_about. Other platforms show an
+        // in-window app menu instead.
+        #[cfg(not(target_os = "macos"))]
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("joplin-rs-app", |ui| {
@@ -964,6 +974,7 @@ impl eframe::App for App {
             Dialog::None => {}
             Dialog::ReaderPasswordSettings => self.show_reader_pw_dialog(ctx),
             Dialog::E2eePrompt => self.show_e2ee_prompt_dialog(ctx),
+            #[cfg(not(target_os = "macos"))]
             Dialog::About => self.show_about_dialog(ctx),
         }
     }
@@ -1149,6 +1160,7 @@ impl App {
         }
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn show_about_dialog(&mut self, ctx: &egui::Context) {
         let response = egui::Modal::new(egui::Id::new("about_modal")).show(ctx, |ui| {
             ui.set_min_width(340.0);
@@ -1354,6 +1366,10 @@ fn main() -> eframe::Result {
         },
         Box::new(|cc| {
             configure_fonts(&cc.egui_ctx);
+            // NSApplication and the winit system menu exist by now; retarget
+            // the macOS app-menu About item and set the rounded dock icon.
+            #[cfg(target_os = "macos")]
+            macos_about::install_native_about();
             Ok(Box::new(App::new()))
         }),
     )
