@@ -3,7 +3,6 @@
 use joplin_rs_core::items::Item;
 use joplin_rs_core::storage::Storage;
 use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -510,9 +509,15 @@ fn find_cjk_font() -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.is_file())
 }
 
-/// Add a CJK-capable system font as a fallback for the proportional and
-/// monospace families. Latin text keeps using egui's bundled fonts (the CJK
-/// font is appended last, so it only supplies glyphs the bundled fonts lack).
+/// Configure fonts so Latin and CJK share ONE system font.
+///
+/// Mixing egui's bundled Latin font with a separate CJK fallback leaves the
+/// two scripts on different baselines (the fonts' ascent/descent/line-gap
+/// metrics differ). Because every candidate system CJK font also contains a
+/// full Latin glyph set, we make it the PRIMARY font for both the
+/// proportional and monospace families; egui's bundled fonts are pushed to
+/// the end purely as a last-resort fallback. All glyphs in a mixed line then
+/// come from one font and share one baseline.
 fn configure_fonts(ctx: &egui::Context) {
     let Some(path) = find_cjk_font() else {
         eprintln!(
@@ -527,19 +532,14 @@ fn configure_fonts(ctx: &egui::Context) {
     };
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
-        "cjk".to_owned(),
-        Arc::new(egui::FontData {
-            font: Cow::Owned(bytes),
-            index: 0,
-            tweak: Default::default(),
-        }),
+        "system".to_owned(),
+        Arc::new(egui::FontData::from_owned(bytes)),
     );
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        fonts
-            .families
-            .entry(family)
-            .or_default()
-            .push("cjk".to_owned());
+        // System font first (so both Latin and CJK use it), bundled fonts
+        // kept behind it for any glyph it is missing.
+        let list = fonts.families.entry(family).or_default();
+        list.insert(0, "system".to_owned());
     }
     ctx.set_fonts(fonts);
 }

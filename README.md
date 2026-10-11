@@ -78,9 +78,10 @@ cargo run -p joplin-rs-app
 
 Same config file. Press **Sync** to download; click a note to render it.
 
-CJK (Chinese/Japanese/Korean) text uses a system CJK font loaded at
-runtime (PingFang/Hiragino on macOS, Noto/WenQuanYi on Linux, Microsoft
-YaHei/SimHei on Windows); egui's bundled fonts are Latin-only. Set
+The GUI uses one system CJK-capable font (PingFang/Hiragino on macOS,
+Noto/WenQuanYi on Linux, Microsoft YaHei/SimHei on Windows) for both Latin
+and CJK text, so mixed-script lines share a single baseline. egui's
+bundled font is kept only as a fallback. Set
 `JOPLIN_RS_FONT=/path/to/font.ttf` to force a specific font.
 
 ## Supported sync-target format
