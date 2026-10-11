@@ -3,6 +3,7 @@
 use joplin_rs_core::items::Item;
 use joplin_rs_core::storage::Storage;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -445,6 +446,97 @@ fn crate_resource_ids(body: &str) -> Vec<String> {
     out
 }
 
+/// Locate a system font that covers Chinese/Japanese/Korean glyphs. egui's
+/// bundled fonts are Latin-only, so without this CJK text renders as empty
+/// boxes (tofu). Search the common per-OS font locations; the
+/// `JOPLIN_RS_FONT` env var may point at a specific font file instead.
+fn find_cjk_font() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("JOPLIN_RS_FONT") {
+        let path = PathBuf::from(p);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    let push = |v: &mut Vec<PathBuf>, p: &str| v.push(PathBuf::from(p));
+    #[cfg(target_os = "macos")]
+    {
+        for p in [
+            "/System/Library/Fonts/PingFang.ttc",
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+            "/System/Library/Fonts/STHeiti Light.ttc",
+            "/System/Library/Fonts/STHeiti Medium.ttc",
+            "/Library/Fonts/Arial Unicode.ttf",
+            "/System/Library/Fonts/Supplemental/Songti.ttc",
+        ] {
+            push(&mut candidates, p);
+        }
+    }
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    {
+        for p in [
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/arphic/uming.ttc",
+        ] {
+            push(&mut candidates, p);
+        }
+        if let Some(home) = dirs::home_dir() {
+            candidates.push(home.join(".local/share/fonts/NotoSansCJK-Regular.ttc"));
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        for p in [
+            "C:\\Windows\\Fonts\\msyh.ttc",
+            "C:\\Windows\\Fonts\\msyh.ttf",
+            "C:\\Windows\\Fonts\\simhei.ttf",
+            "C:\\Windows\\Fonts\\simsun.ttc",
+        ] {
+            push(&mut candidates, p);
+        }
+    }
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+/// Add a CJK-capable system font as a fallback for the proportional and
+/// monospace families. Latin text keeps using egui's bundled fonts (the CJK
+/// font is appended last, so it only supplies glyphs the bundled fonts lack).
+fn configure_fonts(ctx: &egui::Context) {
+    let Some(path) = find_cjk_font() else {
+        eprintln!(
+            "no CJK-capable system font found; Chinese/Japanese/Korean text may not render. \
+             Set JOPLIN_RS_FONT to a .ttf/.ttc font path to override."
+        );
+        return;
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        eprintln!("failed to read font {}", path.display());
+        return;
+    };
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "cjk".to_owned(),
+        Arc::new(egui::FontData {
+            font: Cow::Owned(bytes),
+            index: 0,
+            tweak: Default::default(),
+        }),
+    );
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .push("cjk".to_owned());
+    }
+    ctx.set_fonts(fonts);
+}
+
 fn main() -> eframe::Result {
     eframe::run_native(
         "joplin-rs",
@@ -452,6 +544,9 @@ fn main() -> eframe::Result {
             viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 720.0]),
             ..Default::default()
         },
-        Box::new(|_cc| Ok(Box::new(App::new()))),
+        Box::new(|cc| {
+            configure_fonts(&cc.egui_ctx);
+            Ok(Box::new(App::new()))
+        }),
     )
 }
