@@ -1,10 +1,14 @@
-//! Legacy SJCL-encrypted resource blobs (Joplin attachments created before
-//! FileV1 became the default file method). The header method is one of the
-//! SJCL variants (3/4/5/7); each chunk decrypts with SJCL AES-CCM, 1a/1b
-//! additionally unescape() the plaintext, and the concatenated result is a
-//! single base64 stream of the file bytes. Fixtures are produced by
-//! tools/generate_sjcl_resource_fixtures.js using Joplin's vendored SJCL,
-//! mirroring EncryptionService.encryptFile.
+//! Encrypted resource blob decryption. Covers both the legacy SJCL family
+//! (methods 3/4/5/7) and native FileV1 (method 9), including MULTI-CHUNK
+//! blobs. Each encrypted chunk is an independently base64-padded slice of
+//! the file, so decryption must base64-decode every chunk separately and
+//! concatenate the bytes; decoding the concatenated base64 string fails at
+//! the first interior '=' padding.
+//!
+//! Fixtures are produced by tools/generate_resource_fixtures.js using
+//! Joplin's vendored SJCL and node webcrypto, mirroring
+//! EncryptionService.encryptFile (readFileChunk reads RAW bytes and
+//! base64-encodes each block on its own).
 
 use joplin_rs_core::sync::SyncEngine;
 use serde::Deserialize;
@@ -31,13 +35,13 @@ struct Case {
 fn decrypt_legacy_sjcl_resource_blobs() {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../fixtures/sjcl_resources.json"
+        "/../../fixtures/resource_blobs.json"
     );
     let fixtures: Fixtures = serde_json::from_str(
-        &std::fs::read_to_string(path).expect("run tools/generate_sjcl_resource_fixtures.js"),
+        &std::fs::read_to_string(path).expect("run tools/generate_resource_fixtures.js"),
     )
     .unwrap();
-    assert!(fixtures.cases.len() >= 6);
+    assert!(fixtures.cases.len() >= 10);
 
     for case in &fixtures.cases {
         let bytes = SyncEngine::decrypt_resource_blob(&case.blob, &case.key_material)
@@ -59,7 +63,7 @@ fn decrypt_legacy_sjcl_resource_blobs() {
 fn sjcl_resource_blob_rejects_wrong_key() {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../fixtures/sjcl_resources.json"
+        "/../../fixtures/resource_blobs.json"
     );
     let fixtures: Fixtures = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     let case = fixtures

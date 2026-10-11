@@ -297,29 +297,37 @@ impl<'a> SyncEngine<'a> {
     /// Decrypt a resource blob and return the raw file bytes.
     ///
     /// Two on-disk families share the JED01 chunked container:
-    /// - FileV1 (method 9): each chunk is native AES-256-GCM; plaintext is a
-    ///   base64 slice of the file.
+    /// - FileV1 (method 9): each chunk is native AES-256-GCM.
     /// - Legacy SJCL methods (SJCL3/4 and SJCL1a/1b, methods 3/4/5/7): each
     ///   chunk is an SJCL AES-CCM JSON blob. SJCL1a/1b additionally wrap the
     ///   plaintext with JS escape()/unescape(). Old vaults (created before
     ///   FileV1 became the default file method) encrypt attachments this way,
-    ///   so real sync targets still contain them. In every case the
-    ///   concatenated plaintext is one base64 stream decoded to the file bytes.
+    ///   so real sync targets still contain them.
+    ///
+    /// In both cases the encrypt side (EncryptionService.encryptFile +
+    /// readFileChunk) reads a fixed number of RAW bytes per block
+    /// (5000 for SJCL, 131072 for FileV1) and base64-encodes EACH block on
+    /// its own before encryption. Thus every decrypted chunk is an
+    /// independently-padded base64 string (intermediate chunks end in '='),
+    /// and chunks must be base64-decoded separately and concatenated as
+    /// bytes - never concatenated as one base64 string, which would fail at
+    /// the first interior padding ('=', e.g. offset 6667 for a 5000-byte
+    /// block).
     pub fn decrypt_resource_blob(blob: &str, key_material_hex: &str) -> Result<Vec<u8>> {
         let header = jcrypto::decode_header(blob)?;
         let md_size = usize::from_str_radix(&blob[5..11], 16)
             .map_err(|_| Error::Crypto("bad header size".into()))?;
         let chunks = jcrypto::decode_chunks(&blob[11 + md_size..])?;
         use base64::Engine;
-        let mut b64 = String::new();
+        let b64_engine = base64::engine::general_purpose::STANDARD;
+        let mut raw: Vec<u8> = Vec::new();
         for chunk in chunks {
-            match header.method {
+            // Per-chunk plaintext, always a base64 fragment of the file.
+            let b64: String = match header.method {
                 jcrypto::METHOD_FILE_V1 => {
                     let plain = jcrypto::native_decrypt(key_material_hex, &chunk, 3)?;
-                    b64.push_str(
-                        &String::from_utf8(plain)
-                            .map_err(|_| Error::Crypto("resource chunk not utf8/base64".into()))?,
-                    );
+                    String::from_utf8(plain)
+                        .map_err(|_| Error::Crypto("resource chunk not utf8/base64".into()))?
                 }
                 jcrypto::METHOD_SJCL1A
                 | jcrypto::METHOD_SJCL1B
@@ -332,9 +340,9 @@ impl<'a> SyncEngine<'a> {
                     if header.method == jcrypto::METHOD_SJCL1A
                         || header.method == jcrypto::METHOD_SJCL1B
                     {
-                        b64.push_str(&jcrypto::sjcl_unescape(&text)?);
+                        jcrypto::sjcl_unescape(&text)?
                     } else {
-                        b64.push_str(&text);
+                        text
                     }
                 }
                 other => {
@@ -342,11 +350,14 @@ impl<'a> SyncEngine<'a> {
                         "resource encryption method {other} not supported"
                     )))
                 }
-            }
+            };
+            // Decode this block alone: it carries its own base64 padding.
+            let decoded = b64_engine
+                .decode(b64.as_bytes())
+                .map_err(|e| Error::Crypto(format!("resource base64: {e}")))?;
+            raw.extend_from_slice(&decoded);
         }
-        base64::engine::general_purpose::STANDARD
-            .decode(b64.as_bytes())
-            .map_err(|e| Error::Crypto(format!("resource base64: {e}")))
+        Ok(raw)
     }
 
     /// Turn a downloaded item blob into a parsed [`items::Item`], handling
