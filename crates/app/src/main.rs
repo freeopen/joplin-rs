@@ -179,7 +179,10 @@ struct App {
     search: String,
     /// Search-hit snippets keyed by note id (shown under the note title).
     search_hits: std::collections::HashMap<String, String>,
-    e2ee_password: String,
+    /// E2EE password entered via the pre-sync prompt. Session-only: never
+    /// persisted by the GUI. Empty until the user is prompted (or a previous
+    /// attempt supplied it).
+    e2ee_session_password: String,
     status: String,
     sync_running: Arc<Mutex<bool>>,
     status_shared: Arc<Mutex<String>>,
@@ -211,10 +214,10 @@ struct App {
     /// A sync click opened the E2EE prompt; once the password is submitted the
     /// sync should start automatically.
     e2ee_pending_sync: bool,
-    /// A previous sync proved the WebDAV-password fallback is NOT the E2EE
-    /// password. Until restart, stop falling back so Sync re-prompts instead
-    /// of failing with the wrong password forever.
-    e2ee_webdav_fallback_rejected: bool,
+    /// A previous sync proved the stored/fallback E2EE password (config
+    /// e2ee_password or the WebDAV password) is wrong. Until restart, use only
+    /// the password typed in the prompt instead of failing again.
+    e2ee_stored_rejected: bool,
 }
 
 impl App {
@@ -236,11 +239,7 @@ impl App {
             note_title: String::new(),
             search: String::new(),
             search_hits: Default::default(),
-            e2ee_password: config
-                .e2ee_password
-                .clone()
-                .or_else(|| config.password.clone())
-                .unwrap_or_default(),
+            e2ee_session_password: String::new(),
             status: "ready".into(),
             sync_running: Arc::new(Mutex::new(false)),
             status_shared: Arc::new(Mutex::new(String::new())),
@@ -259,7 +258,7 @@ impl App {
             e2ee_input: String::new(),
             e2ee_prompt_error: None,
             e2ee_pending_sync: false,
-            e2ee_webdav_fallback_rejected: false,
+            e2ee_stored_rejected: false,
         };
         if app.unlocked {
             app.reload_meta();
@@ -464,23 +463,26 @@ impl App {
 
     // ---- E2EE password prompt before sync ----
 
-    /// Effective E2EE password available for the next sync: the in-app field,
-    /// then config.e2ee_password, then the WebDAV password fallback.
+    /// Effective E2EE password for the next sync:
+    /// 1. the session password typed in the pre-sync prompt (never persisted),
+    /// 2. config.toml `e2ee_password` (decrypted from enc:v1: at startup),
+    /// 3. the WebDAV password fallback (many users set both to the same
+    ///    value).
+    ///
+    /// Once a stored/fallback password has been rejected by the server it is
+    /// ignored for the rest of the session so the user is prompted again.
     fn effective_e2ee_password(&self) -> Option<String> {
-        if !self.e2ee_password.is_empty() {
-            return Some(self.e2ee_password.clone());
+        if !self.e2ee_session_password.is_empty() {
+            return Some(self.e2ee_session_password.clone());
+        }
+        if self.e2ee_stored_rejected {
+            return None;
         }
         self.config
             .e2ee_password
             .clone()
             .filter(|p| !p.is_empty())
-            .or_else(|| {
-                if self.e2ee_webdav_fallback_rejected {
-                    None
-                } else {
-                    self.config.password.clone().filter(|p| !p.is_empty())
-                }
-            })
+            .or_else(|| self.config.password.clone().filter(|p| !p.is_empty()))
     }
 
     /// Sync button entry point. If no E2EE password is known (or the previous
@@ -493,12 +495,10 @@ impl App {
             .as_deref()
             .is_some_and(looks_like_wrong_e2ee_password);
         if previous_wrong {
-            // Forget the rejected password so the prompt is required again.
-            self.e2ee_password.clear();
-            self.config.e2ee_password = None;
-            // The wrong value may have come from the WebDAV-password fallback;
-            // suppress that fallback for the rest of the session.
-            self.e2ee_webdav_fallback_rejected = true;
+            // Drop any remembered password and stop trusting config/fallback
+            // values for this session, forcing the prompt to appear again.
+            self.e2ee_session_password.clear();
+            self.e2ee_stored_rejected = true;
             *self.sync_error.lock().unwrap() = None;
         }
         if self.effective_e2ee_password().is_some() {
@@ -518,7 +518,7 @@ impl App {
             self.e2ee_prompt_error = Some("密码不能为空".into());
             return;
         }
-        self.e2ee_password = self.e2ee_input.clone();
+        self.e2ee_session_password = self.e2ee_input.clone();
         self.e2ee_input.clear();
         self.e2ee_prompt_error = None;
         let start = self.e2ee_pending_sync;
@@ -607,12 +607,6 @@ impl eframe::App for App {
         // Top bar
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label("E2EE password:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.e2ee_password)
-                        .password(true)
-                        .desired_width(140.0),
-                );
                 if ui.button("Sync").clicked() {
                     self.request_sync(ctx);
                 }
