@@ -1,6 +1,7 @@
 pub mod crypto;
 pub mod error;
 pub mod items;
+pub mod secret;
 pub mod storage;
 pub mod sync;
 pub mod types;

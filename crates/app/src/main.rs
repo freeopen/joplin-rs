@@ -3,6 +3,7 @@
 mod read_password;
 
 use joplin_rs_core::items::Item;
+use joplin_rs_core::secret::LocalKey;
 use joplin_rs_core::storage::Storage;
 use read_password::{hash_password, verify_password};
 use serde::{Deserialize, Serialize};
@@ -51,20 +52,99 @@ fn config_path() -> PathBuf {
 }
 
 fn load_config() -> Config {
-    std::fs::read_to_string(config_path())
+    let mut cfg: Config = std::fs::read_to_string(config_path())
         .ok()
         .and_then(|raw| toml::from_str(&raw).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // Decrypt secrets stored as `enc:v1:` by the CLI `set-password` command.
+    // Legacy plaintext values pass through unchanged. The key file lives next
+    // to the database, the same location the CLI uses. Only touch the key
+    // file when there is actually a ciphertext to decrypt (don't create an
+    // unused secret.key on every launch).
+    let has_encrypted = cfg.password.as_deref().is_some_and(LocalKey::is_encrypted)
+        || cfg
+            .e2ee_password
+            .as_deref()
+            .is_some_and(LocalKey::is_encrypted);
+    if has_encrypted {
+        match LocalKey::load_or_create(&data_dir().join("secret.key")) {
+            Ok(key) => decrypt_config_secrets(&mut cfg, &key),
+            Err(e) => {
+                tracing::error!("cannot load local secret key: {e}");
+                cfg.password = None;
+                cfg.e2ee_password = None;
+            }
+        }
+    }
+    cfg
 }
 
-/// Persist the config, creating ~/.joplin if needed.
-fn save_config(config: &Config) -> anyhow::Result<()> {
-    let path = config_path();
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+/// Decrypt every `enc:v1:` secret in a config in place. A value that fails to
+/// decrypt is dropped (sync then fails with an auth error rather than sending
+/// ciphertext as the password).
+fn decrypt_config_secrets(cfg: &mut Config, key: &LocalKey) {
+    cfg.password = cfg
+        .password
+        .take()
+        .and_then(|stored| match key.decrypt(&stored) {
+            Ok(plain) => Some(plain),
+            Err(e) => {
+                tracing::error!("cannot decrypt webdav password from config.toml: {e}");
+                None
+            }
+        });
+    cfg.e2ee_password = cfg
+        .e2ee_password
+        .take()
+        .and_then(|stored| match key.decrypt(&stored) {
+            Ok(plain) => Some(plain),
+            Err(e) => {
+                tracing::error!("cannot decrypt e2ee password from config.toml: {e}");
+                None
+            }
+        });
+}
+
+/// Update ONLY the reading-password hash in config.toml, preserving every
+/// other key verbatim. This is critical for password security: the in-memory
+/// Config holds DECRYPTED webdav/e2ee passwords, so serialising the whole
+/// struct would silently downgrade the on-disk ciphertext back to plaintext.
+fn save_reader_password_hash(hash: &Option<String>) -> anyhow::Result<()> {
+    let value = hash.as_ref().map(|h| h.as_str());
+    write_config_string_key(&config_path(), "reader_password_hash", value)
+}
+
+/// Set (or remove when `value` is None) ONE string key in a TOML config file,
+/// preserving every other key verbatim. Used for all app-side config writes:
+/// the in-memory Config holds DECRYPTED webdav/e2ee passwords, so serialising
+/// the whole struct would silently downgrade on-disk ciphertext to plaintext.
+fn write_config_string_key(
+    path: &std::path::Path,
+    key_name: &str,
+    value: Option<&str>,
+) -> anyhow::Result<()> {
+    use toml::Value;
+    let mut table: toml::Table = if path.exists() {
+        let raw = std::fs::read_to_string(path)?;
+        raw.parse()?
+    } else {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        toml::Table::new()
+    };
+    match value {
+        Some(v) => {
+            table.insert(key_name.to_owned(), Value::String(v.to_owned()));
+        }
+        None => {
+            table.remove(key_name);
+        }
     }
-    let raw = toml::to_string_pretty(config)?;
-    std::fs::write(&path, raw)?;
+    let raw = toml::to_string_pretty(&table)?;
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, raw)?;
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
@@ -342,7 +422,7 @@ impl App {
         }
         let previous = self.config.reader_password_hash.clone();
         self.config.reader_password_hash = Some(hash_password(&self.rp_new));
-        match save_config(&self.config) {
+        match save_reader_password_hash(&self.config.reader_password_hash) {
             Ok(()) => {
                 self.rp_current.clear();
                 self.rp_new.clear();
@@ -368,7 +448,7 @@ impl App {
             return;
         }
         let previous = self.config.reader_password_hash.take();
-        match save_config(&self.config) {
+        match save_reader_password_hash(&None) {
             Ok(()) => {
                 self.rp_current.clear();
                 self.rp_new.clear();
@@ -696,42 +776,39 @@ impl App {
     /// Launch-lock password prompt. Cannot be dismissed without the password:
     /// backdrop clicks and Escape are intentionally ignored.
     fn show_lock_modal(&mut self, ctx: &egui::Context) {
-        egui::Modal::new(egui::Id::new("reader_lock_modal"))
-            .show(ctx, |ui| {
-                ui.set_min_width(320.0);
-                ui.heading("阅读密码");
+        egui::Modal::new(egui::Id::new("reader_lock_modal")).show(ctx, |ui| {
+            ui.set_min_width(320.0);
+            ui.heading("阅读密码");
+            ui.add_space(4.0);
+            ui.label("请输入阅读密码以打开 joplin-rs");
+            ui.add_space(8.0);
+
+            let input = egui::TextEdit::singleline(&mut self.lock_input)
+                .password(true)
+                .hint_text("阅读密码")
+                .desired_width(280.0);
+            let input_response = ui.add(input);
+            // Keep focus on the password field (including after a failed
+            // attempt clears it) so typing and Enter always land here.
+            if !input_response.has_focus() {
+                input_response.request_focus();
+            }
+            // egui's recommended singleline submit pattern: Enter surrenders
+            // focus on the same frame, so lost_focus + Enter fires once.
+            let submit =
+                input_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+            if let Some(err) = &self.lock_error {
                 ui.add_space(4.0);
-                ui.label("请输入阅读密码以打开 joplin-rs");
-                ui.add_space(8.0);
-
-                let input = egui::TextEdit::singleline(&mut self.lock_input)
-                    .password(true)
-                    .hint_text("阅读密码")
-                    .desired_width(280.0);
-                let input_response = ui.add(input);
-                // Keep focus on the password field (including after a failed
-                // attempt clears it) so typing and Enter always land here.
-                if !input_response.has_focus() {
-                    input_response.request_focus();
+                ui.label(egui::RichText::new(err).color(egui::Color32::from_rgb(200, 60, 60)));
+            }
+            ui.add_space(10.0);
+            ui.vertical_centered(|ui| {
+                if ui.button("解锁").clicked() || submit {
+                    self.try_unlock();
                 }
-                // egui's recommended singleline submit pattern: Enter surrenders
-                // focus on the same frame, so lost_focus + Enter fires once.
-                let submit =
-                    input_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-
-                if let Some(err) = &self.lock_error {
-                    ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new(err).color(egui::Color32::from_rgb(200, 60, 60)),
-                    );
-                }
-                ui.add_space(10.0);
-                ui.vertical_centered(|ui| {
-                    if ui.button("解锁").clicked() || submit {
-                        self.try_unlock();
-                    }
-                });
             });
+        });
         // Swallow Escape/backdrop-close: the lock may only be cleared by the
         // correct password. Modal::should_close would otherwise dismiss it.
         ctx.input_mut(|i| {
@@ -741,10 +818,14 @@ impl App {
 
     fn show_reader_pw_dialog(&mut self, ctx: &egui::Context) {
         let has_pw = self.has_reader_password();
-        let response = egui::Modal::new(egui::Id::new("reader_pw_settings_modal"))
-            .show(ctx, |ui| {
+        let response =
+            egui::Modal::new(egui::Id::new("reader_pw_settings_modal")).show(ctx, |ui| {
                 ui.set_min_width(360.0);
-                ui.heading(if has_pw { "修改阅读密码" } else { "设置阅读密码" });
+                ui.heading(if has_pw {
+                    "修改阅读密码"
+                } else {
+                    "设置阅读密码"
+                });
                 ui.add_space(6.0);
 
                 if has_pw {
@@ -769,20 +850,16 @@ impl App {
                         .password(true)
                         .desired_width(320.0),
                 );
-                let submit = confirm_response.lost_focus()
-                    && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let submit =
+                    confirm_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
                 if let Some(err) = &self.rp_error {
                     ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new(err).color(egui::Color32::from_rgb(200, 60, 60)),
-                    );
+                    ui.label(egui::RichText::new(err).color(egui::Color32::from_rgb(200, 60, 60)));
                 }
                 if let Some(msg) = &self.rp_message {
                     ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new(msg).color(egui::Color32::from_rgb(40, 140, 60)),
-                    );
+                    ui.label(egui::RichText::new(msg).color(egui::Color32::from_rgb(40, 140, 60)));
                 }
 
                 ui.add_space(10.0);
@@ -813,51 +890,48 @@ impl App {
     }
 
     fn show_e2ee_prompt_dialog(&mut self, ctx: &egui::Context) {
-        let response = egui::Modal::new(egui::Id::new("e2ee_prompt_modal"))
-            .show(ctx, |ui| {
-                ui.set_min_width(360.0);
-                ui.heading("E2EE 密码");
-                ui.add_space(6.0);
-                ui.label("同步需要 E2EE 主密钥密码，请输入后回车开始同步:");
-                ui.add_space(8.0);
+        let response = egui::Modal::new(egui::Id::new("e2ee_prompt_modal")).show(ctx, |ui| {
+            ui.set_min_width(360.0);
+            ui.heading("E2EE 密码");
+            ui.add_space(6.0);
+            ui.label("同步需要 E2EE 主密钥密码，请输入后回车开始同步:");
+            ui.add_space(8.0);
 
-                let input = egui::TextEdit::singleline(&mut self.e2ee_input)
-                    .password(true)
-                    .hint_text("E2EE master key password")
-                    .desired_width(320.0);
-                let input_response = ui.add(input);
-                if !input_response.has_focus() {
-                    input_response.request_focus();
-                }
-                let submit = input_response.lost_focus()
-                    && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let input = egui::TextEdit::singleline(&mut self.e2ee_input)
+                .password(true)
+                .hint_text("E2EE master key password")
+                .desired_width(320.0);
+            let input_response = ui.add(input);
+            if !input_response.has_focus() {
+                input_response.request_focus();
+            }
+            let submit =
+                input_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
-                if let Some(err) = &self.e2ee_prompt_error {
-                    ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new(err).color(egui::Color32::from_rgb(200, 60, 60)),
-                    );
-                }
-                ui.add_space(10.0);
-                let mut cancelled = false;
-                let mut confirmed = false;
-                ui.horizontal(|ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("取消").clicked() {
-                            cancelled = true;
-                        }
-                        if ui.button("开始同步").clicked() {
-                            confirmed = true;
-                        }
-                    });
+            if let Some(err) = &self.e2ee_prompt_error {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(err).color(egui::Color32::from_rgb(200, 60, 60)));
+            }
+            ui.add_space(10.0);
+            let mut cancelled = false;
+            let mut confirmed = false;
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("取消").clicked() {
+                        cancelled = true;
+                    }
+                    if ui.button("开始同步").clicked() {
+                        confirmed = true;
+                    }
                 });
-                if cancelled {
-                    self.e2ee_pending_sync = false;
-                    self.dialog = Dialog::None;
-                } else if confirmed || submit {
-                    self.submit_e2ee_prompt(ctx);
-                }
             });
+            if cancelled {
+                self.e2ee_pending_sync = false;
+                self.dialog = Dialog::None;
+            } else if confirmed || submit {
+                self.submit_e2ee_prompt(ctx);
+            }
+        });
         if response.should_close() {
             self.e2ee_pending_sync = false;
             self.dialog = Dialog::None;
@@ -1007,7 +1081,7 @@ fn main() -> eframe::Result {
 
 #[cfg(test)]
 mod tests {
-    use super::crate_resource_ids;
+    use super::*;
 
     const ID: &str = "0123456789abcdef0123456789abcdef";
 
@@ -1056,5 +1130,88 @@ mod tests {
 
         // No link, only multibyte text: must not panic.
         assert!(crate_resource_ids("交运医药商保清分工作环境交运医药").is_empty());
+    }
+
+    // ---- encrypted config secrets (CLI set-password compatibility) ----
+
+    use joplin_rs_core::secret::LocalKey;
+
+    #[test]
+    fn decrypts_encrypted_config_secrets() {
+        let key = LocalKey::from_bytes([42u8; 32]);
+        let mut cfg = Config {
+            webdav_url: "https://x".into(),
+            username: "u".into(),
+            password: Some(key.encrypt("dav-pw").unwrap()),
+            e2ee_password: Some(key.encrypt("e2ee-pw").unwrap()),
+            insecure_tls: false,
+            ca_cert: None,
+            reader_password_hash: None,
+        };
+        decrypt_config_secrets(&mut cfg, &key);
+        assert_eq!(cfg.password.as_deref(), Some("dav-pw"));
+        assert_eq!(cfg.e2ee_password.as_deref(), Some("e2ee-pw"));
+    }
+
+    #[test]
+    fn plaintext_and_missing_secrets_pass_through() {
+        let key = LocalKey::from_bytes([42u8; 32]);
+        let mut cfg = Config {
+            password: Some("legacy-plain".into()),
+            e2ee_password: None,
+            ..Default::default()
+        };
+        decrypt_config_secrets(&mut cfg, &key);
+        assert_eq!(cfg.password.as_deref(), Some("legacy-plain"));
+        assert!(cfg.e2ee_password.is_none());
+    }
+
+    #[test]
+    fn wrong_key_drops_secret_instead_of_passing_ciphertext() {
+        let enc = LocalKey::from_bytes([1u8; 32]).encrypt("dav-pw").unwrap();
+        let mut cfg = Config {
+            password: Some(enc),
+            ..Default::default()
+        };
+        decrypt_config_secrets(&mut cfg, &LocalKey::from_bytes([2u8; 32]));
+        assert!(cfg.password.is_none());
+    }
+
+    /// App-side writes must never downgrade CLI-encrypted passwords to
+    /// plaintext: only the one key is rewritten, every other line (including
+    /// the `enc:v1:` password) is preserved byte-for-byte in value.
+    #[test]
+    fn app_write_preserves_encrypted_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let key = LocalKey::from_bytes([9u8; 32]);
+        let enc_dav = key.encrypt("keep-me-secret").unwrap();
+        let enc_e2ee = key.encrypt("e2ee-secret").unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "webdav_url = \"https://x/dav\"\nusername = \"u\"\npassword = \"{enc_dav}\"\ne2ee_password = \"{enc_e2ee}\"\n"
+            ),
+        )
+        .unwrap();
+
+        write_config_string_key(&path, "reader_password_hash", Some("hash-abc")).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains(&format!("password = \"{enc_dav}\"")),
+            "webdav ciphertext must be untouched: {raw}"
+        );
+        assert!(raw.contains(&format!("e2ee_password = \"{enc_e2ee}\"")));
+        assert!(raw.contains("reader_password_hash = \"hash-abc\""));
+        assert!(
+            !raw.contains("keep-me-secret"),
+            "plaintext leaked into config.toml"
+        );
+
+        // Removing the reader hash also keeps the ciphertext intact.
+        write_config_string_key(&path, "reader_password_hash", None).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("reader_password_hash"));
+        assert!(raw.contains(&format!("password = \"{enc_dav}\"")));
     }
 }

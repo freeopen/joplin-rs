@@ -2,12 +2,14 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use joplin_rs_core::secret::LocalKey;
 use joplin_rs_core::storage::{SearchOptions, Storage};
 use joplin_rs_core::sync::SyncEngine;
 use joplin_rs_core::webdav::{TlsOptions, WebDavClient};
 use serde::{Deserialize, Serialize};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
+use toml::Value;
 
 #[derive(Parser)]
 #[command(
@@ -79,6 +81,20 @@ enum Command {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// Store the WebDAV password in config.toml encrypted at rest.
+    ///
+    /// The password is encrypted with a machine-local key (~/.joplin/secret.key,
+    /// generated on first use) and written as an `enc:v1:` value. With no
+    /// --password and a TTY, the password is prompted twice without echo.
+    SetPassword {
+        /// New WebDAV password (prompted securely if omitted; reads one line
+        /// from stdin when stdin is not a TTY)
+        #[arg(long)]
+        password: Option<String>,
+        /// Also store the E2EE master-key password encrypted
+        #[arg(long)]
+        e2ee: bool,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -125,6 +141,16 @@ fn data_dir(cli: &Cli) -> PathBuf {
     cli.data_dir.clone().unwrap_or_else(default_base_dir)
 }
 
+/// Path of the machine-local key used to encrypt config secrets.
+fn secret_key_path(cli: &Cli) -> PathBuf {
+    data_dir(cli).join("secret.key")
+}
+
+fn local_key(cli: &Cli) -> Result<LocalKey> {
+    LocalKey::load_or_create(&secret_key_path(cli))
+        .context("load local secret key (~/.joplin/secret.key)")
+}
+
 fn load_config(cli: &Cli) -> Result<Config> {
     let path = config_path(cli);
     if !path.exists() {
@@ -135,6 +161,100 @@ fn load_config(cli: &Cli) -> Result<Config> {
     }
     let raw = std::fs::read_to_string(&path).context("read config")?;
     toml::from_str(&raw).context("parse config.toml")
+}
+
+/// Resolve the plaintext WebDAV password: decrypts `enc:v1:` values with the
+/// local key, passes legacy plaintext through.
+fn webdav_password(cli: &Cli, cfg: &Config) -> Result<String> {
+    let Some(stored) = cfg.password.as_deref() else {
+        return Ok(String::new());
+    };
+    local_key(cli)?
+        .decrypt(stored)
+        .context("decrypt WebDAV password (wrong/missing ~/.joplin/secret.key?)")
+}
+
+/// Read a password without echo: --password wins, else interactive prompt
+/// (with confirmation), else one line from stdin for scripted use.
+fn read_new_password(cli_password: Option<String>, confirm: bool) -> Result<String> {
+    if let Some(pw) = cli_password {
+        return Ok(pw);
+    }
+    if std::io::stdin().is_terminal() {
+        print!("New password: ");
+        std::io::stdout().flush()?;
+        let pw = rpassword::read_password().context("read password")?;
+        if confirm {
+            print!("Confirm password: ");
+            std::io::stdout().flush()?;
+            let again = rpassword::read_password().context("read password")?;
+            if pw != again {
+                bail!("passwords do not match");
+            }
+        }
+        Ok(pw)
+    } else {
+        // Non-interactive: read a single line (piped input, e.g.
+        // `cat pw.txt | joplin-rs set-password`).
+        let mut pw = String::new();
+        std::io::stdin()
+            .read_line(&mut pw)
+            .context("read password from stdin")?;
+        // Trim only the trailing newline, never other characters.
+        while pw.ends_with('\n') || pw.ends_with('\r') {
+            pw.pop();
+        }
+        if pw.is_empty() {
+            bail!("empty password from stdin");
+        }
+        Ok(pw)
+    }
+}
+
+/// Rewrite one string key in the config file, preserving every other field,
+/// comment-free TOML is round-tripped via toml::Value.
+fn write_config_field(cli: &Cli, key: &str, value: String) -> Result<()> {
+    let path = config_path(cli);
+    let mut table: toml::Table = if path.exists() {
+        let raw = std::fs::read_to_string(&path).context("read config")?;
+        raw.parse().context("parse config.toml")?
+    } else {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).context("create config dir")?;
+        }
+        toml::Table::new()
+    };
+    table.insert(key.to_owned(), Value::String(value));
+    let raw = toml::to_string_pretty(&table).context("serialize config")?;
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, raw).context("write config")?;
+    std::fs::rename(&tmp, &path).context("install config.toml")?;
+    Ok(())
+}
+
+fn cmd_set_password(cli: &Cli, password: Option<String>, e2ee: bool) -> Result<()> {
+    let key = local_key(cli)?;
+    let pw = read_new_password(password, true)?;
+    let encrypted = key.encrypt(&pw).context("encrypt password")?;
+    if e2ee {
+        write_config_field(cli, "e2ee_password", encrypted)
+            .context("store encrypted e2ee_password")?;
+        println!(
+            "encrypted E2EE password stored in {}",
+            config_path(cli).display()
+        );
+    } else {
+        write_config_field(cli, "password", encrypted).context("store encrypted password")?;
+        println!(
+            "encrypted WebDAV password stored in {}",
+            config_path(cli).display()
+        );
+    }
+    println!(
+        "machine key: {} (keep this file; losing it makes stored passwords undecryptable)",
+        secret_key_path(cli).display()
+    );
+    Ok(())
 }
 
 fn db(cli: &Cli) -> Result<Storage> {
@@ -211,14 +331,15 @@ async fn main() -> Result<()> {
         Command::Sync { password } => {
             let cfg = load_config(cli)?;
             let storage = db(cli)?;
+            let dav_pw = webdav_password(cli, &cfg)?;
             let client = WebDavClient::new_with_tls(
                 &cfg.webdav_url,
                 &cfg.username,
-                cfg.password.as_deref().unwrap_or(""),
+                &dav_pw,
                 &cfg.tls_options(),
             )?;
             let engine = SyncEngine::new(&client, &storage);
-            let password = resolve_password(&cfg, password.clone())?;
+            let password = resolve_password(cli, &cfg, password.clone())?;
             let outcome = engine
                 .sync(password.as_deref(), &mut |msg| {
                     println!("{msg}");
@@ -241,10 +362,11 @@ async fn main() -> Result<()> {
         }
         Command::Doctor { password } => {
             let cfg = load_config(cli)?;
+            let dav_pw = webdav_password(cli, &cfg)?;
             let client = WebDavClient::new_with_tls(
                 &cfg.webdav_url,
                 &cfg.username,
-                cfg.password.as_deref().unwrap_or(""),
+                &dav_pw,
                 &cfg.tls_options(),
             )?;
             println!("url: {}", cfg.webdav_url);
@@ -254,7 +376,7 @@ async fn main() -> Result<()> {
             println!("sync target version: {}", info.version);
             println!("e2ee: {}", info.e2ee_enabled());
             if info.e2ee_enabled() {
-                let pw = resolve_password(&cfg, password.clone())?;
+                let pw = resolve_password(cli, &cfg, password.clone())?;
                 match engine.unlock_master_key_any(&info, pw.as_deref().unwrap_or("")) {
                     Ok((_, key_id)) => {
                         let suffix =
@@ -376,18 +498,27 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Command::SetPassword { password, e2ee } => {
+            cmd_set_password(cli, password.clone(), *e2ee)?;
+        }
     }
     Ok(())
 }
 
-/// Resolve the E2EE password: CLI arg > config `e2ee_password` > prompt.
+/// Resolve the E2EE password: CLI arg > decrypted config `e2ee_password` > prompt.
 /// The WebDAV password is never used as the E2EE password.
-fn resolve_password(cfg: &Config, cli_password: Option<String>) -> Result<Option<String>> {
+fn resolve_password(
+    cli: &Cli,
+    cfg: &Config,
+    cli_password: Option<String>,
+) -> Result<Option<String>> {
     if let Some(p) = cli_password {
         return Ok(Some(p));
     }
-    if let Some(p) = &cfg.e2ee_password {
-        return Ok(Some(p.clone()));
+    if let Some(stored) = &cfg.e2ee_password {
+        return Ok(Some(local_key(cli)?.decrypt(stored).context(
+            "decrypt e2ee_password (wrong/missing ~/.joplin/secret.key?)",
+        )?));
     }
     print!("E2EE password (empty to skip decryption): ");
     std::io::stdout().flush()?;

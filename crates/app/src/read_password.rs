@@ -55,19 +55,13 @@ pub fn verify_password(password: &str, envelope: &str) -> bool {
     ) else {
         return false;
     };
-    let (Ok(version), Ok(iterations)) = (
-        version.parse::<u32>(),
-        iterations.parse::<u32>(),
-    ) else {
+    let (Ok(version), Ok(iterations)) = (version.parse::<u32>(), iterations.parse::<u32>()) else {
         return false;
     };
     if version != VERSION {
         return false;
     }
-    let (Ok(salt), Ok(expected)) = (
-        hex::decode(salt_hex),
-        hex::decode(hash_hex),
-    ) else {
+    let (Ok(salt), Ok(expected)) = (hex::decode(salt_hex), hex::decode(hash_hex)) else {
         return false;
     };
     if expected.len() != HASH_LEN || salt.is_empty() {
