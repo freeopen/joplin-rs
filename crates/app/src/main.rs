@@ -31,8 +31,8 @@ struct Config {
     /// Path to a PEM CA certificate to trust
     #[serde(default)]
     ca_cert: Option<String>,
-    /// PBKDF2 envelope of the "reading password" that locks the GUI on launch.
-    /// `None` means the app opens without a password prompt.
+    /// PBKDF2 envelope of the global "reading password". It does not lock the
+    /// app on launch; it gates notes the user marked as protected.
     #[serde(default)]
     reader_password_hash: Option<String>,
 }
@@ -115,6 +115,8 @@ fn decrypt_config_secrets(cfg: &mut Config, key: &LocalKey) {
 /// other key verbatim. This is critical for password security: the in-memory
 /// Config holds DECRYPTED webdav/e2ee passwords, so serialising the whole
 /// struct would silently downgrade the on-disk ciphertext back to plaintext.
+///
+/// The password gates notes marked as protected; it does not lock the app.
 fn save_reader_password_hash(hash: &Option<String>) -> anyhow::Result<()> {
     let value = hash.as_ref().map(|h| h.as_str());
     write_config_string_key(&config_path(), "reader_password_hash", value)
@@ -166,7 +168,8 @@ fn data_dir() -> PathBuf {
 enum Dialog {
     #[default]
     None,
-    /// Set / change / remove the reading password.
+    /// Set / change / remove the reading password (used to open protected
+    /// notes).
     ReaderPasswordSettings,
     /// Prompt for the E2EE master-key password after a sync downloaded items.
     E2eePrompt,
@@ -230,13 +233,15 @@ struct App {
     resource_dir: PathBuf,
     note_tags: std::collections::HashMap<String, Vec<String>>, // note_id -> tag titles
 
-    // ---- reading password (launch lock) ----
-    /// False until the launch-lock password has been entered correctly (or no
-    /// reading password is configured). While locked, only the lock screen is
-    /// shown and all note data stays hidden.
-    unlocked: bool,
-    lock_input: String,
-    lock_error: Option<String>,
+    // ---- reading password (per-note protection) ----
+    /// Ids of notes marked as protected by the global reading password.
+    /// Local-only (stored in the kv table, never synced).
+    protected: std::collections::HashSet<String>,
+    /// The currently selected note is showing its password gate instead of
+    /// its body. Reset on every selection, so re-opening a note always asks.
+    note_locked: bool,
+    prot_input: String,
+    prot_error: Option<String>,
 
     // ---- modal dialogs ----
     dialog: Dialog,
@@ -262,10 +267,6 @@ impl App {
     fn new() -> Self {
         let storage = Storage::open(&data_dir().join("joplin-rs.db")).expect("open storage");
         let config: Config = load_config();
-        // A reading password is configured: launch locked. Reloading note
-        // metadata is deferred until after unlock so the list/titles are not
-        // populated behind the lock screen.
-        let has_reader_pw = config.reader_password_hash.is_some();
         let mut app = Self {
             storage,
             config: config.clone(),
@@ -285,9 +286,10 @@ impl App {
             job_event: Arc::new(Mutex::new(None)),
             resource_dir: PathBuf::new(),
             note_tags: Default::default(),
-            unlocked: !has_reader_pw,
-            lock_input: String::new(),
-            lock_error: None,
+            protected: Default::default(),
+            note_locked: false,
+            prot_input: String::new(),
+            prot_error: None,
             dialog: Dialog::None,
             rp_current: String::new(),
             rp_new: String::new(),
@@ -300,9 +302,7 @@ impl App {
             #[cfg(not(target_os = "macos"))]
             about_icon: None,
         };
-        if app.unlocked {
-            app.reload_meta();
-        }
+        app.reload_meta();
         app
     }
 
@@ -338,11 +338,13 @@ impl App {
             }
         }
         self.note_tags = map;
+        self.protected = self.storage.protected_note_ids().unwrap_or_default();
 
         // A decrypt pass may have just replaced the open placeholder with its
         // plaintext; refresh the open note so its body/lock state updates.
+        // Route through the gate so a protected note re-locks after sync.
         if let Some(id) = self.selected_note.clone() {
-            self.open_note(&id);
+            self.request_open_note(&id);
         }
     }
 
@@ -415,26 +417,118 @@ impl App {
         }
     }
 
-    // ---- reading password (launch lock) ----
+    // ---- reading password (per-note protection) ----
 
     fn has_reader_password(&self) -> bool {
         self.config.reader_password_hash.is_some()
     }
 
-    /// Verify the launch-lock input against the stored hash.
-    fn try_unlock(&mut self) {
-        let Some(envelope) = self.config.reader_password_hash.as_deref() else {
-            self.unlocked = true;
+    /// Open a note, routing protected notes through the password gate. This
+    /// is the only UI path that loads a note body, so every (re)selection of
+    /// a protected note asks again; nothing is cached for the session.
+    fn request_open_note(&mut self, id: &str) {
+        if self.protected.contains(id) {
+            // Read only the title for the gate header; body and resource
+            // files stay unloaded until the password is verified.
+            if let Ok(Some(note)) = self.storage.note(id) {
+                self.note_title = note
+                    .props
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                self.selected_note_encrypted = is_encrypted_placeholder(&note);
+            }
+            self.selected_note = Some(id.to_string());
+            self.note_locked = true;
+            self.note_body.clear();
+            self.prot_input.clear();
+            self.prot_error = None;
+            return;
+        }
+        self.note_locked = false;
+        self.open_note(id);
+    }
+
+    /// Verify the gate input against the global reading-password hash and,
+    /// on success, load the gated note.
+    fn try_unlock_note(&mut self) {
+        let Some(id) = self.selected_note.clone() else {
             return;
         };
-        if verify_password(&self.lock_input, envelope) {
-            self.unlocked = true;
-            self.lock_input.clear();
-            self.lock_error = None;
-            self.reload_meta();
+        let Some(envelope) = self.config.reader_password_hash.as_deref() else {
+            // No global password configured: protection is a no-op.
+            self.note_locked = false;
+            self.open_note(&id);
+            return;
+        };
+        if verify_password(&self.prot_input, envelope) {
+            self.prot_input.clear();
+            self.prot_error = None;
+            self.note_locked = false;
+            self.open_note(&id);
         } else {
-            self.lock_error = Some("密码错误，请重试".into());
-            self.lock_input.clear();
+            self.prot_error = Some("密码错误，请重试".into());
+            self.prot_input.clear();
+        }
+    }
+
+    /// Remove protection from the gated note after verifying the password.
+    fn unprotect_gated_note(&mut self) {
+        let Some(id) = self.selected_note.clone() else {
+            return;
+        };
+        let Some(envelope) = self.config.reader_password_hash.as_deref() else {
+            // No global password: unprotect without prompting.
+            let _ = self.storage.unprotect_note(&id);
+            self.protected.remove(&id);
+            self.note_locked = false;
+            self.open_note(&id);
+            return;
+        };
+        if !verify_password(&self.prot_input, envelope) {
+            self.prot_error = Some("密码错误，请重试".into());
+            self.prot_input.clear();
+            return;
+        }
+        if let Err(e) = self.storage.unprotect_note(&id) {
+            self.prot_error = Some(format!("取消保护失败: {e}"));
+            return;
+        }
+        self.protected.remove(&id);
+        self.prot_input.clear();
+        self.prot_error = None;
+        self.note_locked = false;
+        self.open_note(&id);
+    }
+
+    /// Mark the open note as protected. No current password is required:
+    /// adding a lock cannot reduce security. Without a global password set,
+    /// open the password settings dialog instead.
+    fn protect_open_note(&mut self) {
+        if !self.has_reader_password() {
+            self.open_reader_pw_settings();
+            self.set_status("请先设置阅读密码，再保护笔记".into());
+            return;
+        }
+        let Some(id) = self.selected_note.clone() else {
+            return;
+        };
+        match self.storage.set_note_protected(&id) {
+            Ok(()) => {
+                self.protected.insert(id.clone());
+                // Route through the gate immediately.
+                self.request_open_note(&id);
+            }
+            Err(e) => self.set_status(format!("保护失败: {e}")),
+        }
+    }
+
+    /// From an unlocked protected note, jump back to its gate (where the
+    /// password can remove protection).
+    fn gate_open_note(&mut self) {
+        if let Some(id) = self.selected_note.clone() {
+            self.request_open_note(&id);
         }
     }
 
@@ -473,7 +567,8 @@ impl App {
                 self.rp_current.clear();
                 self.rp_new.clear();
                 self.rp_confirm.clear();
-                self.rp_message = Some("阅读密码已保存，下次打开时生效".into());
+                self.rp_message =
+                    Some("阅读密码已保存，对受保护的笔记立即生效".into());
             }
             Err(e) => {
                 self.config.reader_password_hash = previous;
@@ -482,7 +577,9 @@ impl App {
         }
     }
 
-    /// Remove the launch lock (requires the current password).
+    /// Remove the global reading password (requires the current password).
+    /// Protection markers become meaningless without it, so they are all
+    /// cleared on success.
     fn remove_reader_pw(&mut self) {
         self.rp_error = None;
         self.rp_message = None;
@@ -494,18 +591,20 @@ impl App {
             return;
         }
         let previous = self.config.reader_password_hash.take();
-        match save_reader_password_hash(&None) {
-            Ok(()) => {
-                self.rp_current.clear();
-                self.rp_new.clear();
-                self.rp_confirm.clear();
-                self.rp_message = Some("阅读密码已取消".into());
-            }
-            Err(e) => {
-                self.config.reader_password_hash = previous;
-                self.rp_error = Some(format!("保存失败: {e}"));
-            }
+        if let Err(e) = save_reader_password_hash(&None) {
+            self.config.reader_password_hash = previous;
+            self.rp_error = Some(format!("保存失败: {e}"));
+            return;
         }
+        if let Err(e) = self.storage.clear_note_protections() {
+            // Password is already removed; report but do not roll it back.
+            tracing::error!("cannot clear note protections: {e}");
+        }
+        self.protected.clear();
+        self.rp_current.clear();
+        self.rp_new.clear();
+        self.rp_confirm.clear();
+        self.rp_message = Some("阅读密码已取消，所有笔记保护已移除".into());
     }
 
     // ---- E2EE decryption (separate stage after download) ----
@@ -750,19 +849,6 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Launch lock: until the reading password is verified, show only the
-        // lock modal and none of the note panels (note lists are not even
-        // loaded yet, so titles/bodies cannot leak behind the lock).
-        if !self.unlocked {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.centered_and_justified(|ui| {
-                    ui.weak("joplin-rs");
-                });
-            });
-            self.show_lock_modal(ctx);
-            return;
-        }
-
         // Consume any finished background sync/decrypt job before drawing.
         self.handle_job_event(ctx);
 
@@ -880,6 +966,7 @@ impl eframe::App for App {
                                 .unwrap_or("")
                                 .to_string();
                             let encrypted = is_encrypted_placeholder(note);
+                            let protected = self.protected.contains(&id);
                             let raw_title = note
                                 .props
                                 .get("title")
@@ -896,6 +983,13 @@ impl eframe::App for App {
                                 "(no title)".to_string()
                             } else {
                                 raw_title
+                            };
+                            // Reading-password-protected notes carry an 🔐
+                            // marker (title stays visible, body stays gated).
+                            let title = if protected {
+                                format!("🔐 {title}")
+                            } else {
+                                title
                             };
                             let is_todo = note
                                 .props
@@ -916,7 +1010,7 @@ impl eframe::App for App {
                             };
                             let selected = self.selected_note.as_deref() == Some(id.as_str());
                             if ui.selectable_label(selected, label).clicked() {
-                                self.open_note(&id);
+                                self.request_open_note(&id);
                             }
                             if let Some(tags) = note_tags.get(&id) {
                                 if !tags.is_empty() {
@@ -929,8 +1023,9 @@ impl eframe::App for App {
                             }
                             if let Some(snippet) = search_hits.get(&id) {
                                 // Encrypted placeholders have no plaintext body;
-                                // showing an empty/garbled snippet is pointless.
-                                if !encrypted {
+                                // protected notes have a gated body: neither
+                                // shows a search snippet (title still matches).
+                                if !encrypted && !protected {
                                     ui.small(egui::RichText::new(snippet).weak().size(11.0));
                                 }
                             }
@@ -946,20 +1041,35 @@ impl eframe::App for App {
                 });
                 return;
             }
+            // Reading-password gate for a protected note: title is shown,
+            // but the body is not loaded until the password is verified.
+            if self.note_locked {
+                self.show_note_gate(ui, ctx);
+                return;
+            }
             // Encrypted placeholder selected: show its raw (locked) state rather
             // than rendering an empty/encrypted body.
             if self.selected_note_encrypted {
-                ui.heading(&self.note_title);
-                ui.separator();
-                ui.vertical_centered(|ui| {
-                    ui.add_space(40.0);
-                    ui.heading("🔒");
-                    ui.label("此笔记已端到端加密，尚未解密");
-                    ui.label("先完成同步，再提供正确的 E2EE 密码即可查看");
-                });
+                self.show_encrypted_placeholder(ui);
                 return;
             }
-            ui.heading(&self.note_title);
+            // Title row with the protect/unprotect action.
+            let id = self.selected_note.clone().unwrap_or_default();
+            let is_protected = self.protected.contains(&id);
+            ui.horizontal(|ui| {
+                ui.heading(&self.note_title);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if is_protected {
+                        if ui.button("取消保护").clicked() {
+                            // Go back to the gate, where the password removes
+                            // the marker.
+                            self.gate_open_note();
+                        }
+                    } else if ui.button("🔒 保护此笔记").clicked() {
+                        self.protect_open_note();
+                    }
+                });
+            });
             ui.separator();
             egui::ScrollArea::vertical()
                 .auto_shrink(false)
@@ -981,52 +1091,75 @@ impl eframe::App for App {
 }
 
 impl App {
-    // ---- modal rendering ----
+    // ---- note panels ----
 
-    /// Launch-lock password prompt. Cannot be dismissed without the password:
-    /// backdrop clicks and Escape are intentionally ignored.
-    fn show_lock_modal(&mut self, ctx: &egui::Context) {
-        egui::Modal::new(egui::Id::new("reader_lock_modal")).show(ctx, |ui| {
-            ui.set_min_width(320.0);
-            ui.heading("阅读密码");
-            ui.add_space(4.0);
-            ui.label("请输入阅读密码以打开 joplin-rs");
-            ui.add_space(8.0);
+    /// Password gate shown in the body panel for a protected note. The title
+    /// is visible; the body is not loaded until the global reading password
+    /// is verified. Re-shown on every selection, including after sync.
+    fn show_note_gate(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
+        ui.horizontal(|ui| {
+            ui.heading(&self.note_title);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.weak("🔐 受保护");
+            });
+        });
+        ui.separator();
+        ui.vertical_centered(|ui| {
+            ui.add_space(40.0);
+            ui.heading("🔐");
+            ui.label("此笔记受阅读密码保护");
+            ui.add_space(12.0);
 
-            let input = egui::TextEdit::singleline(&mut self.lock_input)
+            let input = egui::TextEdit::singleline(&mut self.prot_input)
                 .password(true)
                 .hint_text("阅读密码")
-                .desired_width(280.0);
+                .desired_width(300.0)
+                .id(ui.make_persistent_id("note_gate_password"));
             let input_response = ui.add(input);
-            // Keep focus on the password field so typing always lands here,
-            // but do NOT steal it back on the frame Enter was pressed:
-            // pressing Enter makes the singleline editor surrender focus,
-            // and re-requesting it in the same frame would suppress the
-            // lost_focus signal below (the bug where Enter did not unlock).
+            // Same focus rule as a modal prompt: keep the field focused, but
+            // do not steal it back on the Enter frame or the surrender /
+            // lost_focus submit signal is eaten.
             let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
             if !input_response.has_focus() && !enter_pressed {
                 input_response.request_focus();
             }
-            // egui's singleline submit pattern: Enter surrenders focus on
-            // the same frame, so lost_focus + Enter fires exactly once.
-            let submit =
-                enter_pressed && (input_response.lost_focus() || !self.lock_input.is_empty());
+            let submit = enter_pressed
+                && (input_response.lost_focus() || !self.prot_input.is_empty());
 
-            if let Some(err) = &self.lock_error {
+            if let Some(err) = &self.prot_error {
                 ui.add_space(4.0);
-                ui.label(egui::RichText::new(err).color(egui::Color32::from_rgb(200, 60, 60)));
+                ui.label(
+                    egui::RichText::new(err).color(egui::Color32::from_rgb(200, 60, 60)),
+                );
             }
             ui.add_space(10.0);
-            ui.vertical_centered(|ui| {
-                if ui.button("解锁").clicked() || submit {
-                    self.try_unlock();
+            let mut unlock = false;
+            let mut unprotect = false;
+            ui.horizontal(|ui| {
+                if ui.button("取消保护").clicked() {
+                    unprotect = true;
+                }
+                if ui.button("解锁查看").clicked() {
+                    unlock = true;
                 }
             });
+            if unlock || submit {
+                self.try_unlock_note();
+            } else if unprotect {
+                self.unprotect_gated_note();
+            }
         });
-        // Swallow Escape/backdrop-close: the lock may only be cleared by the
-        // correct password. Modal::should_close would otherwise dismiss it.
-        ctx.input_mut(|i| {
-            i.consume_key(egui::Modifiers::NONE, egui::Key::Escape);
+    }
+
+    /// E2EE placeholder body (note downloaded but not yet decrypted).
+    fn show_encrypted_placeholder(&self, ui: &mut egui::Ui) {
+        ui.heading(&self.note_title);
+        ui.separator();
+        ui.vertical_centered(|ui| {
+            ui.add_space(40.0);
+            ui.heading("🔒");
+            ui.label("此笔记已端到端加密，尚未解密");
+            ui.label("先完成同步，再提供正确的 E2EE 密码即可查看");
         });
     }
 
@@ -1040,6 +1173,13 @@ impl App {
                 } else {
                     "设置阅读密码"
                 });
+                ui.add_space(4.0);
+                ui.small(
+                    egui::RichText::new(
+                        "阅读密码不锁定整个应用，仅用于打开被标记为“🔐 受保护”的笔记；每次打开都需输入。",
+                    )
+                    .weak(),
+                );
                 ui.add_space(6.0);
 
                 if has_pw {
@@ -1080,7 +1220,7 @@ impl App {
                 let mut remove = false;
                 let mut save = false;
                 ui.horizontal(|ui| {
-                    if has_pw && ui.button("取消密码").clicked() {
+                    if has_pw && ui.button("取消密码（清除所有保护）").clicked() {
                         remove = true;
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

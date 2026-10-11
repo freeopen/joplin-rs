@@ -1,7 +1,9 @@
-//! Reading-password (app launch lock) hashing and verification.
+//! Reading-password hashing and verification.
 //!
-//! The reading password gates access to the GUI on every launch. Only a salted
-//! PBKDF2-HMAC-SHA512 hash is stored in config.toml, never the plaintext.
+//! The reading password is a single global password that gates notes the user
+//! has marked as protected in the GUI (every open of such a note asks for it);
+//! it does not lock the whole app. Only a salted PBKDF2-HMAC-SHA512 hash is
+//! stored in config.toml, never the plaintext.
 //!
 //! Envelope format (one line, stored as `reader_password_hash` in config.toml):
 //!

@@ -243,6 +243,13 @@ impl Storage {
             self.conn
                 .execute("DELETE FROM sync_items WHERE item_id = ?1", [id])
                 .map_err(|e| Error::Storage(format!("delete sync: {e}")))?;
+            // Drop the local-only protection marker with the note.
+            self.conn
+                .execute(
+                    "DELETE FROM kv WHERE key = ?1",
+                    [format!("{}{}", Self::NOTE_PROTECT_PREFIX, id)],
+                )
+                .map_err(|e| Error::Storage(format!("delete protection: {e}")))?;
         }
         Ok(())
     }
@@ -269,6 +276,67 @@ impl Storage {
                 [key, value],
             )
             .map_err(|e| Error::Storage(format!("kv_set: {e}")))?;
+        Ok(())
+    }
+
+    // -- Per-note reading-password protection markers (local only) --------
+    //
+    // Stored in the local `kv` table under `note_protected:<note_id>`, never
+    // synced to Joplin. The password itself is global and lives in config.toml
+    // as a PBKDF2 hash; this marker only records which notes the GUI gates.
+
+    const NOTE_PROTECT_PREFIX: &'static str = "note_protected:";
+
+    /// Mark a note as protected by the global reading password.
+    pub fn set_note_protected(&self, note_id: &str) -> Result<()> {
+        self.kv_set(&format!("{}{}", Self::NOTE_PROTECT_PREFIX, note_id), "1")
+    }
+
+    /// Remove the reading-password protection marker from a note.
+    pub fn unprotect_note(&self, note_id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM kv WHERE key = ?1",
+                [format!("{}{}", Self::NOTE_PROTECT_PREFIX, note_id)],
+            )
+            .map_err(|e| Error::Storage(format!("unprotect_note: {e}")))?;
+        Ok(())
+    }
+
+    /// Whether the note is marked as reading-password protected.
+    pub fn is_note_protected(&self, note_id: &str) -> Result<bool> {
+        self.kv_get(&format!("{}{}", Self::NOTE_PROTECT_PREFIX, note_id))
+            .map(|v| v.is_some())
+    }
+
+    /// Ids of every locally protected note (regardless of whether the note
+    /// still exists; stale markers are removed by `delete_items`).
+    pub fn protected_note_ids(&self) -> Result<std::collections::HashSet<String>> {
+        let like = format!("{}%", Self::NOTE_PROTECT_PREFIX);
+        let mut stmt = self
+            .conn
+            .prepare("SELECT key FROM kv WHERE key LIKE ?1")
+            .map_err(|e| Error::Storage(format!("protected_note_ids: {e}")))?;
+        let rows = stmt
+            .query_map([like], |r| r.get::<_, String>(0))
+            .map_err(|e| Error::Storage(format!("protected_note_ids: {e}")))?;
+        let mut out = std::collections::HashSet::new();
+        for row in rows {
+            let key = row.map_err(|e| Error::Storage(e.to_string()))?;
+            if let Some(id) = key.strip_prefix(Self::NOTE_PROTECT_PREFIX) {
+                out.insert(id.to_string());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Remove every protection marker. Used when the global reading password
+    /// is removed, since protection without a password is meaningless.
+    pub fn clear_note_protections(&self) -> Result<()> {
+        let like = format!("{}%", Self::NOTE_PROTECT_PREFIX);
+        self.conn
+            .execute("DELETE FROM kv WHERE key LIKE ?1", [like])
+            .map_err(|e| Error::Storage(format!("clear_note_protections: {e}")))?;
         Ok(())
     }
 
@@ -672,6 +740,51 @@ mod tests {
         storage.kv_set("k", "v1").unwrap();
         storage.kv_set("k", "v2").unwrap();
         assert_eq!(storage.kv_get("k").unwrap().unwrap(), "v2");
+    }
+
+    #[test]
+    fn note_protection_markers_roundtrip() {
+        let storage = Storage::open_in_memory().unwrap();
+        assert!(storage.protected_note_ids().unwrap().is_empty());
+        assert!(!storage.is_note_protected("n1").unwrap());
+
+        storage.set_note_protected("n1").unwrap();
+        storage.set_note_protected("n2").unwrap();
+        // Setting twice is idempotent.
+        storage.set_note_protected("n1").unwrap();
+        assert!(storage.is_note_protected("n1").unwrap());
+        let ids = storage.protected_note_ids().unwrap();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains("n1") && ids.contains("n2"));
+
+        // Unrelated kv keys are not listed as protected notes.
+        storage.kv_set("delta_context", "x").unwrap();
+        assert_eq!(storage.protected_note_ids().unwrap().len(), 2);
+
+        storage.unprotect_note("n1").unwrap();
+        assert!(!storage.is_note_protected("n1").unwrap());
+        assert!(storage.is_note_protected("n2").unwrap());
+
+        storage.clear_note_protections().unwrap();
+        assert!(storage.protected_note_ids().unwrap().is_empty());
+        // Unrelated kv survives the protection clear.
+        assert_eq!(storage.kv_get("delta_context").unwrap().as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn note_protection_survives_item_upsert_but_not_delete() {
+        let storage = Storage::open_in_memory().unwrap();
+        let item = unserialize(NOTE_BLOB).unwrap();
+        let id = item.props["id"].as_str().unwrap();
+        storage.upsert_item(&item).unwrap();
+        storage.set_note_protected(id).unwrap();
+        // A sync-driven re-upsert must not drop the local marker.
+        storage.upsert_item(&item).unwrap();
+        assert!(storage.is_note_protected(id).unwrap());
+        // Deleting the note removes the marker.
+        storage.delete_items(&[id.to_string()]).unwrap();
+        assert!(!storage.is_note_protected(id).unwrap());
+        assert!(storage.protected_note_ids().unwrap().is_empty());
     }
 
     fn seed_note(
