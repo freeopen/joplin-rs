@@ -10,8 +10,8 @@
 //! - anything else (chore, refactor, docs, test, non-conventional subjects,
 //!   merge commits) does not bump the version.
 //!
-//! The resulting version is `M.I.P+g<short-hash>`. CI tags look like
-//! `vM.I.P-g<hash>` and are parsed the same as `vM.I.P`.
+//! The resulting version is the plain `M.I.P`, and CI tags it `vM.I.P`.
+//! Legacy CI tags like `vM.I.P-g<hash>` are parsed the same as `vM.I.P`.
 //! Git unavailable / outside a git checkout -> the plain Cargo.toml version.
 
 use std::process::Command;
@@ -25,8 +25,6 @@ fn main() {
 }
 
 fn git_version(cargo_version: &str) -> Option<String> {
-    let hash = git(&["rev-parse", "--short", "HEAD"])?;
-
     let (major, minor, patch) = match latest_version_tag() {
         Some(tag) => {
             let base = parse_version_tag(&tag)?;
@@ -40,7 +38,7 @@ fn git_version(cargo_version: &str) -> Option<String> {
         }
     };
 
-    Some(format!("{major}.{minor}.{patch}+g{hash}"))
+    Some(format!("{major}.{minor}.{patch}"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

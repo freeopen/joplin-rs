@@ -1,8 +1,8 @@
 //! Core library for the joplin-rs tools.
 
 /// Full build version derived from git by `build.rs`
-/// (`M.I.P+g<short-hash>`); falls back to the Cargo.toml version outside a
-/// git checkout.
+/// (plain `M.I.P`); falls back to the Cargo.toml version outside a git
+/// checkout.
 pub const GIT_VERSION: &str = match option_env!("JOPLIN_RS_GIT_VERSION") {
     Some(v) => v,
     None => env!("CARGO_PKG_VERSION"),

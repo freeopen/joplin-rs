@@ -1,9 +1,9 @@
 name: Release
 
 # 正式发布（非 prerelease）：
-# - push master：从 git 自动推导版本 X.Y.Z+g<hash>，CI 在当前提交上
-#   自动建 tag vX.Y.Z-g<hash> 并发布 Release（GITHUB_TOKEN 建的 tag 不会
-#   再次触发本流水线，无递归风险）
+# - push master：从 git 提交记录自动推导版本 X.Y.Z（feat 升次版本、fix 升
+#   补丁），CI 在当前提交上自动建 tag vX.Y.Z 并发布 Release（GITHUB_TOKEN
+#   建的 tag 不会再次触发本流水线，无递归风险）
 # - push 人工 tag vX.Y.Z：发布绑定该 tag 的正式 Release
 on:
   push:
@@ -40,7 +40,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # 需要完整历史与 tag，build.rs 才能用 git describe/rev-list 算版本
+          # 需要完整历史与 tag，build.rs 才能用 git describe/log 算版本
           fetch-depth: 0
 
       - name: Install Rust toolchain
@@ -55,7 +55,7 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
-      # 版本号单一数据源：直接读编译产物的 --version（X.Y.Z+g<hash>）
+      # 版本号单一数据源：直接读编译产物的 --version（X.Y.Z）
       - name: Resolve version
         shell: bash
         run: |
@@ -117,8 +117,8 @@ jobs:
             # 人工发布 tag：Release 直接绑定该 tag
             TAG_NAME="${GITHUB_REF_NAME}"
           else
-            # 日常 push：自动 tag，SemVer 的 '+' 在 tag 名中换成 '-'
-            TAG_NAME="v${VERSION/+/-}"
+            # 日常 push：版本号即纯 SemVer，直接加 v 前缀作为 tag
+            TAG_NAME="v${VERSION}"
           fi
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "TAG_NAME=$TAG_NAME" >> "$GITHUB_ENV"
