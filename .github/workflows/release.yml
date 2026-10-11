@@ -1,0 +1,135 @@
+name: Release
+
+# 正式发布（非 prerelease）：
+# - push master：从 git 自动推导版本 X.Y.Z+g<hash>，CI 在当前提交上
+#   自动建 tag vX.Y.Z-g<hash> 并发布 Release（GITHUB_TOKEN 建的 tag 不会
+#   再次触发本流水线，无递归风险）
+# - push 人工 tag vX.Y.Z：发布绑定该 tag 的正式 Release
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # 需要完整历史与 tag，build.rs 才能用 git describe/rev-list 算版本
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # 在 workspace 根目录编译，会同时产出两个 bin
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # 版本号单一数据源：直接读编译产物的 --version（X.Y.Z+g<hash>）
+      - name: Resolve version
+        shell: bash
+        run: |
+          set -e
+          BIN="target/${{ matrix.target }}/release/joplin-rs"
+          if [ -f "$BIN.exe" ]; then BIN="$BIN.exe"; fi
+          VERSION="$("$BIN" --version | awk '{print $2}')"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "Building version $VERSION"
+
+      # ---------- 打包：两个 bin + LICENSE ----------
+      - name: Package (Unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -e
+          BIN_DIR="target/${{ matrix.target }}/release"
+          OUT="joplin-rs-${VERSION}-${{ matrix.target }}.tar.gz"
+          mkdir -p stage
+          cp "$BIN_DIR/joplin-rs" "$BIN_DIR/joplin-rs-app" LICENSE stage/
+          tar czf "$OUT" -C stage joplin-rs joplin-rs-app LICENSE
+
+      - name: Package (Windows)
+        if: matrix.archive == 'zip'
+        shell: bash
+        run: |
+          set -e
+          BIN_DIR="target/${{ matrix.target }}/release"
+          OUT="joplin-rs-${VERSION}-${{ matrix.target }}.zip"
+          mkdir -p stage
+          cp "$BIN_DIR/joplin-rs.exe" "$BIN_DIR/joplin-rs-app.exe" LICENSE stage/
+          (cd stage && 7z a "../$OUT" joplin-rs.exe joplin-rs-app.exe LICENSE)
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: joplin-rs-${{ matrix.target }}
+          path: joplin-rs-${{ env.VERSION }}-${{ matrix.target }}.*
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Resolve version and tag
+        shell: bash
+        run: |
+          set -e
+          mkdir -p rel
+          tar xzf artifacts/joplin-rs-*-x86_64-unknown-linux-gnu.tar.gz -C rel
+          VERSION="$(./rel/joplin-rs --version | awk '{print $2}')"
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            # 人工发布 tag：Release 直接绑定该 tag
+            TAG_NAME="${GITHUB_REF_NAME}"
+          else
+            # 日常 push：自动 tag，SemVer 的 '+' 在 tag 名中换成 '-'
+            TAG_NAME="v${VERSION/+/-}"
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "TAG_NAME=$TAG_NAME" >> "$GITHUB_ENV"
+          echo "Releasing $VERSION as $TAG_NAME"
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG_NAME }}
+          name: Release ${{ env.VERSION }}
+          files: artifacts/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false

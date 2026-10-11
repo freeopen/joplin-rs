@@ -44,6 +44,24 @@ A read-only Joplin client written in Rust:
 cargo build --release
 ```
 
+## Versioning and releases
+
+The build version is derived automatically from git (no manual Cargo.toml
+bumps):
+
+- Latest tag `vM.I.P`, N commits ahead of it -> `M.I.(P+N)+g<short-hash>`
+- No tag yet -> the Cargo.toml version with the total commit count added to
+  its patch component
+- Outside a git checkout -> the plain Cargo.toml version
+
+`joplin-rs --version` and the GUI About panel report the same string.
+
+Every push to `master` is built for Linux, Windows and macOS (x64/arm64) and
+published as an official GitHub Release; CI creates the matching tag
+`vM.I.P-g<hash>` on the pushed commit. To mark a milestone manually, push a
+tag like `v0.2.0` (prefer bumping minor/major so the new patch base does not
+go backwards relative to the automatically accumulated patch number).
+
 ## CLI usage
 
 Create `config.toml` (default location: `~/.joplin/config.toml`):

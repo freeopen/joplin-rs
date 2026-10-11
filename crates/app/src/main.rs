@@ -5,8 +5,8 @@ mod read_password;
 #[cfg(target_os = "macos")]
 mod macos_about;
 
-/// App version, taken from Cargo.toml at compile time.
-const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// App version, derived from git tags at compile time (see core::GIT_VERSION).
+const APP_VERSION: &str = joplin_rs_core::GIT_VERSION;
 
 use joplin_rs_core::items::Item;
 use joplin_rs_core::secret::LocalKey;
