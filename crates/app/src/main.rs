@@ -426,18 +426,25 @@ impl eframe::App for App {
 }
 
 /// Extract Joplin resource ids referenced as ":/<32-hex>" in a note body.
+/// Operates on bytes only (the marker and hex digits are all ASCII), so it is
+/// safe on UTF-8 text containing multibyte characters - slicing the string at
+/// a fixed byte offset could land inside a CJK character and panic.
 fn crate_resource_ids(body: &str) -> Vec<String> {
-    let mut out = Vec::new();
+    const HEX: &[u8] = b"0123456789abcdefABCDEF";
     let bytes = body.as_bytes();
+    let mut out = Vec::new();
     let mut i = 0;
     while i + 34 <= bytes.len() {
         if bytes[i] == b':' && bytes[i + 1] == b'/' {
-            let candidate = &body[i + 2..(i + 34).min(body.len())];
-            if candidate.len() == 32 && candidate.chars().all(|c| c.is_ascii_hexdigit()) {
-                if !out.contains(&candidate.to_string()) {
-                    out.push(candidate.to_string());
+            let start = i + 2;
+            let end = start + 32;
+            if bytes[start..end].iter().all(|b| HEX.contains(b)) {
+                // ASCII hex, so this byte range is a valid char boundary.
+                let id = body[start..end].to_string();
+                if !out.contains(&id) {
+                    out.push(id);
                 }
-                i += 34;
+                i = end;
                 continue;
             }
         }
@@ -549,4 +556,58 @@ fn main() -> eframe::Result {
             Ok(Box::new(App::new()))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::crate_resource_ids;
+
+    const ID: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn extracts_resource_link() {
+        let body = format!("before :/{ID} after");
+        assert_eq!(crate_resource_ids(&body), vec![ID.to_string()]);
+    }
+
+    #[test]
+    fn dedupes_repeated_links() {
+        let body = format!(":/{ID} text :/{ID}");
+        assert_eq!(crate_resource_ids(&body), vec![ID.to_string()]);
+    }
+
+    #[test]
+    fn ignores_non_hex_and_short_ids() {
+        assert!(crate_resource_ids("/not-a-link").is_empty());
+        assert!(crate_resource_ids(&format!(":/{}short", "0".repeat(31))).is_empty());
+        assert_eq!(crate_resource_ids(&format!(":/{ID}")), vec![ID.to_string()]);
+    }
+
+    /// Regression for the "end byte index is not a char boundary" panic:
+    /// a non-link ":/" whose 32-byte look-ahead window ends inside a
+    /// multibyte CJK character must not slice the string mid-character.
+    #[test]
+    fn nonlink_window_inside_cjk_does_not_panic() {
+        // ":/" followed by 31 ASCII bytes then a 3-byte CJK char: the old
+        // fixed-offset slice [i+2 .. i+34] ended on that char's first byte.
+        let body = format!(":/{}交", "a".repeat(31));
+        assert!(crate_resource_ids(&body).is_empty());
+
+        // A colon+slash embedded in a URL/path right next to Chinese text.
+        let body = "参考 https:/交运医药 结尾".to_string();
+        assert!(crate_resource_ids(&body).is_empty());
+    }
+
+    /// Real Chinese note with a valid resource link: id must be extracted.
+    #[test]
+    fn extracts_link_from_chinese_body() {
+        let body = format!("交运医药商保清分工作环境：![图](:/{ID})，后续中文交运医药");
+        assert_eq!(crate_resource_ids(&body), vec![ID.to_string()]);
+
+        let body = format!("开头中文 :/{ID}交");
+        assert_eq!(crate_resource_ids(&body), vec![ID.to_string()]);
+
+        // No link, only multibyte text: must not panic.
+        assert!(crate_resource_ids("交运医药商保清分工作环境交运医药").is_empty());
+    }
 }
