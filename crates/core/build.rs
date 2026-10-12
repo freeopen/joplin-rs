@@ -24,10 +24,7 @@ use std::process::Command;
 fn main() {
     let cargo_version = env!("CARGO_PKG_VERSION");
     let version = git_version(cargo_version).unwrap_or_else(|| cargo_version.to_string());
-    let display = match git(&["rev-parse", "--short=9", "HEAD"]) {
-        Some(hash) => format!("v{version} ({hash})"),
-        None => format!("v{version}"),
-    };
+    let display = version_display(&version, git(&["rev-parse", "--short=9", "HEAD"]).as_deref());
     println!("cargo:rustc-env=JOPLIN_RS_GIT_VERSION={version}");
     println!("cargo:rustc-env=JOPLIN_RS_VERSION_DISPLAY={display}");
     // The build script runs with the crate dir (crates/core) as cwd, so
@@ -36,6 +33,19 @@ fn main() {
     if let Some(root) = git(&["rev-parse", "--show-toplevel"]) {
         println!("cargo:rerun-if-changed={root}/.git/HEAD");
         println!("cargo:rerun-if-changed={root}/.git/refs");
+    }
+}
+
+/// The human-facing `--version` string: `vM.I.P (<hash>)`, or just `vM.I.P`
+/// when there is no commit hash (outside a git checkout).
+///
+/// CI (`.github/workflows/release.yml`) strips this back down to the plain
+/// `M.I.P` with `sed -E 's/.* v([0-9]+\.[0-9]+\.[0-9]+).*/\1/'`; keep the
+/// format in sync with that expression.
+fn version_display(version: &str, hash: Option<&str>) -> String {
+    match hash {
+        Some(hash) => format!("v{version} ({hash})"),
+        None => format!("v{version}"),
     }
 }
 
@@ -208,5 +218,74 @@ mod tests {
         assert_eq!(parse_semver("1.0.0"), Some((1, 0, 0)));
         assert_eq!(parse_semver("1.2.3-rc.1"), Some((1, 2, 3)));
         assert_eq!(parse_semver("1.2.3+meta"), Some((1, 2, 3)));
+    }
+
+    #[test]
+    fn display_format_with_and_without_hash() {
+        assert_eq!(
+            version_display("1.0.0", Some("b30d7ede3")),
+            "v1.0.0 (b30d7ede3)"
+        );
+        assert_eq!(version_display("1.0.0", None), "v1.0.0");
+        // A hash that itself starts with `v` must not confuse consumers.
+        assert_eq!(version_display("1.1.0", Some("va2751c")), "v1.1.0 (va2751c)");
+    }
+
+    /// The CI workflow resolves the release version from the binary's
+    /// `--version` output with a sed expression; the display format built
+    /// here must stay parseable by it. This test mirrors that expression.
+    #[test]
+    fn display_string_is_parseable_like_ci_sed() {
+        let sed_extract = |display: &str| -> String {
+            // Mirrors `sed -E 's/.* v([0-9]+\.[0-9]+\.[0-9]+).*/\1/'`.
+            let re = regex_lite_find_version(display);
+            re.expect("CI sed must find a version in the display string")
+        };
+        assert_eq!(sed_extract(&version_display("1.1.0", Some("a2751c434"))), "1.1.0");
+        assert_eq!(sed_extract(&version_display("1.1.0", None)), "1.1.0");
+        assert_eq!(
+            sed_extract(&version_display("1.1.0", Some("va2751c"))),
+            "1.1.0"
+        );
+    }
+
+    /// Minimal stand-in for the CI sed expression: find the LAST ` v` (sed's
+    /// leading `.*` is greedy) followed by `M.I.P` and capture the digits.
+    /// Deliberately written as a scan rather than a regex crate dependency
+    /// (build scripts should stay lean).
+    fn regex_lite_find_version(s: &str) -> Option<String> {
+        // CI sees `joplin-rs vM.I.P ...`; display strings built here start
+        // with `v`, so scan for `v` either at the start or after a space.
+        let mut starts = vec![0];
+        starts.extend(
+            s.match_indices(" v")
+                .filter(|(i, _)| *i > 0)
+                .map(|(i, _)| i + 1),
+        );
+        starts
+            .iter()
+            .rev()
+            .find_map(|i| semver_at(&s[*i..]))
+    }
+
+    /// If `s` starts with `M.I.P` (digits and dots), return it.
+    fn semver_at(s: &str) -> Option<String> {
+        let s = s.strip_prefix('v')?;
+        let end = s
+            .char_indices()
+            .find(|(_, c)| !c.is_ascii_digit() && *c != '.')
+            .map(|(i, _)| i)
+            .unwrap_or(s.len());
+        let candidate = &s[..end];
+        let mut parts = candidate.split('.');
+        let ok = [0, 0, 0]
+            .iter()
+            .all(|_| {
+                parts
+                    .next()
+                    .is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+            })
+            && parts.next().is_none();
+        ok.then(|| candidate.to_string())
     }
 }
