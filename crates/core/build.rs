@@ -1,18 +1,9 @@
 //! Derive the package version from git tags and commit messages at compile
 //! time.
 //!
-//! Bump rules (Conventional Commits), counted over the commits after the
-//! latest `vM.I.P` tag (or over all of history when no such tag exists):
-//! - `feat:` / `feat(scope):`          -> MINOR +1
-//! - `fix:`  / `fix(scope):`           -> PATCH +1
-//! - a `!` before the colon
-//!   (e.g. `feat!:`, `feat(api)!:`)    -> MAJOR +1
-//! - anything else (chore, refactor, docs, test, non-conventional subjects,
-//!   merge commits) does not bump the version.
-//!
-//! The resulting version is the plain `M.I.P`, and CI tags it `vM.I.P`.
-//! Legacy CI tags like `vM.I.P-g<hash>` are parsed the same as `vM.I.P`.
-//! Git unavailable / outside a git checkout -> the plain Cargo.toml version.
+//! The pure logic (Conventional-Commits bumping, tag/semver parsing, display
+//! formatting) lives in [`crate::version`] so `cargo test` can exercise it;
+//! this script only runs git and forwards the results to the compiler.
 //!
 //! Two env vars are exported to the crate:
 //! - `JOPLIN_RS_GIT_VERSION`: the plain `M.I.P` (what CI tags releases with)
@@ -21,92 +12,40 @@
 
 use std::process::Command;
 
+// Share the pure logic with the library crate: the build script is its own
+// crate, so `crate::version` would not resolve; include the same source file
+// directly (kept in sync via `cargo:rerun-if-changed` on the lib source).
+#[path = "src/version.rs"]
+mod version;
+
 fn main() {
     let cargo_version = env!("CARGO_PKG_VERSION");
-    let version = git_version(cargo_version).unwrap_or_else(|| cargo_version.to_string());
-    let display = version_display(&version, git(&["rev-parse", "--short=9", "HEAD"]).as_deref());
+    let tag = latest_version_tag();
+    let subjects = match &tag {
+        Some(tag) => git_log_subjects(Some(&format!("{tag}..HEAD"))),
+        None => git_log_subjects(None),
+    }
+    .unwrap_or_default();
+    let version = version::derive_version(cargo_version, tag.as_deref(), &subjects)
+        .unwrap_or_else(|| cargo_version.to_string());
+    let display = version::version_display(&version, git(&["rev-parse", "--short=9", "HEAD"]).as_deref());
     println!("cargo:rustc-env=JOPLIN_RS_GIT_VERSION={version}");
     println!("cargo:rustc-env=JOPLIN_RS_VERSION_DISPLAY={display}");
     // The build script runs with the crate dir (crates/core) as cwd, so
     // repo-relative paths like `.git/HEAD` would point at a nonexistent file
     // and never trigger a rebuild; anchor them at the repo root instead.
+    // Also rerun when the shared version logic changes.
+    println!("cargo:rerun-if-changed=src/version.rs");
     if let Some(root) = git(&["rev-parse", "--show-toplevel"]) {
         println!("cargo:rerun-if-changed={root}/.git/HEAD");
         println!("cargo:rerun-if-changed={root}/.git/refs");
     }
 }
 
-/// The human-facing `--version` string: `vM.I.P (<hash>)`, or just `vM.I.P`
-/// when there is no commit hash (outside a git checkout).
-///
-/// CI (`.github/workflows/release.yml`) strips this back down to the plain
-/// `M.I.P` with `sed -E 's/.* v([0-9]+\.[0-9]+\.[0-9]+).*/\1/'`; keep the
-/// format in sync with that expression.
-fn version_display(version: &str, hash: Option<&str>) -> String {
-    match hash {
-        Some(hash) => format!("v{version} ({hash})"),
-        None => format!("v{version}"),
-    }
-}
-
-fn git_version(cargo_version: &str) -> Option<String> {
-    let (major, minor, patch) = match latest_version_tag() {
-        Some(tag) => {
-            let base = parse_version_tag(&tag)?;
-            let subjects = git_log_subjects(Some(&format!("{tag}..HEAD")))?;
-            bump(base, &subjects)
-        }
-        None => {
-            let base = parse_semver(cargo_version)?;
-            let subjects = git_log_subjects(None)?;
-            bump(base, &subjects)
-        }
-    };
-
-    Some(format!("{major}.{minor}.{patch}"))
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Bump {
-    None,
-    Patch,
-    Minor,
-    Major,
-}
-
-/// Apply the bump implied by each commit subject onto a base `(M, I, P)`.
-fn bump(base: (u64, u64, u64), subjects: &[String]) -> (u64, u64, u64) {
-    let (mut major, mut minor, mut patch) = base;
-    for subject in subjects {
-        match classify(subject) {
-            Bump::Major => major += 1,
-            Bump::Minor => minor += 1,
-            Bump::Patch => patch += 1,
-            Bump::None => {}
-        }
-    }
-    (major, minor, patch)
-}
-
-/// Classify one commit subject per Conventional Commits.
-fn classify(subject: &str) -> Bump {
-    // Only the header matters: first line, up to the colon.
-    let header = subject.lines().next().unwrap_or("").trim();
-    let Some((kind, _)) = header.split_once(':') else {
-        return Bump::None;
-    };
-    let breaking = kind.ends_with('!');
-    let kind = kind.trim_end_matches('!');
-    let ty = kind.split('(').next().unwrap_or(kind).trim();
-    if breaking {
-        Bump::Major
-    } else if ty.eq_ignore_ascii_case("feat") {
-        Bump::Minor
-    } else if ty.eq_ignore_ascii_case("fix") {
-        Bump::Patch
-    } else {
-        Bump::None
-    }
+/// Latest tag matching `v<digit>...` (covers both `v0.2.0` and CI tags like
+/// `v0.1.46-g76a78f8`). Tags without the `v` prefix are ignored.
+fn latest_version_tag() -> Option<String> {
+    git(&["describe", "--tags", "--abbrev=0", "--match", "v[0-9]*"])
 }
 
 /// Subject lines of the commits in `range` (e.g. `v1.0.0..HEAD`), or of all
@@ -123,33 +62,6 @@ fn git_log_subjects(range: Option<&str>) -> Option<Vec<String>> {
             .filter(|s| !s.is_empty())
             .collect(),
     )
-}
-
-/// Latest tag matching `v<digit>...` (covers both `v0.2.0` and CI tags like
-/// `v0.1.46-g76a78f8`). Tags without the `v` prefix are ignored.
-fn latest_version_tag() -> Option<String> {
-    git(&["describe", "--tags", "--abbrev=0", "--match", "v[0-9]*"])
-}
-
-/// Parse `vM.I.P` or `vM.I.P-g<hash>` into `(M, I, P)`.
-fn parse_version_tag(tag: &str) -> Option<(u64, u64, u64)> {
-    let body = tag.strip_prefix('v')?;
-    // CI tags carry a `-g<hash>` prerelease-style suffix; strip it.
-    let semver_part = body.split_once("-g").map_or(body, |(v, _)| v);
-    parse_semver(semver_part)
-}
-
-fn parse_semver(v: &str) -> Option<(u64, u64, u64)> {
-    // Tolerate build metadata / prerelease suffixes on the Cargo version too.
-    let core = v.split(['+', '-']).next().unwrap_or(v);
-    let mut parts = core.split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    let patch = parts.next()?.parse().ok()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    Some((major, minor, patch))
 }
 
 fn git(args: &[&str]) -> Option<String> {
@@ -169,123 +81,4 @@ fn git_text(args: &[&str]) -> Option<String> {
         return None;
     }
     String::from_utf8(output.stdout).ok()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn classify_conventional_subjects() {
-        assert_eq!(classify("feat: new sync stage"), Bump::Minor);
-        assert_eq!(classify("feat(app): rounded icon"), Bump::Minor);
-        assert_eq!(classify("fix(sync): decode chunks"), Bump::Patch);
-        assert_eq!(classify("fix: utf8 boundary"), Bump::Patch);
-        assert_eq!(classify("feat!: rework config format"), Bump::Major);
-        assert_eq!(classify("feat(api)!: breaking change"), Bump::Major);
-        assert_eq!(classify("fix!: changed error contract"), Bump::Major);
-        assert_eq!(classify("chore: bump deps"), Bump::None);
-        assert_eq!(classify("refactor(cli): drop flag"), Bump::None);
-        assert_eq!(classify("docs: note it"), Bump::None);
-        assert_eq!(classify("test: add case"), Bump::None);
-        assert_eq!(classify("plain message without type"), Bump::None);
-        assert_eq!(classify("Merge branch 'feature'"), Bump::None);
-    }
-
-    #[test]
-    fn bump_counts_each_kind() {
-        let s = |x: &str| x.to_string();
-        let subjects = vec![
-            s("fix: a"),
-            s("fix: b"),
-            s("feat: c"),
-            s("chore: d"),
-            s("feat(app)!: e"),
-        ];
-        assert_eq!(bump((1, 0, 0), &subjects), (2, 1, 2));
-    }
-
-    #[test]
-    fn empty_range_keeps_base() {
-        assert_eq!(bump((1, 2, 3), &[]), (1, 2, 3));
-    }
-
-    #[test]
-    fn tag_and_semver_parsing() {
-        assert_eq!(parse_version_tag("v1.2.3"), Some((1, 2, 3)));
-        assert_eq!(parse_version_tag("v0.1.47-ge69647e"), Some((0, 1, 47)));
-        assert_eq!(parse_version_tag("1.2.3"), None);
-        assert_eq!(parse_semver("1.0.0"), Some((1, 0, 0)));
-        assert_eq!(parse_semver("1.2.3-rc.1"), Some((1, 2, 3)));
-        assert_eq!(parse_semver("1.2.3+meta"), Some((1, 2, 3)));
-    }
-
-    #[test]
-    fn display_format_with_and_without_hash() {
-        assert_eq!(
-            version_display("1.0.0", Some("b30d7ede3")),
-            "v1.0.0 (b30d7ede3)"
-        );
-        assert_eq!(version_display("1.0.0", None), "v1.0.0");
-        // A hash that itself starts with `v` must not confuse consumers.
-        assert_eq!(version_display("1.1.0", Some("va2751c")), "v1.1.0 (va2751c)");
-    }
-
-    /// The CI workflow resolves the release version from the binary's
-    /// `--version` output with a sed expression; the display format built
-    /// here must stay parseable by it. This test mirrors that expression.
-    #[test]
-    fn display_string_is_parseable_like_ci_sed() {
-        let sed_extract = |display: &str| -> String {
-            // Mirrors `sed -E 's/.* v([0-9]+\.[0-9]+\.[0-9]+).*/\1/'`.
-            let re = regex_lite_find_version(display);
-            re.expect("CI sed must find a version in the display string")
-        };
-        assert_eq!(sed_extract(&version_display("1.1.0", Some("a2751c434"))), "1.1.0");
-        assert_eq!(sed_extract(&version_display("1.1.0", None)), "1.1.0");
-        assert_eq!(
-            sed_extract(&version_display("1.1.0", Some("va2751c"))),
-            "1.1.0"
-        );
-    }
-
-    /// Minimal stand-in for the CI sed expression: find the LAST ` v` (sed's
-    /// leading `.*` is greedy) followed by `M.I.P` and capture the digits.
-    /// Deliberately written as a scan rather than a regex crate dependency
-    /// (build scripts should stay lean).
-    fn regex_lite_find_version(s: &str) -> Option<String> {
-        // CI sees `joplin-rs vM.I.P ...`; display strings built here start
-        // with `v`, so scan for `v` either at the start or after a space.
-        let mut starts = vec![0];
-        starts.extend(
-            s.match_indices(" v")
-                .filter(|(i, _)| *i > 0)
-                .map(|(i, _)| i + 1),
-        );
-        starts
-            .iter()
-            .rev()
-            .find_map(|i| semver_at(&s[*i..]))
-    }
-
-    /// If `s` starts with `M.I.P` (digits and dots), return it.
-    fn semver_at(s: &str) -> Option<String> {
-        let s = s.strip_prefix('v')?;
-        let end = s
-            .char_indices()
-            .find(|(_, c)| !c.is_ascii_digit() && *c != '.')
-            .map(|(i, _)| i)
-            .unwrap_or(s.len());
-        let candidate = &s[..end];
-        let mut parts = candidate.split('.');
-        let ok = [0, 0, 0]
-            .iter()
-            .all(|_| {
-                parts
-                    .next()
-                    .is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
-            })
-            && parts.next().is_none();
-        ok.then(|| candidate.to_string())
-    }
 }

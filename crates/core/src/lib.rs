@@ -24,6 +24,7 @@ pub mod secret;
 pub mod storage;
 pub mod sync;
 pub mod types;
+pub mod version;
 pub mod webdav;
 
 /// Current unix time in milliseconds.
