@@ -209,7 +209,7 @@ mod tests {
                 .filter(|(i, _)| *i > 0)
                 .map(|(i, _)| i + 1),
         );
-        starts.iter().rev().find_map(|i| semver_at(&s[*i..]))
+        starts.iter().rev().find_map(|&i| semver_at(&s[i..]))
     }
 
     /// If `s` starts with `M.I.P` (digits and dots), return it.
