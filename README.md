@@ -49,9 +49,11 @@ cargo build --release
 The build version is derived automatically from git (no manual Cargo.toml
 bumps):
 
-- Latest tag `vM.I.P`, N commits ahead of it -> `M.I.(P+N)+g<short-hash>`
-- No tag yet -> the Cargo.toml version with the total commit count added to
-  its patch component
+- Latest tag `vM.I.P`, with `feat`/`fix` commits after it -> `feat` bumps
+  the minor, `fix` bumps the patch, and a `!` (e.g. `feat!:`) bumps the
+  major; other commit types do not bump
+- No version tag yet -> the same bump rules applied over the whole history
+  on top of the Cargo.toml version
 - Outside a git checkout -> the plain Cargo.toml version
 
 `joplin-rs --version` and the GUI About panel report the same string,
