@@ -5,7 +5,7 @@ members = ["crates/core", "crates/cli", "crates/app"]
 [workspace.package]
 version = "1.0.0"
 edition = "2021"
-license = "MIT"
+license = "AGPL-3.0-only"
 
 [workspace.dependencies]
 joplin-rs-core = { path = "crates/core" }
