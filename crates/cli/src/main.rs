@@ -14,7 +14,7 @@ use toml::Value;
 #[derive(Parser)]
 #[command(
     name = "joplin-rs",
-    version = joplin_rs_core::GIT_VERSION,
+    version = joplin_rs_core::VERSION_DISPLAY,
     about = "Read-only Joplin client (WebDAV + E2EE)"
 )]
 struct Cli {

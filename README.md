@@ -54,7 +54,10 @@ bumps):
   its patch component
 - Outside a git checkout -> the plain Cargo.toml version
 
-`joplin-rs --version` and the GUI About panel report the same string.
+`joplin-rs --version` and the GUI About panel report the same string,
+`vX.Y.Z (<commit-hash>)` (the hash is omitted when built outside a git
+checkout). The hash is display-only: GitHub Release tags are the plain
+`vX.Y.Z` with no hash suffix.
 
 Every push to `master` is built for Linux, Windows and macOS (x64/arm64) and
 published as an official GitHub Release; CI creates the matching tag

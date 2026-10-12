@@ -5,8 +5,8 @@ mod read_password;
 #[cfg(target_os = "macos")]
 mod macos_about;
 
-/// App version, derived from git tags at compile time (see core::GIT_VERSION).
-const APP_VERSION: &str = joplin_rs_core::GIT_VERSION;
+/// Human-facing version (see core::VERSION_DISPLAY), e.g. `v1.0.0 (b30d7ede3)`.
+const APP_VERSION: &str = joplin_rs_core::VERSION_DISPLAY;
 
 use joplin_rs_core::items::Item;
 use joplin_rs_core::secret::LocalKey;

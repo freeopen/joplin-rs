@@ -13,15 +13,30 @@
 //! The resulting version is the plain `M.I.P`, and CI tags it `vM.I.P`.
 //! Legacy CI tags like `vM.I.P-g<hash>` are parsed the same as `vM.I.P`.
 //! Git unavailable / outside a git checkout -> the plain Cargo.toml version.
+//!
+//! Two env vars are exported to the crate:
+//! - `JOPLIN_RS_GIT_VERSION`: the plain `M.I.P` (what CI tags releases with)
+//! - `JOPLIN_RS_VERSION_DISPLAY`: what `--version` and the GUI About panel
+//!   show, e.g. `v1.0.0 (b30d7ede3)`; the hash is omitted outside git.
 
 use std::process::Command;
 
 fn main() {
     let cargo_version = env!("CARGO_PKG_VERSION");
     let version = git_version(cargo_version).unwrap_or_else(|| cargo_version.to_string());
+    let display = match git(&["rev-parse", "--short=9", "HEAD"]) {
+        Some(hash) => format!("v{version} ({hash})"),
+        None => format!("v{version}"),
+    };
     println!("cargo:rustc-env=JOPLIN_RS_GIT_VERSION={version}");
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    println!("cargo:rerun-if-changed=.git/refs");
+    println!("cargo:rustc-env=JOPLIN_RS_VERSION_DISPLAY={display}");
+    // The build script runs with the crate dir (crates/core) as cwd, so
+    // repo-relative paths like `.git/HEAD` would point at a nonexistent file
+    // and never trigger a rebuild; anchor them at the repo root instead.
+    if let Some(root) = git(&["rev-parse", "--show-toplevel"]) {
+        println!("cargo:rerun-if-changed={root}/.git/HEAD");
+        println!("cargo:rerun-if-changed={root}/.git/refs");
+    }
 }
 
 fn git_version(cargo_version: &str) -> Option<String> {
