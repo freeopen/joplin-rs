@@ -8,8 +8,6 @@
 //! Stage 2 is the E2EE decryption pass; it is triggered either automatically
 //! (a password is available) or after the user submits the prompt dialog.
 
-use std::sync::{Arc, Mutex};
-
 use crate::app::{
     AppState, DecryptSummary, JobChannel, JobEvent, Stage1Summary,
 };

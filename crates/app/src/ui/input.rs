@@ -361,20 +361,18 @@ impl gpui::Render for InputState {
     }
 }
 
-impl InputState {
-    /// Register the key bindings this input handles. Call once at startup.
-    pub fn register(cx: &mut App) {
-        cx.bind_keys([
-            KeyBinding::new("enter", Submit, Some("Input")),
-            KeyBinding::new("backspace", Backspace, Some("Input")),
-            KeyBinding::new("delete", Delete, Some("Input")),
-            KeyBinding::new("left", Left, Some("Input")),
-            KeyBinding::new("right", Right, Some("Input")),
-            KeyBinding::new("home", Home, Some("Input")),
-            KeyBinding::new("end", End, Some("Input")),
-            KeyBinding::new("cmd-a", SelectAll, Some("Input")),
-            KeyBinding::new("cmd-v", Paste, Some("Input")),
-            KeyBinding::new("cmd-c", Copy, Some("Input")),
-        ]);
-    }
+/// Register the key bindings this input handles. Call once at startup.
+pub fn register(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("enter", Submit, Some("Input")),
+        KeyBinding::new("backspace", Backspace, Some("Input")),
+        KeyBinding::new("delete", Delete, Some("Input")),
+        KeyBinding::new("left", Left, Some("Input")),
+        KeyBinding::new("right", Right, Some("Input")),
+        KeyBinding::new("home", Home, Some("Input")),
+        KeyBinding::new("end", End, Some("Input")),
+        KeyBinding::new("cmd-a", SelectAll, Some("Input")),
+        KeyBinding::new("cmd-v", Paste, Some("Input")),
+        KeyBinding::new("cmd-c", Copy, Some("Input")),
+    ]);
 }

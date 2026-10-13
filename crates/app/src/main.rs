@@ -1,8 +1,20 @@
-//! joplin-rs GUI: read-only note browser (egui).
+//! joplin-rs GUI: read-only note browser.
+//!
+//! Two coexisting frontends during the migration:
+//! - default: the original egui/eframe UI (main.rs body below)
+//! - `gpui-view`: the GPUI root view (view.rs) + widgets (ui/), launched
+//!   by `gpui_main()` behind the feature flag
 
 mod read_password;
+
+#[cfg(feature = "gpui-view")]
+mod app;
+#[cfg(feature = "gpui-view")]
+mod jobs;
 #[cfg(feature = "gpui-view")]
 mod ui;
+#[cfg(feature = "gpui-view")]
+mod view;
 
 #[cfg(target_os = "macos")]
 mod macos_about;
