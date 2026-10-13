@@ -113,7 +113,7 @@ match highest:
 3. 版本不变（本次 push 无 feat/fix）：tag 已存在，跳过发布，避免把新产物挂到旧提交的 tag 上。
 4. 人工 push `vX.Y.Z` tag：Release 直接绑定该 tag。
 
-`version_logic.rs` 中的 `display_string_is_parseable_like_ci_sed` 测试与这条 sed 表达式一一对应，保证显示格式永远可被 CI 解析。
+`src/version.rs` 中的 `display_string_is_parseable_like_ci_sed` 测试与这条 sed 表达式一一对应，保证显示格式永远可被 CI 解析。
 
 ## 8. 验证
 
