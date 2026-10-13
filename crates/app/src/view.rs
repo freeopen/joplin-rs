@@ -72,6 +72,44 @@ impl NoteBrowser {
         });
         let gate_input = cx.new(|cx| InputState::new(cx).placeholder("阅读密码"));
 
+        // Poll the job channel on a 150ms tick: worker progress lines and
+        // finished events arrive through shared mutexes, the UI thread
+        // applies them here and calls cx.notify(). Replaces egui's
+        // per-frame handle_job_event + ctx.request_repaint loop.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(150))
+                    .await;
+                let this = this.upgrade();
+                let Some(this) = this else { return };
+                this.update(cx, |this, cx| {
+                    // Mirror live worker progress into the status line.
+                    this.state.update(cx, |s, _| {
+                        let worker = s.jobs.worker_status();
+                        if !worker.is_empty() {
+                            s.status = worker;
+                        }
+                        let _ = s.handle_job_event();
+                    });
+                    // Auto-start the decrypt pass when a stored password is
+                    // available (mirrors the egui flow's auto-continue).
+                    this.state.update(cx, |s, _| jobs::after_sync_done(s));
+                    this.sync_dialog_from_state(cx);
+                    // Search-as-you-type: reload when the input changed.
+                    let text = this.search_input.read(cx).value().to_string();
+                    this.state.update(cx, |s, _| {
+                        if s.search != text {
+                            s.search = text.clone();
+                            s.load_notes();
+                        }
+                    });
+                    cx.notify();
+                });
+            }
+        })
+            .detach();
+
         Self {
             state,
             search_input,
