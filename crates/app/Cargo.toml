@@ -11,19 +11,31 @@ path = "src/main.rs"
 [dependencies]
 joplin-rs-core = { workspace = true }
 tokio = { workspace = true }
-eframe = { version = "0.32", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
-egui = "0.32"
-egui_commonmark = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 dirs = { workspace = true }
 tracing = { workspace = true }
+rand = { workspace = true }
 pbkdf2 = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
-rand = { workspace = true }
+# 旧 egui 视图层（main.rs 仍在引用）：GPUI 视图重写完成后整体移除。
+eframe = { version = "0.32", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.32"
+egui_commonmark = { workspace = true }
+# Zed 官方发布的 GPUI（crates.io）。macOS 部署目标 11.0（Big Sur）下编译验证：
+# objc2/cocoa 的 availability 检查在编译期兜底，误用 12+ API 会直接报错。
+# runtime_shaders 供无完整 Xcode 的开发机编译（运行时编译 shader）；
+# 正式发布构建需 Xcode 的 metal 编译器产出预编译 metallib，不开此 feature。
+gpui = { version = "=0.2.2", optional = true }
+
+[features]
+default = []
+# 本机无 Xcode（CLT 不含 metal 编译器）时的开发用途。
+spike-runtime-shaders = ["gpui/runtime_shaders"]
+gpui-view = ["dep:gpui"]
 
 # Native macOS menu bar / About panel / rounded dock icon.
 [target.'cfg(target_os = "macos")'.dependencies]
