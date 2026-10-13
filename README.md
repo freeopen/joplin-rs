@@ -30,13 +30,14 @@ A read-only Joplin client written in Rust:
 - Search: multi-word AND search over title+body (CLI `search` and GUI),
   with notebook/tag/todo filters (`--folder`, `--tag`, `--todo`,
   `--completed`), snippets (`--snippets`) and JSON output (`--json`)
-- GUI (egui): notebook list, note list (todos/tags), full-text search,
-  Markdown rendering (GFM via egui_commonmark) with decrypted resource
-  images, two-stage sync (download first with live status, then a separate
-  E2EE decryption pass; notes without a password stay in the list as locked
-  placeholders), rounded macOS Joplin app icon (dock/window) and About via
-  the native app-name menu (in-window app menu on other platforms),
-  optional reading password that locks the app on every launch
+- GUI (gpui-kit / Zed GPUI): notebook list, note list (todos/tags),
+  full-text search, Markdown rendering (GFM tables/task lists/code blocks,
+  text selection) with decrypted resource images, two-stage sync (download
+  first with live status, then a separate E2EE decryption pass; notes
+  without a password stay in the list as locked placeholders), rounded
+  macOS Joplin app icon (dock/window) and About via the native app-name
+  menu (in-window About on other platforms), optional reading password
+  that gates notes marked as protected
 
 ## Build
 
@@ -49,9 +50,10 @@ cargo build --release
 The build version is derived automatically from git (no manual Cargo.toml
 bumps):
 
-- Latest tag `vM.I.P`, with `feat`/`fix` commits after it -> `feat` bumps
-  the minor, `fix` bumps the patch, and a `!` (e.g. `feat!:`) bumps the
-  major; other commit types do not bump
+- Latest tag `vM.I.P`, with `feat`/`fix` commits after it -> the strongest
+  level applies exactly once, release-style: `feat` -> minor (patch resets),
+  `fix` -> patch, and a `!` (e.g. `feat!:`) -> major (minor and patch reset);
+  other commit types do not bump, and no bump at all skips the release
 - No version tag yet -> the same bump rules applied over the whole history
   on top of the Cargo.toml version
 - Outside a git checkout -> the plain Cargo.toml version
@@ -124,11 +126,9 @@ cargo run -p joplin-rs-app
 
 Same config file. Press **Sync** to download; click a note to render it.
 
-The GUI uses one system CJK-capable font (PingFang/Hiragino on macOS,
-Noto/WenQuanYi on Linux, Microsoft YaHei/SimHei on Windows) for both Latin
-and CJK text, so mixed-script lines share a single baseline. egui's
-bundled font is kept only as a fallback. Set
-`JOPLIN_RS_FONT=/path/to/font.ttf` to force a specific font.
+The GUI renders text with the system UI font (PingFang on macOS) and falls
+back through the platform font stack for CJK. Set
+`JOPLIN_RS_FONT=/path/to/font.ttf` to force a specific font family.
 
 ## Supported sync-target format
 

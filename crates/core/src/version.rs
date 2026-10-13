@@ -35,26 +35,34 @@ pub fn version_display(version: &str, hash: Option<&str>) -> String {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Bump {
+    // Declaration order is the severity order: None < Patch < Minor < Major.
     None,
     Patch,
     Minor,
     Major,
 }
 
-/// Apply the bump implied by each commit subject onto a base `(M, I, P)`.
+/// Apply the strongest bump found in `subjects` onto a base `(M, I, P)`,
+/// release-style: only the highest level applies, exactly once, and lower
+/// components reset to zero (Major -> `(M+1, 0, 0)`, Minor -> `(M, I+1, 0)`,
+/// Patch -> `(M, I, P+1)`, None -> unchanged). This matches the default
+/// behavior of semantic-release / commitizen rather than accumulating every
+/// commit individually.
 fn bump(base: (u64, u64, u64), subjects: &[String]) -> (u64, u64, u64) {
-    let (mut major, mut minor, mut patch) = base;
-    for subject in subjects {
-        match classify(subject) {
-            Bump::Major => major += 1,
-            Bump::Minor => minor += 1,
-            Bump::Patch => patch += 1,
-            Bump::None => {}
-        }
+    let highest = subjects
+        .iter()
+        .map(|s| classify(s))
+        .max()
+        .unwrap_or(Bump::None);
+    let (major, minor, patch) = base;
+    match highest {
+        Bump::Major => (major + 1, 0, 0),
+        Bump::Minor => (major, minor + 1, 0),
+        Bump::Patch => (major, minor, patch + 1),
+        Bump::None => base,
     }
-    (major, minor, patch)
 }
 
 /// Classify one commit subject per Conventional Commits.
@@ -121,8 +129,9 @@ mod tests {
     }
 
     #[test]
-    fn bump_counts_each_kind() {
+    fn bump_applies_highest_level_once_and_resets() {
         let s = |x: &str| x.to_string();
+        // `!` outranks everything and applies once: major bump, lower digits reset.
         let subjects = vec![
             s("fix: a"),
             s("fix: b"),
@@ -130,7 +139,19 @@ mod tests {
             s("chore: d"),
             s("feat(app)!: e"),
         ];
-        assert_eq!(bump((1, 0, 0), &subjects), (2, 1, 2));
+        assert_eq!(bump((1, 0, 0), &subjects), (2, 0, 0));
+        // Minor wins over patch, patch resets.
+        let subjects = vec![s("fix: a"), s("feat: b")];
+        assert_eq!(bump((1, 4, 2), &subjects), (1, 5, 0));
+        // Repeated feat still only bumps minor once.
+        let subjects = vec![s("feat: a"), s("feat: b")];
+        assert_eq!(bump((1, 4, 2), &subjects), (1, 5, 0));
+        // Repeated fix still only bumps patch once.
+        let subjects = vec![s("fix: a"), s("fix: b")];
+        assert_eq!(bump((1, 4, 2), &subjects), (1, 4, 3));
+        // No feat/fix in the range keeps the base (release skipped).
+        let subjects = vec![s("chore: x"), s("docs: y")];
+        assert_eq!(bump((1, 4, 2), &subjects), (1, 4, 2));
     }
 
     #[test]
@@ -154,7 +175,7 @@ mod tests {
         // Tag path: bumps count only after the tag.
         assert_eq!(
             derive_version("9.9.9", Some("v1.0.0"), &[s("feat: a"), s("fix: b")]),
-            Some("1.1.1".to_string())
+            Some("1.1.0".to_string())
         );
         // No tag: bumps count over the Cargo.toml base.
         assert_eq!(
@@ -163,6 +184,50 @@ mod tests {
         );
         // Unparseable tag -> falls back to None (build.rs then uses Cargo).
         assert_eq!(derive_version("1.0.0", Some("not-a-tag"), &[]), None);
+    }
+
+    /// Mirrors the worked examples in `docs/versioning.md` §6 end to end.
+    #[test]
+    fn docs_examples() {
+        let s = |x: &str| x.to_string();
+        // Base tag `v1.4.2`:
+        assert_eq!(
+            derive_version("9.9.9", Some("v1.4.2"), &[s("fix: a")]),
+            Some("1.4.3".to_string())
+        );
+        assert_eq!(
+            derive_version("9.9.9", Some("v1.4.2"), &[s("fix: a"), s("fix: b")]),
+            Some("1.4.3".to_string())
+        );
+        assert_eq!(
+            derive_version("9.9.9", Some("v1.4.2"), &[s("feat: a"), s("fix: b")]),
+            Some("1.5.0".to_string())
+        );
+        assert_eq!(
+            derive_version("9.9.9", Some("v1.4.2"), &[s("feat: a"), s("feat: b")]),
+            Some("1.5.0".to_string())
+        );
+        assert_eq!(
+            derive_version("9.9.9", Some("v1.4.2"), &[s("feat!: breaking change")]),
+            Some("2.0.0".to_string())
+        );
+        assert_eq!(
+            derive_version("9.9.9", Some("v1.4.2"), &[s("fix: a"), s("feat!: b")]),
+            Some("2.0.0".to_string())
+        );
+        assert_eq!(
+            derive_version("9.9.9", Some("v1.4.2"), &[s("chore: x"), s("docs: y")]),
+            Some("1.4.2".to_string())
+        );
+        // No tag yet: full history over the Cargo.toml base.
+        let history: Vec<String> = (0..6)
+            .map(|i| s(&format!("feat: feature {i}")))
+            .chain((0..12).map(|i| s(&format!("fix: fix {i}"))))
+            .collect();
+        assert_eq!(
+            derive_version("1.0.0", None, &history),
+            Some("1.1.0".to_string())
+        );
     }
 
     #[test]
