@@ -47,6 +47,13 @@ pub struct NoteBrowser {
     dialog: Option<Entity<DialogState>>,
     /// Dialog the state machine wants shown (mirrors app::Dialog).
     pending_dialog: Dialog,
+    /// Reader-password settings form fields (rebuilt on each open, mirroring
+    /// the egui dialog lifecycle; values stay in AppState).
+    rp_current: Option<Entity<InputState>>,
+    rp_new: Option<Entity<InputState>>,
+    rp_confirm: Option<Entity<InputState>>,
+    /// E2EE prompt password field (session-only; never persisted).
+    e2ee_field: Option<Entity<InputState>>,
     focus: FocusHandle,
 }
 
@@ -116,6 +123,10 @@ impl NoteBrowser {
             gate_input,
             dialog: None,
             pending_dialog: Dialog::None,
+            rp_current: None,
+            rp_new: None,
+            rp_confirm: None,
+            e2ee_field: None,
             focus: cx.focus_handle(),
         }
     }
@@ -140,26 +151,100 @@ impl NoteBrowser {
     /// ReaderPasswordSettings embeds the 3-field form (current/new/confirm);
     /// E2eePrompt embeds one password field. Fields live in AppState so the
     /// logic layer owns validation and persistence, exactly like the egui UI.
+    /// Rebuild the modal layer from the state machine's dialog flag. Form
+    /// fields are fresh entities on each open (the egui dialog lifecycle);
+    /// their values live in AppState so the logic layer owns validation and
+    /// persistence exactly as before.
+    fn collect_rp_inputs(&mut self, cx: &mut Context<Self>) {
+        let read = |e: &Option<Entity<InputState>>| -> String {
+            e.as_ref().map(|e| e.read(cx).value().to_string()).unwrap_or_default()
+        };
+        let (cur, new, confirm) = (
+            read(&self.rp_current),
+            read(&self.rp_new),
+            read(&self.rp_confirm),
+        );
+        self.state.update(cx, |s, _| {
+            s.rp_current = cur;
+            s.rp_new = new;
+            s.rp_confirm = confirm;
+        });
+    }
+
     fn sync_dialog_from_state(&mut self, cx: &mut Context<Self>) {
         let want = self.state.read(cx).dialog;
         self.pending_dialog = want;
         self.dialog = match want {
-            Dialog::None => None,
-            Dialog::ReaderPasswordSettings => Some(cx.new(|_| {
-                DialogState::new(
-                    "阅读密码设置",
-                    move |action, _cx| {
-                        let _ = action;
+            Dialog::None => {
+                self.rp_current = None;
+                self.rp_new = None;
+                self.rp_confirm = None;
+                self.e2ee_field = None;
+                None
+            }
+            Dialog::ReaderPasswordSettings => {
+                let current = cx.new(|cx| InputState::new(cx).placeholder("当前密码"));
+                let new = cx.new(|cx| InputState::new(cx).placeholder("新密码"));
+                let confirm = cx.new(|cx| InputState::new(cx).placeholder("确认新密码"));
+                self.rp_current = Some(current.clone());
+                self.rp_new = Some(new.clone());
+                self.rp_confirm = Some(confirm.clone());
+                let browser = cx.entity().downgrade();
+                let has_password = self.state.read(cx).has_reader_password();
+                let fields = vec![
+                    form_row("当前密码", current),
+                    form_row("新密码", new),
+                    form_row("确认新密码", confirm),
+                    if has_password {
+                        hint_line("输入当前密码验证后修改；留空当前密码则视为取消")
+                    } else {
+                        hint_line("尚未设置阅读密码；新密码即为初始密码")
                     },
-                )
-            })),
-            Dialog::E2eePrompt => Some(cx.new(|_| {
-                DialogState::new("E2EE 密码", move |_action, _cx| {})
-            })),
+                    dialog_actions(
+                        "确定",
+                        has_password.then_some("移除密码"),
+                        Some("取消"),
+                        browser.clone(),
+                        DialogKind::ReaderPassword,
+                    ),
+                ];
+                Some(cx.new(|_| {
+                    DialogState::new("阅读密码设置", move |_action, _cx| {})
+                        .with_body(fields)
+                }))
+            }
+            Dialog::E2eePrompt => {
+                let pending = self.state.read(cx).e2ee_pending_count;
+                let input = cx.new(|cx| InputState::new(cx).placeholder("E2EE 主密码"));
+                self.e2ee_field = Some(input.clone());
+                let browser = cx.entity().downgrade();
+                let fields = vec![
+                    hint_line(&format!(
+                        "{pending} 项已加密，输入 E2EE 主密码解密（仅本次会话使用）"
+                    )),
+                    form_row("密码", input),
+                    dialog_actions("解密", None, Some("取消"), browser, DialogKind::E2ee),
+                ];
+                Some(cx.new(|_| {
+                    DialogState::new("E2EE 密码", move |_action, _cx| {}).with_body(fields)
+                }))
+            }
             #[cfg(not(target_os = "macos"))]
-            Dialog::About => Some(cx.new(|_| {
-                DialogState::new("About joplin-rs", move |_action, _cx| {})
-            })),
+            Dialog::About => {
+                let browser = cx.entity().downgrade();
+                Some(cx.new(|_| {
+                    DialogState::new("About joplin-rs", move |_action, _cx| {}).with_body(vec![
+                        div().text_size(px(16.)).font_weight(gpui::FontWeight::BOLD)
+                            .child("joplin-rs").into_any_element(),
+                        div().text_color(rgb(0x71717a))
+                            .child(SharedString::from(crate::APP_VERSION)).into_any_element(),
+                        div().text_color(rgb(0x71717a))
+                            .child("应用图标为 Joplin 官方图标，版权归 Joplin 项目所有")
+                            .into_any_element(),
+                        dialog_actions("关闭", None, None, browser, DialogKind::None),
+                    ])
+                }))
+            }
         };
     }
 }
@@ -554,6 +639,158 @@ impl AppState {
     /// Placeholder hook kept for on_action wiring; real logic lives in
     /// jobs::start_download which takes &mut AppState directly.
     pub(crate) fn request_sync_marker(&mut self) {}
+}
+
+#[derive(Clone, Copy)]
+enum DialogKind {
+    ReaderPassword,
+    E2ee,
+    #[allow(dead_code)]
+    None,
+}
+
+/// Confirm / optional-destructive / cancel row. Buttons drive the parent
+/// NoteBrowser via a weak entity so there is no retain cycle.
+fn dialog_actions(
+    primary: &'static str,
+    destructive: Option<&'static str>,
+    cancel: Option<&'static str>,
+    browser: gpui::WeakEntity<NoteBrowser>,
+    kind: DialogKind,
+) -> gpui::AnyElement {
+    let mut row = div().flex().justify_end().gap_2();
+    if let Some(label) = cancel {
+        let browser = browser.clone();
+        row = row.child(
+            div()
+                .id("dlg-cancel")
+                .px_3()
+                .py_1()
+                .rounded_sm()
+                .border_1()
+                .border_color(rgb(BORDER))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(0xf4f4f5)))
+                .child(label)
+                .on_click(move |_, _, cx| {
+                    browser
+                        .update(cx, |view, cx| {
+                            view.state.update(cx, |s, _| s.dialog = Dialog::None);
+                            view.sync_dialog_from_state(cx);
+                            cx.notify();
+                        })
+                        .ok();
+                }),
+        );
+    }
+    if let Some(label) = destructive {
+        let browser = browser.clone();
+        row = row.child(
+            div()
+                .id("dlg-cancel")
+                .px_3()
+                .py_1()
+                .rounded_sm()
+                .border_1()
+                .border_color(rgb(0xdc2626))
+                .text_color(rgb(0xdc2626))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(0xfef2f2)))
+                .child(label)
+                .on_click(move |_, _, cx| {
+                    browser
+                        .update(cx, |view, cx| {
+                            view.collect_rp_inputs(cx);
+                            view.state.update(cx, |s, _| s.remove_reader_pw());
+                            s_close(view, cx);
+                        })
+                        .ok();
+                }),
+        );
+    }
+    {
+        let browser = browser.clone();
+        row = row.child(
+            div()
+                .id("dlg-cancel")
+                .px_3()
+                .py_1()
+                .rounded_sm()
+                .bg(rgb(0x2563eb))
+                .text_color(white())
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(0x1d4ed8)))
+                .child(primary)
+                .on_click(move |_, _, cx| match kind {
+                    DialogKind::ReaderPassword => {
+                        browser
+                            .update(cx, |view, cx| {
+                                view.collect_rp_inputs(cx);
+                                view.state.update(cx, |s, _| s.submit_reader_pw());
+                                if view.state.read(cx).rp_error.is_none() {
+                                    s_close(view, cx);
+                                }
+                                cx.notify();
+                            })
+                            .ok();
+                    }
+                    DialogKind::E2ee => {
+                        browser
+                            .update(cx, |view, cx| {
+                                if let Some(field) = &view.e2ee_field {
+                                    let text = field.read(cx).value().to_string();
+                                    view.state.update(cx, |s, _| s.e2ee_input = text);
+                                }
+                                view.state.update(cx, |s, _| s.submit_e2ee_prompt());
+                                let want_dialog = view.state.read(cx).dialog;
+                                if want_dialog == Dialog::None {
+                                    view.state
+                                        .update(cx, |s, _| jobs::start_decrypt(s));
+                                    s_close(view, cx);
+                                }
+                                cx.notify();
+                            })
+                            .ok();
+                    }
+                    DialogKind::None => {
+                        browser
+                            .update(cx, |view, cx| s_close(view, cx))
+                            .ok();
+                    }
+                }),
+        );
+    }
+    row.into_any_element()
+}
+
+fn s_close(view: &mut NoteBrowser, cx: &mut Context<NoteBrowser>) {
+    view.state.update(cx, |s, _| s.dialog = Dialog::None);
+    view.sync_dialog_from_state(cx);
+}
+
+/// One labeled form row for dialogs (label left, field right).
+fn form_row(label: &str, field: Entity<InputState>) -> gpui::AnyElement {
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .w(px(96.))
+                .text_color(rgb(0x52525b))
+                .child(SharedString::from(label.to_string())),
+        )
+        .child(field)
+        .into_any_element()
+}
+
+/// Muted hint line under a dialog form.
+fn hint_line(text: &str) -> gpui::AnyElement {
+    div()
+        .text_size(px(12.))
+        .text_color(rgb(0x71717a))
+        .child(SharedString::from(text.to_string()))
+        .into_any_element()
 }
 
 /// GPUI entry point behind the `gpui-view` feature. The default binary
