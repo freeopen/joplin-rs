@@ -126,6 +126,24 @@ mod tests {
         assert_eq!(classify("test: add case"), Bump::None);
         assert_eq!(classify("plain message without type"), Bump::None);
         assert_eq!(classify("Merge branch 'feature'"), Bump::None);
+        // §4 details: type name is case-insensitive, empty type is None,
+        // only the first line (header) participates, scope contents are
+        // ignored, and a bare `!` with an empty type still counts as breaking.
+        assert_eq!(classify("FEAT: uppercase type"), Bump::Minor);
+        assert_eq!(classify("Fix(UI): mixed case"), Bump::Patch);
+        assert_eq!(classify(": no type before colon"), Bump::None);
+        assert_eq!(classify("!: empty type but breaking"), Bump::Major);
+        assert_eq!(classify("feat(extra:colon): scope text"), Bump::Minor);
+        assert_eq!(
+            classify("feat: header\n\nfeat: body line that must be ignored"),
+            Bump::Minor
+        );
+        assert_eq!(
+            classify("chore: header\nfeat: body line must not bump"),
+            Bump::None
+        );
+        assert_eq!(classify("feat trailing no colon after type"), Bump::None);
+        assert_eq!(classify(""), Bump::None);
     }
 
     #[test]

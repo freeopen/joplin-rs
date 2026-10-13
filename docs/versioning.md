@@ -1,6 +1,6 @@
 # 发布式重置的版本号生成逻辑
 
-> 实现位置：`crates/common/build.rs`（git 编排）+ `crates/common/src/version_logic.rs`（纯逻辑，可被 `cargo test` 覆盖）
+> 实现位置：`crates/core/build.rs`（git 编排）+ `crates/core/src/version.rs`（纯逻辑，可被 `cargo test` 覆盖）
 > 发布流水线：`.github/workflows/release.yml`
 
 本项目的版本号**不写死在 `Cargo.toml`**，而是在**编译期从 git 推导**：
@@ -16,22 +16,22 @@ X.Y.Z = 最近一个 vM.I.P tag（或 Cargo.toml 基线）
 
 ```
 CARGO_PKG_VERSION ─┐
-                   ├─→ derive_version() ─→ "M.I.P" ─┬─→ XRAY_GIT_VERSION
+                   ├─→ derive_version() ─→ "M.I.P" ─┬─→ JOPLIN_RS_GIT_VERSION
 latest tag ────────┤                                │
-                   │                                └─→ version_display() ─→ XRAY_VERSION_DISPLAY
+                   │                                └─→ version_display() ─→ JOPLIN_RS_VERSION_DISPLAY
 tag..HEAD 的提交 ──┘                                      = "vM.I.P (<hash9>)"
 ```
 
 - `build.rs` 只做三件事：跑 git、把结果交给纯逻辑、导出两个环境变量。
-- 纯逻辑放在 `version_logic.rs`，build script 通过 `#[path]` 复用同一份源码，以便 `cargo test` 能覆盖（build script 自己的 `#[cfg(test)]` 不会运行）。
-- `cargo:rerun-if-changed` 监听 `src/version_logic.rs`、`.git/HEAD`、`.git/refs`（锚在仓库根，因为 build script 的 cwd 是 crate 目录）。
+- 纯逻辑放在 `src/version.rs`，build script 通过 `#[path]` 复用同一份源码，以便 `cargo test` 能覆盖（build script 自己的 `#[cfg(test)]` 不会运行）。
+- `cargo:rerun-if-changed` 监听 `src/version.rs`、`.git/HEAD`、`.git/refs`（锚在仓库根，因为 build script 的 cwd 是 crate 目录）。
 
 ## 2. 环境变量契约
 
 | 变量 | 内容 | 用途 |
 | --- | --- | --- |
-| `XRAY_GIT_VERSION` | 纯 `M.I.P`，无 `v` 前缀、无 hash | CI 用它建 tag |
-| `XRAY_VERSION_DISPLAY` | `vM.I.P (<hash9>)`，非 git 环境省略 `(hash)` | `--version` 显示 |
+| `JOPLIN_RS_GIT_VERSION` | 纯 `M.I.P`，无 `v` 前缀、无 hash | CI 用它建 tag |
+| `JOPLIN_RS_VERSION_DISPLAY` | `vM.I.P (<hash9>)`，非 git 环境省略 `(hash)` | `--version` 显示 |
 
 - 不在 git 仓库里：tag 与 hash 都拿不到，`--version` 直接显示 `v{CARGO_PKG_VERSION}`，无 hash。
 - 解析失败：`derive_version` 返回 `None`，`build.rs` 回退成裸 `CARGO_PKG_VERSION`（**不做任何 bump**）。
@@ -118,19 +118,19 @@ match highest:
 ## 8. 验证
 
 ```bash
-# 单元测试（含 reset 语义与 CI-sed 契约）
-cargo test -p xray-common version_logic
+# 单元测试（含 reset 语义、§4 边界与 CI-sed 契约）
+cargo test -p joplin-rs-core version
 
 # 查看当前推导结果
-cargo run -p xray-cli --bin xray-client -- --version
-# -> xray-client vM.I.P (<hash9>)
+cargo run -p joplin-rs-cli -- --version
+# -> joplin-rs vM.I.P (<hash9>)
 
 # 模拟 CI 解析（应输出纯 X.Y.Z，无 v 前缀）
-./target/debug/xray-client --version | sed -E 's/.* v([0-9]+\.[0-9]+\.[0-9]+).*/\1/'
+cargo run -q -p joplin-rs-cli -- --version | sed -E 's/.* v([0-9]+\.[0-9]+\.[0-9]+).*/\1/'
 ```
 
-## 9. 与 joplin-rs 的差异（有意为之）
+## 9. 与 xray 上游方案的差异
 
-- ~~本方案把 `bump` 从"逐条累加"改成"发布式重置"（`1.6.12` → `1.1.0`）；joplin-rs 的当前实现仍是逐条累加。~~ joplin-rs 已采用同款发布式重置语义（`crates/core/src/version.rs` 的 `bump`），并有与本文 §5/§6 例子一一对应的单元测试（`bump_applies_highest_level_once_and_resets`、`docs_examples`）。
-- 变量命名不同：本文示例用 `XRAY_GIT_VERSION` / `XRAY_VERSION_DISPLAY`，joplin-rs 对应为 `JOPLIN_RS_GIT_VERSION` / `JOPLIN_RS_VERSION_DISPLAY`。
+- 本方案把 `bump` 从"逐条累加"改成"发布式重置"（`1.6.12` → `1.1.0`）；joplin-rs 已采用同款发布式重置语义（`crates/core/src/version.rs` 的 `bump`），并有与本文 §4/§5/§6 例子一一对应的单元测试（`classify_conventional_subjects`、`bump_applies_highest_level_once_and_resets`、`docs_examples`）。
+- 变量命名沿用 joplin-rs 约定：`JOPLIN_RS_GIT_VERSION` / `JOPLIN_RS_VERSION_DISPLAY`。
 - 其余契约保持一致：`#[path]` 共享纯逻辑、`-g<hash>` tag 解析、双环境变量、`rerun-if-changed` 锚定仓库根。
