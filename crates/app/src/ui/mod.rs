@@ -5,5 +5,6 @@
 //! Zed's official gpui examples; implementations here target gpui 0.2.2
 //! directly with no gpui-kit dependency.
 
+pub mod dialog;
 pub mod input;
 pub mod markdown;
