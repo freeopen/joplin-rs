@@ -123,6 +123,10 @@ mod tests {
         assert_eq!(classify("feat!: rework config format"), Bump::Major);
         assert_eq!(classify("feat(api)!: breaking change"), Bump::Major);
         assert_eq!(classify("fix!: changed error contract"), Bump::Major);
+        // Scoped breaking markers keep their type; only a truly empty type
+        // loses the breaking escalation (see the empty-type case below).
+        assert_eq!(classify("feat(app)!: scoped breaking"), Bump::Major);
+        assert_eq!(classify("feat!: breaking"), Bump::Major);
         assert_eq!(classify("chore: bump deps"), Bump::None);
         assert_eq!(classify("refactor(cli): drop flag"), Bump::None);
         assert_eq!(classify("docs: note it"), Bump::None);
