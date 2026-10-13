@@ -687,7 +687,6 @@ impl AppState {
         let Some(event) = self.jobs.take_event() else {
             return false;
         };
-        let mut changed = false;
         match event {
             JobEvent::SyncDone(result) => match result {
                 Ok((summary, pending)) => {
@@ -708,11 +707,11 @@ impl AppState {
                         self.e2ee_prompt_error = None;
                         self.dialog = Dialog::E2eePrompt;
                     }
-                    changed = true;
+                    return true;
                 }
                 Err(e) => {
                     self.set_status(format!("同步失败: {e}"));
-                    changed = true;
+                    return true;
                 }
             },
             JobEvent::DecryptDone(result) => {
@@ -749,10 +748,9 @@ impl AppState {
                         }
                     }
                 }
-                changed = true;
+                true
             }
         }
-        changed
     }
 
     pub fn set_status(&mut self, text: String) {
