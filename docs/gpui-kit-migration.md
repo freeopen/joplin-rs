@@ -143,7 +143,7 @@ if let Ok(bytes) = std::fs::read(&font_path) {          // JOPLIN_RS_FONT 指定
 **构建配置**
 
 - `.cargo/config.toml` 的 `[profile.dev.package]` 包名需按 gpui-pre 家族改名（gpui-pre、gpui-pre-macros、gpui-pre-platform、gpui-pre-wgpu、naga、cosmic-text、taffy、rustybuzz、ttf-parser、lyon、image 等），首次编译后按 Cargo.lock 实际包名补齐。
-- `MACOSX_DEPLOYMENT_TARGET=11.0` 保留：gpui-pre 家族同样走 objc2/cocoa availability 编译期检查。
+- `MACOSX_DEPLOYMENT_TARGET=11.0` 保留。**已核实 gpui-pre 0.3.9 支持 Big Sur**（2026-10-13，方法与证据见 §7.7）。
 - runtime_shaders：gpui-kit 的 platform 依赖默认带 `runtime_shaders`，无 Xcode metal 编译器的开发机可直接 `cargo build --features gpui-view`，现 `spike-runtime-shaders` feature 可删除。正式发布需预编译 metallib 时再评估（见 §7 风险）。
 
 ## 4. 迁移步骤（每步独立提交，全程 `--features gpui-view`）
@@ -244,6 +244,30 @@ if let Ok(bytes) = std::fs::read(&font_path) {          // JOPLIN_RS_FONT 指定
 4. **字体 panic 面**：任何写死的、目标机器没有的 family 都会 panic；所有 family 选择必须经过 `all_font_names()` 探测。
 5. **版本锁定**：GPUI 家族 `=0.3.9` 联动发布，后续升级是整族操作。
 6. **Windows 未知项**：gpui-pre 在 Windows 的路径（DirectX/wgpu、输入法）未经本机验证，靠 CI 产物回归。
+
+### 7.7 macOS Big Sur (11.0) 支持核实（2026-10-13）
+
+结论：**gpui-pre 0.3.9 没有不支持 macOS Big Sur**，`MACOSX_DEPLOYMENT_TARGET=11.0` 原样保留。
+
+三方面证据：
+
+1. **编译期探针（决定性）**：临时工程依赖 gpui-pre / gpui-pre-platform（`runtime_shaders`）/
+   gpui-pre-apple / gpui-pre-macos 全家族，`MACOSX_DEPLOYMENT_TARGET=11.0 cargo check
+   --target x86_64-apple-darwin` 零错误、零 availability 告警。降到 10.15 / 10.12（objc2
+   默认下限）同样干净编译。
+2. **源码层面**：`gpui-pre-macos` 中所有 12+/15+ API 均为运行时守卫
+   （`os_version() >= Version::new(12, 0, 0)`，如 `setAllowsAutomaticKeyEquivalentLocalization`、
+   `setDefaultApplicationAtURL`——后者在 <12 时返回错误而不崩溃，本项目也不使用）；
+   Metal shader build script 的编译下限显式声明 `-mmacosx-version-min=10.15.7`
+   （`gpui-pre-apple/build.rs:138`）；无启动时版本断言或硬性 exit。
+3. **上游 Zed 官方文档**（zed.dev/docs/installation）：macOS 11.x Big Sur 为
+   "Partially Supported"，唯一原因是协作屏幕共享依赖 ScreenCaptureKit（12+），
+   与 gpui 本身无关；Zed 编辑器本体在 Big Sur 运行。
+
+对本文档的影响：§3.1 构建配置中部署目标条款维持原状；步骤 7 后的发布产物在
+Big Sur 上运行不受影响。本机 CLT 无 metal 工具链时非 `runtime_shaders` 构建会
+在 build script 失败，属工具链问题，与 Big Sur 无关（gpui-kit 默认 platform
+依赖已带 `runtime_shaders`，恰好绕过）。
 
 ## 8. 参考资料
 
