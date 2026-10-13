@@ -75,7 +75,10 @@ fn classify(subject: &str) -> Bump {
     let breaking = kind.ends_with('!');
     let kind = kind.trim_end_matches('!');
     let ty = kind.split('(').next().unwrap_or(kind).trim();
-    if breaking {
+    if ty.is_empty() {
+        // No conventional type before the colon: never bumps, even with `!`.
+        Bump::None
+    } else if breaking {
         Bump::Major
     } else if ty.eq_ignore_ascii_case("feat") {
         Bump::Minor
@@ -126,13 +129,13 @@ mod tests {
         assert_eq!(classify("test: add case"), Bump::None);
         assert_eq!(classify("plain message without type"), Bump::None);
         assert_eq!(classify("Merge branch 'feature'"), Bump::None);
-        // §4 details: type name is case-insensitive, empty type is None,
-        // only the first line (header) participates, scope contents are
-        // ignored, and a bare `!` with an empty type still counts as breaking.
+        // §4 details: type name is case-insensitive, empty type is None
+        // (even with `!`), only the first line (header) participates,
+        // scope contents are ignored.
         assert_eq!(classify("FEAT: uppercase type"), Bump::Minor);
         assert_eq!(classify("Fix(UI): mixed case"), Bump::Patch);
         assert_eq!(classify(": no type before colon"), Bump::None);
-        assert_eq!(classify("!: empty type but breaking"), Bump::Major);
+        assert_eq!(classify("!: empty type, breaking ignored"), Bump::None);
         assert_eq!(classify("feat(extra:colon): scope text"), Bump::Minor);
         assert_eq!(
             classify("feat: header\n\nfeat: body line that must be ignored"),
