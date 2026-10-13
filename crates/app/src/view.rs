@@ -8,9 +8,9 @@
 //! events. `cx.spawn` polls the job channel each frame budget.
 
 use gpui::{
-    actions, div, prelude::*, px, App, AppContext, Context, Entity,
-    FocusHandle, Focusable, KeyBinding, Render, SharedString,
-    Window, black, rgb, white,
+    actions, div, prelude::*, px, App, AppContext, Application, Bounds, Context, Entity,
+    FocusHandle, Focusable, KeyBinding, Render, SharedString, Size,
+    Window, WindowBounds, WindowOptions, black, rgb, white,
 };
 
 use crate::app::{AppState, Dialog, is_encrypted_placeholder, short_id};
@@ -555,4 +555,23 @@ impl AppState {
     /// Placeholder hook kept for on_action wiring; real logic lives in
     /// jobs::start_download which takes &mut AppState directly.
     pub(crate) fn request_sync_marker(&mut self) {}
+}
+
+/// GPUI entry point behind the `gpui-view` feature. The default binary
+/// still runs the egui UI (`main` in main.rs); this mirrors it one-for-one
+/// until the egui frontend is retired.
+pub fn gpui_main() {
+    Application::new().run(|cx: &mut App| {
+        register(cx);
+        let bounds = Bounds::centered(None, Size::new(px(1100.), px(720.)), cx);
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                ..Default::default()
+            },
+            |_window, cx| cx.new(NoteBrowser::new),
+        )
+        .expect("open main window");
+        cx.activate(true);
+    });
 }
