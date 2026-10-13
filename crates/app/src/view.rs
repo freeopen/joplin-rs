@@ -15,7 +15,7 @@ use gpui::{
 
 use crate::app::{AppState, Dialog, is_encrypted_placeholder, short_id};
 use crate::jobs;
-use crate::ui::dialog::{DialogAction, DialogState};
+use crate::ui::dialog::DialogState;
 use crate::ui::input::InputState;
 use crate::ui::markdown;
 
@@ -83,7 +83,7 @@ impl NoteBrowser {
                     .await;
                 let this = this.upgrade();
                 let Some(this) = this else { return };
-                this.update(cx, |this, cx| {
+                let _ = this.update(cx, |this, cx| {
                     // Mirror live worker progress into the status line.
                     this.state.update(cx, |s, _| {
                         let worker = s.jobs.worker_status();
