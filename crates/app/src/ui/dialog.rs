@@ -34,6 +34,10 @@ pub enum DialogAction {
 pub struct DialogState {
     title: SharedString,
     on_action: Box<dyn Fn(DialogAction, &mut App) + 'static>,
+    /// Extra body elements embedded by the parent view (form fields,
+    /// messages), handed over once via [`DialogState::with_body`]. AnyElement
+    /// is arena-allocated (not Clone), so render consumes the vec.
+    body: Option<Vec<gpui::AnyElement>>,
 }
 
 impl DialogState {
@@ -44,7 +48,16 @@ impl DialogState {
         Self {
             title: title.into(),
             on_action: Box::new(on_action),
+            body: None,
         }
+    }
+
+    /// Embed form fields / messages into the card body. Called by the
+    /// parent view right after `cx.new` builds the dialog entity; consumed
+    /// by the first render.
+    pub fn with_body(mut self, body: Vec<gpui::AnyElement>) -> Self {
+        self.body = Some(body);
+        self
     }
 
     fn confirm(&mut self, _: &Confirm, _: &mut Window, cx: &mut Context<Self>) {
@@ -109,7 +122,7 @@ impl Render for DialogState {
                                 .font_weight(gpui::FontWeight::BOLD)
                                 .child(title),
                         )
-                        .child(self.card_body(cx))
+                        .children(self.body.take().unwrap_or_default())
                         .child(
                             div()
                                 .flex()
@@ -156,14 +169,5 @@ impl Render for DialogState {
         )
         .with_priority(1)
         .into_any_element()
-    }
-}
-
-impl DialogState {
-    /// Hook for subclasses/wrappers: the parent view embeds form content by
-    /// wrapping DialogState in its own view and rendering the fields itself.
-    /// The default body is empty; the buttons row stays.
-    fn card_body(&self, _cx: &mut Context<Self>) -> gpui::AnyElement {
-        div().into_any_element()
     }
 }

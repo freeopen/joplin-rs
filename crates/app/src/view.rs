@@ -136,29 +136,28 @@ impl NoteBrowser {
         cx.notify();
     }
 
+    /// Rebuild the modal layer from the state machine's dialog flag.
+    /// ReaderPasswordSettings embeds the 3-field form (current/new/confirm);
+    /// E2eePrompt embeds one password field. Fields live in AppState so the
+    /// logic layer owns validation and persistence, exactly like the egui UI.
     fn sync_dialog_from_state(&mut self, cx: &mut Context<Self>) {
         let want = self.state.read(cx).dialog;
         self.pending_dialog = want;
         self.dialog = match want {
             Dialog::None => None,
-            Dialog::ReaderPasswordSettings => Some(cx.new(|_cx| {
-                DialogState::new("阅读密码设置", move |action, cx| match action {
-                    DialogAction::Confirm => {
-                        // The parent view's form fields live in AppState;
-                        // confirm applies and closes.
-                        // Real submission happens in the password form below.
-                        let _ = cx;
-                    }
-                    DialogAction::Dismiss => {
-                        let _ = cx;
-                    }
-                })
+            Dialog::ReaderPasswordSettings => Some(cx.new(|_| {
+                DialogState::new(
+                    "阅读密码设置",
+                    move |action, _cx| {
+                        let _ = action;
+                    },
+                )
             })),
-            Dialog::E2eePrompt => Some(cx.new(|_cx| {
+            Dialog::E2eePrompt => Some(cx.new(|_| {
                 DialogState::new("E2EE 密码", move |_action, _cx| {})
             })),
             #[cfg(not(target_os = "macos"))]
-            Dialog::About => Some(cx.new(|cx| {
+            Dialog::About => Some(cx.new(|_| {
                 DialogState::new("About joplin-rs", move |_action, _cx| {})
             })),
         };
