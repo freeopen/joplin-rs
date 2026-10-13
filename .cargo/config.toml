@@ -1,0 +1,25 @@
+# joplin-rs workspace 构建配置
+# macOS 部署目标 11.0（Big Sur）：编译期 availability 兜底，依赖若误用 12+ API
+# 直接编译报错而非运行时崩溃。Linux/Windows 上该变量无效果，安全。
+[env]
+MACOSX_DEPLOYMENT_TARGET = "11.0"
+
+# GPUI 系依赖在 dev profile 下不优化时运行极慢（gpui-kit 文档同款建议）：
+# 只优化框架依赖，应用代码保持可调试。
+[profile.dev.package]
+gpui = { opt-level = 3 }
+gpui-macros = { opt-level = 3 }
+gpui-collections = { opt-level = 3 }
+gpui-http-client = { opt-level = 3 }
+gpui-media = { opt-level = 3 }
+gpui-util = { opt-level = 3 }
+metal = { opt-level = 3 }
+naga = { opt-level = 3 }
+cosmic-text = { opt-level = 3 }
+rustybuzz = { opt-level = 3 }
+taffy = { opt-level = 3 }
+ttf-parser = { opt-level = 3 }
+resvg = { opt-level = 3 }
+usvg = { opt-level = 3 }
+lyon = { opt-level = 3 }
+image = { opt-level = 3 }
