@@ -1,6 +1,8 @@
 //! joplin-rs GUI: read-only note browser (egui).
 
 mod read_password;
+#[cfg(feature = "gpui-view")]
+mod ui;
 
 #[cfg(target_os = "macos")]
 mod macos_about;

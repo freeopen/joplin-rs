@@ -21,6 +21,7 @@ rand = { workspace = true }
 pbkdf2 = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+comrak = { workspace = true }
 # 旧 egui 视图层（main.rs 仍在引用）：GPUI 视图重写完成后整体移除。
 eframe = { version = "0.32", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 egui = "0.32"
