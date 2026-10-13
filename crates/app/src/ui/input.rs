@@ -8,8 +8,8 @@
 use std::ops::Range;
 
 use gpui::{
-    actions, div, prelude::*, px, App, Context, Entity, EntityInputHandler, FocusHandle,
-    Focusable, KeyBinding, Pixels, SharedString, UTF16Selection, Window, black, rgb, white,
+    actions, div, prelude::*, px, App, Context, EntityInputHandler, FocusHandle,
+    Focusable, KeyBinding, Pixels, SharedString, UTF16Selection, Window, black, rgb,
 };
 
 actions!(input, [Submit, Backspace, Delete, Left, Right, Home, End, SelectAll, Paste, Copy, ShowCharacterPalette]);
@@ -333,7 +333,7 @@ impl gpui::Render for InputState {
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::copy))
-            .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, window, cx| {
+            .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, window, _cx| {
                 window.focus(&this.focus_handle);
             }))
             .on_click(|_, _, _| {})
