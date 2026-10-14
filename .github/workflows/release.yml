@@ -58,15 +58,19 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       # Linux：gpui-pre-linux 依赖的构建期系统库。zed-font-kit 默认走
-      # yeslogic-fontconfig-sys（pkg-config fontconfig），xkbcommon/x11 走
-      # #[link] 静态引用 libxkbcommon/-x11/-xcb，这些 dev 包 ubuntu runner
-      # 默认不带，缺失会让 build script panic（exit 101）或链接失败。
+      # yeslogic-fontconfig-sys（pkg-config fontconfig）；xkbcommon/x11 需要
+      # 链接期找到 libxkbcommon-x11.so —— 注意 Ubuntu 24.04 的
+      # libxkbcommon-dev 只含 libxkbcommon.so，-x11 的链接符号在
+      # libxkbcommon-x11-0（运行时包）里且不带 .so 软链，需手工补一个。
       - name: Install Linux system deps
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            pkg-config libfontconfig1-dev libxkbcommon-dev libxcb1-dev
+            pkg-config libfontconfig1-dev libxkbcommon-dev \
+            libxkbcommon-x11-0 libxcb1-dev
+          sudo ln -sf libxkbcommon-x11.so.0 \
+            /usr/lib/x86_64-linux-gnu/libxkbcommon-x11.so
 
       # 在 workspace 根目录编译，会同时产出两个 bin。失败时把 cargo 输出
       # 尾部（真正的 error 行）打进日志摘要，便于匿名查看失败原因。
