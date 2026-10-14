@@ -75,6 +75,7 @@ jobs:
       # 在 workspace 根目录编译，会同时产出两个 bin。失败时把 cargo 输出
       # 尾部（真正的 error 行）打进日志摘要，便于匿名查看失败原因。
       - name: Build
+        shell: bash
         run: |
           set -o pipefail
           if cargo build --release --target ${{ matrix.target }} 2>&1 | tee build.log; then
