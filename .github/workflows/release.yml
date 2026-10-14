@@ -68,9 +68,18 @@ jobs:
           sudo apt-get install -y \
             pkg-config libfontconfig1-dev libxkbcommon-dev libxcb1-dev
 
-      # 在 workspace 根目录编译，会同时产出两个 bin
+      # 在 workspace 根目录编译，会同时产出两个 bin。失败时把 cargo 输出
+      # 尾部（真正的 error 行）打进日志摘要，便于匿名查看失败原因。
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: |
+          set -o pipefail
+          if cargo build --release --target ${{ matrix.target }} 2>&1 | tee build.log; then
+            echo "build ok"
+          else
+            echo "### build failed; last 120 lines ###"
+            tail -n 120 build.log || true
+            exit 1
+          fi
 
       # 版本号单一数据源：直接读编译产物的 --version（X.Y.Z）
       - name: Resolve version
