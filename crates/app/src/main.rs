@@ -20,6 +20,12 @@ const APP_VERSION: &str = joplin_rs_core::VERSION_DISPLAY;
 const APP_ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 
 fn main() {
+    // Headless version flag so `joplin-rs-app --version` matches the CLI
+    // convention and the About panel string without opening a window.
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!("joplin-rs-app {}", joplin_rs_core::VERSION_DISPLAY);
+        return;
+    }
     view::gpui_main();
 }
 
