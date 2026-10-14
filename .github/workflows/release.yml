@@ -8,9 +8,9 @@ name: Release
 #   本流水线，无递归风险）；若该版本号的 tag 已存在（本次 push 没有
 #   feat/fix 提交，版本未变），则跳过发布
 # - push 人工 tag vX.Y.Z：发布绑定该 tag 的正式 Release
-# 产物形态：全平台 CLI 二进制打包（tar.gz/zip）；macOS 额外把 GUI app
-# 打成 .dmg（joplin-rs.app bundle，拖入 Applications 即用，见
-# tools/make-dmg.sh）
+# 产物形态：Linux/Windows tar.gz/zip 打 CLI + GUI 两个二进制；macOS 的
+# tar.gz 仅打 CLI（joplin-rs）一个二进制，GUI（joplin-rs-app）单独打成
+# .dmg（joplin-rs.app bundle，拖入 Applications 即用，见 tools/make-dmg.sh）
 on:
   push:
     branches:
@@ -72,7 +72,7 @@ jobs:
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "Building version $VERSION"
 
-      # ---------- 打包：CLI 二进制（全平台） ----------
+      # ---------- 打包：CLI 二进制（Linux/Windows 全量，macOS 仅 CLI） ----------
       - name: Package CLI (Unix)
         if: matrix.archive == 'tar.gz'
         shell: bash
@@ -81,8 +81,14 @@ jobs:
           BIN_DIR="target/${{ matrix.target }}/release"
           OUT="joplin-rs-${VERSION}-${{ matrix.target }}.tar.gz"
           mkdir -p stage
-          cp "$BIN_DIR/joplin-rs" "$BIN_DIR/joplin-rs-app" LICENSE stage/
-          tar czf "$OUT" -C stage joplin-rs joplin-rs-app LICENSE
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            # macOS：CLI 仅打 joplin-rs 一个二进制；GUI 走 .dmg
+            cp "$BIN_DIR/joplin-rs" LICENSE stage/
+            tar czf "$OUT" -C stage joplin-rs LICENSE
+          else
+            cp "$BIN_DIR/joplin-rs" "$BIN_DIR/joplin-rs-app" LICENSE stage/
+            tar czf "$OUT" -C stage joplin-rs joplin-rs-app LICENSE
+          fi
 
       - name: Package CLI (Windows)
         if: matrix.archive == 'zip'
@@ -100,6 +106,11 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: ./tools/make-dmg.sh --target ${{ matrix.target }}
+
+      - name: List artifacts
+        if: runner.os == 'macOS'
+        shell: bash
+        run: ls -la joplin-rs-${VERSION}-${{ matrix.target }}.*
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

@@ -86,10 +86,11 @@ published as an official GitHub Release; CI creates the matching tag
 tag like `v0.2.0` (prefer bumping minor/major so the new patch base does not
 go backwards relative to the automatically accumulated patch number).
 
-Release artifacts: the CLI and GUI ship as plain binaries in `tar.gz` (Linux,
-macOS) / `zip` (Windows). On macOS the GUI additionally ships as a DMG
-containing a `joplin-rs.app` bundle (drag into Applications; ad-hoc signed,
-not notarized, so use right-click -> Open on first launch). To package it
+Release artifacts: Linux and Windows ship both binaries (CLI `joplin-rs` +
+GUI `joplin-rs-app`) in `tar.gz` / `zip`. On macOS the `tar.gz` carries the
+CLI binary only, and the GUI additionally ships as a DMG containing a
+`joplin-rs.app` bundle (drag into Applications; ad-hoc signed, not
+notarized, so use right-click -> Open on first launch). To package it
 locally on a Mac:
 
 ```
