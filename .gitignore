@@ -3,3 +3,5 @@
 .codegraph
 .DS_Store
 .omx/
+# local packaging outputs (tools/make-dmg.sh)
+/*.dmg

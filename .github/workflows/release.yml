@@ -8,6 +8,9 @@ name: Release
 #   本流水线，无递归风险）；若该版本号的 tag 已存在（本次 push 没有
 #   feat/fix 提交，版本未变），则跳过发布
 # - push 人工 tag vX.Y.Z：发布绑定该 tag 的正式 Release
+# 产物形态：全平台 CLI 二进制打包（tar.gz/zip）；macOS 额外把 GUI app
+# 打成 .dmg（joplin-rs.app bundle，拖入 Applications 即用，见
+# tools/make-dmg.sh）
 on:
   push:
     branches:
@@ -69,8 +72,8 @@ jobs:
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "Building version $VERSION"
 
-      # ---------- 打包：两个 bin + LICENSE ----------
-      - name: Package (Unix)
+      # ---------- 打包：CLI 二进制（全平台） ----------
+      - name: Package CLI (Unix)
         if: matrix.archive == 'tar.gz'
         shell: bash
         run: |
@@ -81,7 +84,7 @@ jobs:
           cp "$BIN_DIR/joplin-rs" "$BIN_DIR/joplin-rs-app" LICENSE stage/
           tar czf "$OUT" -C stage joplin-rs joplin-rs-app LICENSE
 
-      - name: Package (Windows)
+      - name: Package CLI (Windows)
         if: matrix.archive == 'zip'
         shell: bash
         run: |
@@ -91,6 +94,12 @@ jobs:
           mkdir -p stage
           cp "$BIN_DIR/joplin-rs.exe" "$BIN_DIR/joplin-rs-app.exe" LICENSE stage/
           (cd stage && 7z a "../$OUT" joplin-rs.exe joplin-rs-app.exe LICENSE)
+
+      # ---------- macOS：GUI app 打成 .dmg（app-only bundle） ----------
+      - name: Package macOS app DMG
+        if: runner.os == 'macOS'
+        shell: bash
+        run: ./tools/make-dmg.sh --target ${{ matrix.target }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
