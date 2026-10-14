@@ -110,6 +110,13 @@ cargo clippy -p joplin-rs-app
 - **Windows**：gpui-pre 首次构建（迁移文档风险 #6，路径未经本机验证，靠 CI 回归）；
 - 结果（含是否补依赖）回写迁移文档。
 
+预分析（2026-10-14，基于 Cargo.lock 依赖图核查，待 CI 确认）：**Linux 大概率无需补 apt 包**。
+构建期链接需求只有：`freetype-sys`（pkg-config freetype2，否则内置源码用 cc 编译，runner 均有 gcc）、
+`libsqlite3-sys`（bundled）。其余全部运行时 dlopen 或纯 Rust：`wayland-sys`（dlib/dlopen）、
+`yeslogic-fontconfig-sys`（dlib/dlopen）、`x11rb`/`xkbcommon-rs`（纯 Rust）、Vulkan（ash + libloading）。
+gpui-kit 对 Linux 同时启用 x11 + wayland（见 gpui-kit-0.7.3 Cargo.toml），运行时依赖
+`ubuntu-latest` 镜像自带。若 CI 仍报链接错误再按报错补包并回写此处。
+
 ## 4. Validation 汇总
 
 | 层面 | 手段 | 通过标准 |
