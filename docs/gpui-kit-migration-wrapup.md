@@ -123,6 +123,18 @@ Build 步骤 exit 101。核查依赖图后确认两处构建期硬依赖：
 release.yml 已在 Linux leg 增补 `apt-get install pkg-config libfontconfig1-dev
 libxkbcommon-dev libxcb1-dev`。
 
+最终定位与修复（run 38596806379 拿到真实报错尾部后）：Linux 的真实错误是
+`rust-lld: error: unable to find library -lxkbcommon-x11` —— Ubuntu 24.04 的
+`libxkbcommon-dev` 只装 `libxkbcommon.so`，`libxkbcommon-x11.so` 在运行时包
+`libxkbcommon-x11-0` 里且不带 `.so` 软链。修复：补装 `libxkbcommon-x11-0` 并
+`ln -sf libxkbcommon-x11.so.0 .../libxkbcommon-x11.so`。同 run 还暴露两个打包
+改动引入的问题并修复：Build 步骤的多行 bash wrapper 在 Windows 上被 pwsh 执行
+（补 `shell: bash`）；之前 CI 全红的另一半原因是 Resolve version 步骤的
+`VERSION="$(...)"` 引号未闭合（shell 把后续行吞进一个未终止字符串）。
+
+验证：run 38603919131（commit 651164b）四平台全绿，Release v1.1.0 发布
+macOS 双架构 .dmg（GUI only）+ .tar.gz（仅 CLI）、Linux/Windows 全量包。
+
 ## 4. Validation 汇总
 
 | 层面 | 手段 | 通过标准 |
