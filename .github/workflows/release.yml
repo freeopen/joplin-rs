@@ -68,7 +68,7 @@ jobs:
           set -e
           BIN="target/${{ matrix.target }}/release/joplin-rs"
           if [ -f "$BIN.exe" ]; then BIN="$BIN.exe"; fi
-          VERSION="$($BIN --version | sed -E 's/.* v([0-9]+\.[0-9]+\.[0-9]+).*/\1/') # 剥掉 v 前缀和哈希取纯 X.Y.Z
+          VERSION="$($BIN --version | sed -E 's/.* v([0-9]+\.[0-9]+\.[0-9]+).*/\1/')" # 剥掉 v 前缀和哈希取纯 X.Y.Z
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "Building version $VERSION"
 
@@ -110,7 +110,7 @@ jobs:
       - name: List artifacts
         if: runner.os == 'macOS'
         shell: bash
-        run: ls -la joplin-rs-${VERSION}-${{ matrix.target }}.*
+        run: ls -la "joplin-rs-${VERSION}-${{ matrix.target }}."*
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -135,7 +135,7 @@ jobs:
           set -e
           mkdir -p rel
           tar xzf artifacts/joplin-rs-*-x86_64-unknown-linux-gnu.tar.gz -C rel
-          VERSION="$(./rel/joplin-rs --version | sed -E 's/.* v([0-9]+\.[0-9]+\.[0-9]+).*/\1/') # 取纯 X.Y.Z；Release/tag 仍用 vX.Y.Z 纯版本号，不带哈希
+          VERSION="$(./rel/joplin-rs --version | sed -E 's/.* v([0-9]+\.[0-9]+\.[0-9]+).*/\1/')" # 取纯 X.Y.Z；Release/tag 仍用 vX.Y.Z 纯版本号，不带哈希
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             # 人工发布 tag：Release 直接绑定该 tag
             TAG_NAME="${GITHUB_REF_NAME}"
