@@ -21,19 +21,19 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use gpui_kit::{
-    App, Bounds, Context, Entity, FocusHandle, Focusable, Image, ImageFormat, ImageSource,
-    KeyBinding, Menu, MenuItem, Render, Resource, SharedString, SharedUri, Size, Subscription,
-    Window, WindowBounds, WindowOptions, div, prelude::*, px,
-};
 use gpui_kit::component::{
-    ActiveTheme, Disableable, Sizable, WindowExt,
     button::{Button, ButtonVariants},
     dialog::{DialogAction, DialogFooter},
     input::{Copy, Cut, Input, InputEvent, InputState, Paste, SelectAll},
+    ActiveTheme, Disableable, Sizable, WindowExt,
+};
+use gpui_kit::{
+    div, prelude::*, px, App, Bounds, Context, Entity, FocusHandle, Focusable, Image, ImageFormat,
+    ImageSource, KeyBinding, Menu, MenuItem, Render, Resource, SharedString, SharedUri, Size,
+    Subscription, Window, WindowBounds, WindowOptions,
 };
 
-use crate::app::{AppState, Dialog as AppDialog, is_encrypted_placeholder, short_id};
+use crate::app::{is_encrypted_placeholder, short_id, AppState, Dialog as AppDialog};
 use crate::jobs;
 
 gpui_kit::actions!(app, [Sync, Reload, OpenReaderPassword, Quit, ShowAbout]);
@@ -105,6 +105,10 @@ pub struct NoteBrowser {
     /// Guard: only auto-focus a dialog's first field once per opening.
     rp_dialog_focused: Rc<Cell<bool>>,
     e2ee_dialog_focused: Rc<Cell<bool>>,
+    /// Last seen `prot_gate_epoch`: when AppState bumps it a protected note
+    /// (re)locked, and the persistent gate field must be cleared so a
+    /// re-opened gate never shows or reuses the previous password.
+    gate_epoch_seen: u64,
     focus: FocusHandle,
     #[allow(dead_code)]
     subscriptions: Vec<Subscription>,
@@ -122,11 +126,21 @@ impl NoteBrowser {
         state.update(cx, |s, _| s.reload_meta());
 
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search…"));
-        let gate_input = cx.new(|cx| InputState::new(window, cx).placeholder("阅读密码").masked(true));
-        let rp_current = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("当前密码").masked(true)
+        let gate_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("阅读密码")
+                .masked(true)
         });
-        let rp_new = cx.new(|cx| InputState::new(window, cx).placeholder("新密码").masked(true));
+        let rp_current = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("当前密码")
+                .masked(true)
+        });
+        let rp_new = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("新密码")
+                .masked(true)
+        });
         let rp_confirm = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("确认新密码")
@@ -230,9 +244,20 @@ impl NoteBrowser {
                             }
                             let _ = s.handle_job_event();
                         });
-                        // Auto-start the decrypt pass when a stored password is
-                        // available (mirrors the egui flow's auto-continue).
-                        this.state.update(cx, |s, _| jobs::after_sync_done(s));
+                        // Auto-start the decrypt pass when a not-yet-tried
+                        // password is available (mirrors the egui flow's
+                        // auto-continue; honours the sticky cancel flag).
+                        this.state.update(cx, |s, _| jobs::auto_decrypt(s));
+                        // A protected note (re)locked: clear the gate field so
+                        // the re-opened gate never shows the last password.
+                        // (`set_value` emits no Change event, so AppState's
+                        // already-cleared `prot_input` stays in sync.)
+                        let epoch = this.state.read(cx).prot_gate_epoch;
+                        if epoch != this.gate_epoch_seen {
+                            this.gate_epoch_seen = epoch;
+                            this.gate_input
+                                .update(cx, |input, cx| input.set_value("", window, cx));
+                        }
                         this.sync_dialog_from_state(window, cx);
                         cx.notify();
                     });
@@ -252,6 +277,7 @@ impl NoteBrowser {
             pending_dialog: AppDialog::None,
             rp_dialog_focused: Rc::new(Cell::new(false)),
             e2ee_dialog_focused: Rc::new(Cell::new(false)),
+            gate_epoch_seen: 0,
             focus: cx.focus_handle(),
             subscriptions,
         }
@@ -530,8 +556,7 @@ impl NoteBrowser {
                                 .on_click(move |_, window, cx| {
                                     browser_cancel
                                         .update(cx, |view, cx| {
-                                            view.state
-                                                .update(cx, |s, _| s.cancel_e2ee_prompt());
+                                            view.state.update(cx, |s, _| s.cancel_e2ee_prompt());
                                             view.pending_dialog = AppDialog::None;
                                         })
                                         .ok();
@@ -694,11 +719,7 @@ impl Render for NoteBrowser {
                     .py_2()
                     .border_b_1()
                     .border_color(theme.border)
-                    .child(
-                        Input::new(&self.search_input)
-                            .id("search")
-                            .cleanable(true),
-                    ),
+                    .child(Input::new(&self.search_input).id("search").cleanable(true)),
             )
             // ---- body: sidebar + note panel ----
             .child(
@@ -876,7 +897,8 @@ impl NoteBrowser {
                                         .text_size(px(11.))
                                         .text_color(theme.muted_foreground)
                                         .children(
-                                            tags.iter().map(|t| SharedString::from(format!("#{t}"))),
+                                            tags.iter()
+                                                .map(|t| SharedString::from(format!("#{t}"))),
                                         ),
                                 )
                             })
@@ -888,9 +910,17 @@ impl NoteBrowser {
                                         .child(SharedString::from(snippet.unwrap_or_default())),
                                 )
                             })
-                            .on_click(cx.listener(move |this, _, _, cx| {
+                            .on_click(cx.listener(move |this, _, window, cx| {
                                 let note_id = id.clone();
                                 this.state.update(cx, |s, _| s.request_open_note(&note_id));
+                                // A protected note (re)locks here: drop any
+                                // password still sitting in the gate field so
+                                // re-opening never reuses it.
+                                if this.state.read(cx).note_locked {
+                                    this.gate_input
+                                        .update(cx, |input, cx| input.set_value("", window, cx));
+                                    this.gate_epoch_seen = this.state.read(cx).prot_gate_epoch;
+                                }
                                 cx.notify();
                             }))
                     })),
@@ -898,7 +928,11 @@ impl NoteBrowser {
             .into_any_element()
     }
 
-    fn render_note_panel(&self, _window: &mut Window, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+    fn render_note_panel(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
         let theme = cx.theme();
         let state = self.state.read(cx);
         if state.selected_note.is_none() {
@@ -928,7 +962,11 @@ impl NoteBrowser {
                         .font_weight(gpui_kit::FontWeight::BOLD)
                         .child(SharedString::from(state.note_title.clone())),
                 )
-                .child(div().w(px(300.)).child(Input::new(&self.gate_input).id("gate")))
+                .child(
+                    div()
+                        .w(px(300.))
+                        .child(Input::new(&self.gate_input).id("gate")),
+                )
                 .children(error.map(error_line))
                 .child(
                     div()
@@ -947,15 +985,12 @@ impl NoteBrowser {
                                     cx.notify();
                                 })),
                         )
-                        .child(
-                            Button::new("btn-unlock")
-                                .primary()
-                                .label("解锁")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.gate_unlock(cx);
-                                    cx.notify();
-                                })),
-                        ),
+                        .child(Button::new("btn-unlock").primary().label("解锁").on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.gate_unlock(cx);
+                                cx.notify();
+                            }),
+                        )),
                 )
                 .into_any_element();
         }
@@ -1017,7 +1052,9 @@ impl NoteBrowser {
                             })
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.state.update(cx, |s, _| {
-                                    if s.protected.contains(s.selected_note.as_deref().unwrap_or("")) {
+                                    if s.protected
+                                        .contains(s.selected_note.as_deref().unwrap_or(""))
+                                    {
                                         s.gate_open_note();
                                     } else {
                                         s.protect_open_note();
@@ -1089,9 +1126,7 @@ fn ok_line(msg: String) -> gpui_kit::AnyElement {
 fn render_markdown(body: &str, resource_dir: &Path) -> gpui_kit::AnyElement {
     let dir = resource_dir.to_path_buf();
     gpui_kit::base::TextView::markdown("note-body", body.to_string())
-        .image_source(move |uri: &SharedUri| -> ImageSource {
-            image_source_for(uri, &dir)
-        })
+        .image_source(move |uri: &SharedUri| -> ImageSource { image_source_for(uri, &dir) })
         .on_link_click(|url, _, _, cx| {
             cx.open_url(url);
         })
@@ -1137,7 +1172,9 @@ fn decode_data_url_image(url: &str) -> Option<Image> {
     let mime = meta.split(';').next()?;
     let format = ImageFormat::from_mime_type(mime)?;
     use base64::Engine as _;
-    let bytes = base64::engine::general_purpose::STANDARD.decode(payload).ok()?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .ok()?;
     Some(Image::from_bytes(format, bytes))
 }
 
@@ -1239,9 +1276,10 @@ pub fn gpui_main() {
         init_fonts(cx);
         register(cx);
         let bounds = Bounds::centered(None, Size::new(px(1100.), px(720.)), cx);
-        let icon = image::load_from_memory_with_format(crate::APP_ICON_PNG, image::ImageFormat::Png)
-            .ok()
-            .map(|img| Arc::new(img.to_rgba8()));
+        let icon =
+            image::load_from_memory_with_format(crate::APP_ICON_PNG, image::ImageFormat::Png)
+                .ok()
+                .map(|img| Arc::new(img.to_rgba8()));
         gpui_kit::open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -1273,15 +1311,12 @@ mod tests {
     fn synth_sfnt(family: &str) -> Vec<u8> {
         // name table: format(2) + count(2) + stringOffset(2) + one record(12)
         // + UTF-16BE string.
-        let raw: Vec<u8> = family
-            .encode_utf16()
-            .flat_map(u16::to_be_bytes)
-            .collect();
+        let raw: Vec<u8> = family.encode_utf16().flat_map(u16::to_be_bytes).collect();
         let name_table_len = 6 + 12 + raw.len();
         let mut name = vec![0u8, 0];
         name.extend_from_slice(&1u16.to_be_bytes()); // count
         name.extend_from_slice(&(6 + 12u16).to_be_bytes()); // string offset
-        // record: platform 3, encoding 1, language 0, name-id 1
+                                                            // record: platform 3, encoding 1, language 0, name-id 1
         name.extend_from_slice(&3u16.to_be_bytes());
         name.extend_from_slice(&1u16.to_be_bytes());
         name.extend_from_slice(&0u16.to_be_bytes());
@@ -1324,7 +1359,10 @@ mod tests {
 
     #[test]
     fn family_from_plain_ttf() {
-        assert_eq!(first_family_name(&synth_sfnt("Test Sans")), Some("Test Sans".into()));
+        assert_eq!(
+            first_family_name(&synth_sfnt("Test Sans")),
+            Some("Test Sans".into())
+        );
     }
 
     #[test]

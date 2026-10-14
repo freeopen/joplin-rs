@@ -9,7 +9,7 @@
 //! (a password is available) or after the user submits the prompt dialog.
 
 use crate::app::{
-    AppState, DecryptSummary, JobChannel, JobEvent, Stage1Summary,
+    e2ee_auto_start_pending, AppState, DecryptSummary, JobChannel, JobEvent, Stage1Summary,
 };
 
 /// Kick off stage 1 (password-less download sync) unless a job is running.
@@ -65,7 +65,9 @@ pub fn start_download(state: &mut AppState) {
 }
 
 /// Kick off stage 2 (E2EE decryption). If no password is available, opens
-/// the prompt dialog instead (caller shows `state.dialog`).
+/// the prompt dialog instead (caller shows `state.dialog`). Records the
+/// password on the state so the auto-continue pass can tell which values
+/// have already been tried.
 pub fn start_decrypt(state: &mut AppState) {
     if state.jobs.is_busy() {
         return;
@@ -78,6 +80,7 @@ pub fn start_decrypt(state: &mut AppState) {
     };
     *state.jobs.running.lock().unwrap() = true;
     *state.jobs.event.lock().unwrap() = None;
+    state.e2ee_job_password = password.clone();
     state.set_status("开始解密…".into());
 
     let config = state.config.clone();
@@ -116,11 +119,21 @@ pub fn start_decrypt(state: &mut AppState) {
     });
 }
 
-/// Handle a finished download: with a stored password, auto-start decrypt;
-/// otherwise surface the E2EE prompt dialog. Called by the UI layer after
-/// [`AppState::handle_job_event`] reports a SyncDone.
-pub fn after_sync_done(state: &mut AppState) {
-    if state.e2ee_pending_count > 0 && state.e2ee_password_for_decrypt().is_some() {
+/// Handle a finished download and every UI tick afterwards: auto-start the
+/// decrypt pass when a not-yet-tried password is available. Without the
+/// cancellation and already-tried guards this re-opened the prompt dialog
+/// forever after a decline (and kept retrying a wrong fallback password).
+/// A user-submitted retry goes through the prompt's explicit
+/// [`start_decrypt`] and bypasses the already-tried guard.
+pub fn auto_decrypt(state: &mut AppState) {
+    let should = e2ee_auto_start_pending(
+        state.e2ee_pending_count,
+        state.jobs.is_busy(),
+        state.e2ee_cancelled,
+        state.e2ee_password_for_decrypt().as_deref(),
+        &state.e2ee_job_password,
+    );
+    if should {
         start_decrypt(state);
     }
 }

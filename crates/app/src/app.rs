@@ -289,11 +289,25 @@ pub struct AppState {
     pub rp_confirm: String,
     pub rp_message: Option<String>,
     pub rp_error: Option<String>,
-    // E2EE prompt dialog fields:
+    /// E2EE prompt dialog fields:
     pub e2ee_input: String,
     pub e2ee_prompt_error: Option<String>,
     /// Number of encrypted items awaiting the password shown in the prompt.
     pub e2ee_pending_count: usize,
+    /// Password the last-started decrypt job used. The auto-continue pass
+    /// never restarts with this same value, which is what turned a wrong
+    /// fallback password (e.g. the reused WebDAV password) into an endless
+    /// fail -> prompt -> cancel -> retry loop.
+    pub e2ee_job_password: String,
+    /// Sticky "user declined" flag for the E2EE prompt. Set on cancel, so
+    /// the periodic auto-decrypt pass stops re-opening the dialog; cleared
+    /// by a fresh SyncDone or an explicit password submission.
+    pub e2ee_cancelled: bool,
+    /// Bumped every time a protected note re-locks (each `request_open_note`
+    /// gate hit). The view layer clears the gate field when this changes,
+    /// because the persistent GPUI `InputState` keeps typed text otherwise:
+    /// re-opening a gated note would show and reuse the previous password.
+    pub prot_gate_epoch: u64,
 }
 
 impl AppState {
@@ -330,6 +344,9 @@ impl AppState {
             e2ee_input: String::new(),
             e2ee_prompt_error: None,
             e2ee_pending_count: 0,
+            e2ee_job_password: String::new(),
+            e2ee_cancelled: false,
+            prot_gate_epoch: 0,
         })
     }
 
@@ -471,6 +488,9 @@ impl AppState {
             self.note_body.clear();
             self.prot_input.clear();
             self.prot_error = None;
+            // Signal the view layer to clear the gate input field: a
+            // protected note re-locking must not reuse the last password.
+            self.prot_gate_epoch = self.prot_gate_epoch.wrapping_add(1);
             return;
         }
         self.note_locked = false;
@@ -669,13 +689,26 @@ impl AppState {
         self.e2ee_session_password = self.e2ee_input.clone();
         self.e2ee_input.clear();
         self.e2ee_prompt_error = None;
+        // An explicit submission overrides a previous decline: the user is
+        // actively asking for decryption to run.
+        self.e2ee_cancelled = false;
         self.dialog = Dialog::None;
     }
 
-    /// Cancel the post-sync E2EE prompt: placeholders stay in the list.
+    /// Cancel the post-sync E2EE prompt: placeholders stay in the list. The
+    /// decision is sticky: without this flag the periodic auto-decrypt pass
+    /// restarts with the same (wrong) stored/fallback password and the
+    /// failure re-opens the dialog forever.
     pub fn cancel_e2ee_prompt(&mut self) {
         self.e2ee_input.clear();
         self.e2ee_prompt_error = None;
+        self.e2ee_cancelled = true;
+        if self.e2ee_pending_count > 0 {
+            self.set_status(format!(
+                "已取消解密：{} 项保持加密状态（重新同步可重试）",
+                self.e2ee_pending_count
+            ));
+        }
         self.dialog = Dialog::None;
     }
 
@@ -692,6 +725,11 @@ impl AppState {
                 Ok((summary, pending)) => {
                     self.reload_meta();
                     self.e2ee_pending_count = pending;
+                    // A fresh batch resets the prompt slate: a previous
+                    // decline and the record of which password the last
+                    // decrypt pass tried no longer apply.
+                    self.e2ee_cancelled = false;
+                    self.e2ee_job_password.clear();
                     let base = format!(
                         "同步完成：{} 项已下载，{} 项已删除，{} 个资源",
                         summary.downloaded, summary.deleted, summary.resources
@@ -732,13 +770,25 @@ impl AppState {
                         }
                     }
                     Err(e) => {
-                        // Wrong/unsupported E2EE password: drop the session
-                        // password and prompt again; placeholders remain.
+                        // Wrong/unsupported E2EE password: placeholders remain
+                        // in the list. The session password is kept: clearing
+                        // it here would wipe a password the user submitted
+                        // while this job was still running.
                         let looks_wrong = looks_like_wrong_e2ee_password(&e);
-                        self.e2ee_session_password.clear();
-                        self.e2ee_input.clear();
                         self.set_status(format!("E2EE 解密失败: {e}"));
-                        if self.e2ee_pending_count > 0 {
+                        let user_supplied_new = e2ee_retry_supersedes_prompt(
+                            &self.e2ee_session_password,
+                            &self.e2ee_job_password,
+                        );
+                        if user_supplied_new {
+                            // A password submitted while the failed job was
+                            // still running: the auto-continue pass picks it
+                            // up (it differs from the password just tried).
+                            self.e2ee_input.clear();
+                            self.e2ee_prompt_error = None;
+                            self.dialog = Dialog::None;
+                        } else if self.e2ee_pending_count > 0 && !self.e2ee_cancelled {
+                            self.e2ee_input.clear();
                             self.e2ee_prompt_error = Some(if looks_wrong {
                                 "E2EE 密码错误，未解密笔记保持加密状态".into()
                             } else {
@@ -770,6 +820,32 @@ pub fn looks_like_wrong_e2ee_password(err: &str) -> bool {
         || e.contains("aead")
         || e.contains("密钥")
         || e.contains("密码")
+}
+
+/// Pure decision core for the automatic decrypt continuation run every
+/// UI tick. Starts only when items are pending, no job is running, the user
+/// has not declined, and a password is available that the last job has not
+/// already tried (retrying the same wrong fallback password is the endless
+/// cancel-loop bug). User-submitted retries bypass this via the prompt's
+/// explicit `start_decrypt`.
+pub fn e2ee_auto_start_pending(
+    pending: usize,
+    busy: bool,
+    cancelled: bool,
+    password: Option<&str>,
+    last_tried: &str,
+) -> bool {
+    pending > 0
+        && !busy
+        && !cancelled
+        && password.is_some_and(|pw| !pw.is_empty() && pw != last_tried)
+}
+
+/// True when a user-submitted password supersedes the one the failed decrypt
+/// job just tried: instead of re-prompting with an error, the auto-continue
+/// pass should immediately retry with the newer password.
+pub fn e2ee_retry_supersedes_prompt(session: &str, tried: &str) -> bool {
+    !session.is_empty() && session != tried
 }
 
 pub fn is_encrypted_placeholder(item: &Item) -> bool {
@@ -894,6 +970,61 @@ mod tests {
         assert_eq!(crate_resource_ids(&body), vec![ID.to_string()]);
 
         assert!(crate_resource_ids("交运医药商保清分工作环境交运医药").is_empty());
+    }
+
+    /// Regression: cancelling the E2EE prompt must stop the auto-decrypt
+    /// pass from restarting it. The old loop: cancel -> pending stays > 0 ->
+    /// the tick restarted decrypt with the same wrong stored/fallback
+    /// password -> failure re-opened the prompt, forever.
+    #[test]
+    fn e2ee_auto_start_honours_cancel_and_tried_passwords() {
+        // Fresh sync batch: nothing tried, password available -> start.
+        assert!(e2ee_auto_start_pending(5, false, false, Some("pw"), ""));
+        // No password at all -> the prompt dialog path, not an auto start.
+        assert!(!e2ee_auto_start_pending(5, false, false, None, ""));
+        assert!(!e2ee_auto_start_pending(5, false, false, Some(""), ""));
+        // A job is already running -> wait.
+        assert!(!e2ee_auto_start_pending(5, true, false, Some("pw"), ""));
+        // Nothing pending -> no-op.
+        assert!(!e2ee_auto_start_pending(0, false, false, Some("pw"), ""));
+
+        // The user declined -> never auto-start again, even though the same
+        // password is still available and items are still encrypted.
+        assert!(!e2ee_auto_start_pending(5, false, true, Some("pw"), ""));
+
+        // The exact password the last job tried must not auto-retry: this is
+        // the fallback-password loop (cancel -> retry same wrong password).
+        assert!(!e2ee_auto_start_pending(
+            5,
+            false,
+            false,
+            Some("dav-pw"),
+            "dav-pw"
+        ));
+        // A different (newly submitted) password does auto-start.
+        assert!(e2ee_auto_start_pending(
+            5,
+            false,
+            false,
+            Some("e2ee"),
+            "dav-pw"
+        ));
+    }
+
+    /// Regression: submitting the correct E2EE password while a stale job
+    /// (started with the wrong fallback password) was still running lost the
+    /// submission - the old DecryptDone(Err) handler cleared the session
+    /// password and re-prompted instead of retrying with it.
+    #[test]
+    fn e2ee_new_submission_supersedes_failed_job() {
+        // Session password differs from the password the failed job tried:
+        // retry with it instead of showing the prompt again.
+        assert!(e2ee_retry_supersedes_prompt("correct-pw", "dav-pw"));
+        // Session password is the same one that just failed: re-prompt so
+        // the user can correct it.
+        assert!(!e2ee_retry_supersedes_prompt("wrong-pw", "wrong-pw"));
+        // Nothing submitted: always re-prompt.
+        assert!(!e2ee_retry_supersedes_prompt("", "dav-pw"));
     }
 
     // ---- encrypted config secrets (CLI set-password compatibility) ----
