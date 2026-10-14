@@ -97,6 +97,19 @@ pub fn install_native_about() {
     unsafe { retarget_about(&app_menu, delegate) };
 }
 
+/// Show the native About panel immediately (rounded icon, app name,
+/// version). Used by the app-menu About action and the toolbar About
+/// button on macOS.
+pub fn show_native_about() {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    if let Some(options) = about_options() {
+        let app = NSApplication::sharedApplication(mtm);
+        unsafe { app.orderFrontStandardAboutPanelWithOptions(&options) };
+    }
+}
+
 fn rounded_icon() -> Option<Retained<NSImage>> {
     let mtm = MainThreadMarker::new()?;
     let data = NSData::with_bytes(ICON_PNG);

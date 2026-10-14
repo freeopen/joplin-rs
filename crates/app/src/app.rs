@@ -707,11 +707,11 @@ impl AppState {
                         self.e2ee_prompt_error = None;
                         self.dialog = Dialog::E2eePrompt;
                     }
-                    return true;
+                    true
                 }
                 Err(e) => {
                     self.set_status(format!("同步失败: {e}"));
-                    return true;
+                    true
                 }
             },
             JobEvent::DecryptDone(result) => {

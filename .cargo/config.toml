@@ -5,21 +5,33 @@
 MACOSX_DEPLOYMENT_TARGET = "11.0"
 
 # GPUI 系依赖在 dev profile 下不优化时运行极慢（gpui-kit 文档同款建议）：
-# 只优化框架依赖，应用代码保持可调试。
+# 只优化框架依赖，应用代码保持可调试。包名按 gpui-pre 0.3.9 家族实际命名，
+# 首次编译后可按 Cargo.lock 增补。
 [profile.dev.package]
-gpui = { opt-level = 3 }
-gpui-macros = { opt-level = 3 }
-gpui-collections = { opt-level = 3 }
-gpui-http-client = { opt-level = 3 }
-gpui-media = { opt-level = 3 }
-gpui-util = { opt-level = 3 }
+gpui-pre = { opt-level = 3 }
+gpui-pre-macros = { opt-level = 3 }
+gpui-pre-platform = { opt-level = 3 }
+gpui-pre-apple = { opt-level = 3 }
+gpui-pre-macos = { opt-level = 3 }
+gpui-pre-linux = { opt-level = 3 }
+gpui-pre-windows = { opt-level = 3 }
+gpui-pre-wgpu = { opt-level = 3 }
+gpui-pre-collections = { opt-level = 3 }
+gpui-pre-util = { opt-level = 3 }
+gpui-pre-refineable = { opt-level = 3 }
+gpui-pre-sum-tree = { opt-level = 3 }
+gpui-pre-scheduler = { opt-level = 3 }
+gpui-pre-shared-string = { opt-level = 3 }
+gpui-pre-http-client = { opt-level = 3 }
+gpui-base = { opt-level = 3 }
+gpui-component = { opt-level = 3 }
+gpui-kit = { opt-level = 3 }
+gpui-kit-assets = { opt-level = 3 }
 metal = { opt-level = 3 }
 naga = { opt-level = 3 }
 cosmic-text = { opt-level = 3 }
 rustybuzz = { opt-level = 3 }
 taffy = { opt-level = 3 }
 ttf-parser = { opt-level = 3 }
-resvg = { opt-level = 3 }
-usvg = { opt-level = 3 }
 lyon = { opt-level = 3 }
 image = { opt-level = 3 }
