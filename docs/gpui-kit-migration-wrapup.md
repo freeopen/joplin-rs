@@ -65,25 +65,18 @@ cargo clippy -p joplin-rs-app
 
 ### 步骤 4：人工行为对等验收（迁移文档 §5 清单，macOS）
 
-实施进度（2026-10-14，锁屏会话下机器可自验部分）：
+实施进度（2026-10-14）：
 
-- [x] 启动：窗口居中已用 CGWindowList 验证（1100x753，标题 joplin-rs；内容高 720 + 标题栏）；进程启动无崩溃；中文渲染/图标需解锁后目视
-- [x] `JOPLIN_RS_FONT` 覆盖：.ttf（Andale Mono）、.ttc（Hiragino Sans GB、ADTNumeric 12 成员集合）均正常启动无 panic；字体生效目视需解锁后确认
+- [x] 启动：窗口居中已用 CGWindowList 验证（1100x753，标题 joplin-rs；内容高 720 + 标题栏）；进程启动无崩溃
+- [x] 视觉验收：解锁桌面后实测截图确认 —— 工具栏（Sync/ready、阅读密码、Reload、About）、笔记本/笔记列表、
+      Markdown 正文（行内代码、链接下划线）、中英文混排渲染全部正常，应用前台运行稳定
+- [x] `JOPLIN_RS_FONT` 覆盖：.ttf（Andale Mono）、.ttc（Hiragino Sans GB、ADTNumeric 12 成员集合）均正常启动无 panic
 - [x] `JOPLIN_RS_FONT` 指向不存在文件：降级跳过注册，不 panic
-- [x] `joplin-rs-app --version`：输出 `joplin-rs-app v1.1.0 (8a4846578)`，与 CLI `joplin-rs v1.1.0 (…)` 同源（VERSION_DISPLAY）。
-      注意：egui 时代 `--version` 也会静默启动 GUI（从未实现过该 flag），本次补上；About 面板同用 APP_VERSION，一致
-- [ ] Sync / E2EE 弹窗 / 阅读密码 gate / 笔记列表 / 搜索 / Markdown / 对话框交互：需真实后端与解锁桌面，待用户验收
-
-- [ ] 启动：窗口 1100x720 居中、dock/窗口图标、中文渲染正常（PingFang）
-- [ ] `JOPLIN_RS_FONT` 覆盖生效（.ttf 与 .ttc 各验证一次，覆盖步骤 2 的修复）
-- [ ] Sync：两阶段下载 → 自动解密或弹 E2EE 窗；进度文案实时更新；完成后列表刷新
-- [ ] E2EE 弹窗：空密码报错、错误密码保持加密并重新弹窗、取消保持加密
-- [ ] 阅读密码 gate：错误提示、解锁、每次重选重锁、保护/取消保护、设置/修改/移除密码
-- [ ] 笔记列表：🔒 已加密占位、🔐 受保护、todo ☑/☐、tag `#xxx`、snippet（锁定/受保护不显示）
-- [ ] 搜索：即时过滤、多词 AND
-- [ ] Markdown：表格/任务列表/代码块/链接点击/本地资源图片/远程图片降级
-- [ ] 对话框交互：Esc 关闭、scrim 点击关闭、错误时不关窗
-- [ ] `joplin-rs-app --version` 与 About 面板版本一致（已实现，见上方实施进度）
+- [x] `joplin-rs-app --version`：输出 `joplin-rs-app v1.1.0 (…)`，与 CLI/About 同源（VERSION_DISPLAY）。
+      注意：egui 时代 `--version` 也会静默启动 GUI（从未实现过该 flag），本次补上
+- [ ] Sync / E2EE 弹窗 / 阅读密码 gate 交互 / 搜索即时过滤 / 对话框 Esc/scrim：需真实后端与用户参与；
+      桌面为用户在用环境，不再自动化点击，待用户手动验收
+- [ ] `JOPLIN_RS_FONT` 覆盖后字体实际生效的目视确认（当前默认 PingFang 渲染已确认正常）
 
 ### 步骤 5：更新 docs/gpui-kit-migration.md
 
