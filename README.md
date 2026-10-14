@@ -86,6 +86,17 @@ published as an official GitHub Release; CI creates the matching tag
 tag like `v0.2.0` (prefer bumping minor/major so the new patch base does not
 go backwards relative to the automatically accumulated patch number).
 
+Release artifacts: the CLI and GUI ship as plain binaries in `tar.gz` (Linux,
+macOS) / `zip` (Windows). On macOS the GUI additionally ships as a DMG
+containing a `joplin-rs.app` bundle (drag into Applications; ad-hoc signed,
+not notarized, so use right-click -> Open on first launch). To package it
+locally on a Mac:
+
+```
+cargo build --release --target aarch64-apple-darwin
+tools/make-dmg.sh --target aarch64-apple-darwin
+```
+
 ## CLI usage
 
 Create `config.toml` (default location: `~/.joplin/config.toml`):
