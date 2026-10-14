@@ -7,6 +7,23 @@ A read-only Joplin client written in Rust:
 2. **Read-only notes** - browse notes in a GUI with Markdown rendering, or use
    the CLI. Nothing is ever uploaded; sync is download-only.
 
+## Why joplin-rs
+
+Joplin is my favorite daily note-taking tool, but the official client kept
+raising its macOS requirements. My old MacBook cannot run anything newer than
+macOS Big Sur, so recent official builds will not install on it; and after
+downgrading to the last compatible Joplin release, it could no longer sync
+properly with newer Joplin versions.
+
+joplin-rs is a from-scratch Rust client built for exactly this situation:
+
+1. **Compatibility first** - the primary goal is to run well on macOS Big Sur
+   and other hardware/OS combinations the official client has dropped.
+2. **Roadmap** - today: read-only E2EE sync and browsing; next: note editing
+   and upload sync.
+3. **Design philosophy** - fast, just-enough features, wide device
+   compatibility (速度要快，功能够用，设备兼容).
+
 ## What works
 
 - WebDAV sync (PROPFIND/GET based, basicDelta algorithm like Joplin):
@@ -152,9 +169,10 @@ cargo test --workspace
 - `crates/core/tests/plaintext_resource.rs`: unencrypted vault with a binary
   resource must round-trip byte-exact
 
-## Not implemented (by design)
+## Not implemented (yet)
 
-- Uploading / editing (read-only client)
+- Uploading / editing (read-only for now; note editing and upload sync are the
+  next milestone, see [Why joplin-rs](#why-joplin-rs))
 - Sync targets other than WebDAV
 - PPK (public/private key) master keys
 - OCB2-based legacy encryption (SJCL 1/2)
