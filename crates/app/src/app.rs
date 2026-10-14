@@ -163,7 +163,7 @@ pub fn data_dir() -> PathBuf {
 }
 
 /// Which modal dialog is currently open.
-#[derive(Default, PartialEq, Eq, Clone, Copy)]
+#[derive(Default, PartialEq, Eq, Clone, Copy, Debug)]
 pub enum Dialog {
     #[default]
     None,
@@ -314,6 +314,12 @@ impl AppState {
     pub fn new() -> anyhow::Result<Self> {
         let storage = Storage::open(&data_dir().join("joplin-rs.db"))?;
         let config = load_config();
+        Self::build(storage, config)
+    }
+
+    /// Single constructor body shared by [`Self::new`] and the test wiring:
+    /// keeps the field list in one place.
+    fn build(storage: Storage, config: Config) -> anyhow::Result<Self> {
         Ok(Self {
             storage,
             config,
@@ -1025,6 +1031,146 @@ mod tests {
         assert!(!e2ee_retry_supersedes_prompt("wrong-pw", "wrong-pw"));
         // Nothing submitted: always re-prompt.
         assert!(!e2ee_retry_supersedes_prompt("", "dav-pw"));
+    }
+
+    /// Full state-machine regression for the reported E2EE flows, simulating
+    /// the view tick: consume job events, then run the auto-decrypt pass.
+    /// Uses an in-memory storage so nothing touches the user's data dir.
+    fn tick(state: &mut AppState) {
+        let _ = state.handle_job_event();
+        crate::jobs::auto_decrypt(state);
+    }
+
+    /// The reported cancel loop: sync leaves items encrypted, the fallback
+    /// password fails, the user cancels -> the prompt must stay closed and no
+    /// further decrypt job may auto-start.
+    #[test]
+    fn e2ee_cancel_stops_the_prompt_loop_end_to_end() {
+        let mut state =
+            AppState::build(Storage::open_in_memory().unwrap(), Config::default()).unwrap();
+        state.config.password = Some("dav-pw".into()); // reused fallback
+
+        // SyncDone with pending items: the tick auto-starts decrypt with the
+        // fallback password (busy until the simulated job finishes).
+        state.e2ee_pending_count = 3;
+        let _ = state.jobs.take_event();
+        state.jobs.running = std::sync::Arc::new(std::sync::Mutex::new(false));
+        let event = JobEvent::SyncDone(Ok((
+            Stage1Summary {
+                downloaded: 3,
+                deleted: 0,
+                resources: 0,
+            },
+            3,
+        )));
+        *state.jobs.event.lock().unwrap() = Some(event);
+        tick(&mut state);
+        assert_eq!(state.e2ee_job_password, "dav-pw");
+
+        // The fallback password fails (simulated DecryptDone): the worker
+        // clears the busy flag before posting the event, as jobs.rs does.
+        state.jobs.running = std::sync::Arc::new(std::sync::Mutex::new(false));
+        *state.jobs.event.lock().unwrap() = Some(JobEvent::DecryptDone(Err(
+            "aes-gcm: password mismatch".into(),
+        )));
+        tick(&mut state);
+        assert_eq!(state.dialog, Dialog::E2eePrompt);
+
+        // User cancels: dialog closes and the decision is sticky.
+        state.cancel_e2ee_prompt();
+        assert_eq!(state.dialog, Dialog::None);
+        assert!(state.e2ee_cancelled);
+
+        // Ticks keep running (as in the real UI): no job restart, no dialog
+        // re-open, even though pending stays > 0 and the password is there.
+        for _ in 0..5 {
+            tick(&mut state);
+            assert_eq!(state.dialog, Dialog::None, "prompt must stay closed");
+            assert!(!state.jobs.is_busy(), "no decrypt job may restart");
+        }
+    }
+
+    /// The reported lost submission: the user types the correct password
+    /// while a stale (fallback-password) job is still running. The stale job
+    /// then fails; the submitted password must survive and be retried.
+    #[test]
+    fn e2ee_submission_during_stale_job_is_retried_end_to_end() {
+        let mut state =
+            AppState::build(Storage::open_in_memory().unwrap(), Config::default()).unwrap();
+        state.config.password = Some("dav-pw".into());
+
+        // SyncDone -> auto-start with the fallback password.
+        state.e2ee_pending_count = 2;
+        state.jobs.running = std::sync::Arc::new(std::sync::Mutex::new(false));
+        *state.jobs.event.lock().unwrap() = Some(JobEvent::SyncDone(Ok((
+            Stage1Summary {
+                downloaded: 2,
+                deleted: 0,
+                resources: 0,
+            },
+            2,
+        ))));
+        tick(&mut state);
+        assert_eq!(state.e2ee_job_password, "dav-pw");
+
+        // Mid-job the user submits the correct password (the view accepted
+        // it; the job slot is still busy, mirroring start_decrypt's guard).
+        state.e2ee_input = "correct-pw".into();
+        state.submit_e2ee_prompt();
+        assert_eq!(state.e2ee_session_password, "correct-pw");
+
+        // The stale job fails: the worker clears the busy flag before
+        // posting the event (as jobs.rs does). The submission must NOT be
+        // wiped, and the next tick must retry with the correct password
+        // instead of just re-prompting.
+        state.jobs.running = std::sync::Arc::new(std::sync::Mutex::new(false));
+        *state.jobs.event.lock().unwrap() = Some(JobEvent::DecryptDone(Err(
+            "aes-gcm: password mismatch".into(),
+        )));
+        tick(&mut state);
+        assert_eq!(state.e2ee_session_password, "correct-pw");
+        assert_eq!(state.e2ee_job_password, "correct-pw");
+        assert_eq!(state.dialog, Dialog::None);
+    }
+
+    /// Bug 1 end-to-end on the state machine: every re-lock of a protected
+    /// note bumps the gate epoch so the view layer clears the field, and the
+    /// mirror input is always reset.
+    #[test]
+    fn gate_relock_bumps_epoch_and_clears_input() {
+        let mut state =
+            AppState::build(Storage::open_in_memory().unwrap(), Config::default()).unwrap();
+        let note = Item {
+            item_type: 1,
+            props: {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert("id".to_string(), serde_json::Value::from(ID));
+                m.insert("title".to_string(), serde_json::Value::from("secret"));
+                m
+            },
+            body: "confidential".into(),
+        };
+        state.storage.upsert_item(&note).unwrap();
+        state.storage.set_note_protected(ID).unwrap();
+
+        state.reload_meta();
+        assert!(state.protected.contains(ID));
+
+        // First open: gate locks, epoch advances from 0.
+        state.request_open_note(ID);
+        assert!(state.note_locked);
+        assert_eq!(state.prot_gate_epoch, 1);
+        let first_epoch = state.prot_gate_epoch;
+
+        // Simulate the user typing (the view mirrors the field into state).
+        state.prot_input = "old-password".into();
+
+        // Focus lost, note re-opened: the epoch must advance again and the
+        // mirrored input reset, so the view knows to clear the field.
+        state.request_open_note(ID);
+        assert!(state.note_locked);
+        assert_eq!(state.prot_gate_epoch, first_epoch + 1);
+        assert!(state.prot_input.is_empty());
     }
 
     // ---- encrypted config secrets (CLI set-password compatibility) ----
