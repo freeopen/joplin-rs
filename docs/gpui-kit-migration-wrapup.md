@@ -110,6 +110,19 @@ cargo clippy -p joplin-rs-app
 gpui-kit 对 Linux 同时启用 x11 + wayland（见 gpui-kit-0.7.3 Cargo.toml），运行时依赖
 `ubuntu-latest` 镜像自带。若 CI 仍报链接错误再按报错补包并回写此处。
 
+CI 实测（2026-10-14，run 38585346395 / commit 6530596）：**Linux 需要补 apt 包**，
+Build 步骤 exit 101。核查依赖图后确认两处构建期硬依赖：
+
+1. `zed-font-kit`（gpui-pre-linux 拉入）默认 feature `source-fontconfig` 用
+   `yeslogic-fontconfig-sys`，其 build script 直接 `pkg_config::find_library("fontconfig").unwrap()`
+   —— runner 无 `libfontconfig1-dev`/`pkg-config` 时 panic（即观察到的 101）。
+   该 crate 支持 `RUST_FONTCONFIG_DLOPEN=1` 走 dlopen，但 gpui-pre-linux 未设；
+2. `xkbcommon` 0.8 无 dlopen feature，`#[link(name = "xkbcommon")]` 与
+   `xkbcommon-x11` 在链接期就要求 `.so` 存在，且 `zed-scap`/`xcb` 链需要 `libxcb`。
+
+release.yml 已在 Linux leg 增补 `apt-get install pkg-config libfontconfig1-dev
+libxkbcommon-dev libxcb1-dev`。
+
 ## 4. Validation 汇总
 
 | 层面 | 手段 | 通过标准 |
