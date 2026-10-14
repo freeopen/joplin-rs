@@ -1,8 +1,18 @@
 # joplin-rs GUI 迁移到 gpui-kit
 
-> 状态：计划（未开始实施）
+> 状态：已实施（2026-10-13，本地验证通过；收尾验证见 [gpui-kit-migration-wrapup.md](gpui-kit-migration-wrapup.md)）
 > 目标版本：gpui-kit 0.7.3（gpui-pre 0.3.9 / gpui-base 0.7.3 / gpui-component 0.7.3 / gpui-kit-assets 0.7.1）
 > 现状基线：`gpui = "=0.2.2"` + 手写 widgets（`ui/input.rs` / `ui/dialog.rs` / `ui/markdown.rs`），位于 `gpui-view` feature 之后
+
+## 0. 实际落地与计划差异（2026-10-13 收尾时记录）
+
+1. **feature 门控未保留**：未按步骤 1-6 保留 `gpui-view` feature，步骤 7 前移，egui
+   依赖与 feature 同批删除。中间态不可逐步编译，故整个迁移是单个原子提交。
+2. **对话框 API**：用 `WindowExt::open_dialog` / `open_alert_dialog`（Root 栈式管理），
+   而非 §3.1 草案的 `DialogHandle` 命令式 API；`AppState.dialog` 仍是唯一事实来源，
+   `sync_dialog_from_state` 负责对齐开关。
+3. **轮询签名**：用 `cx.spawn_in(window, ..)`（闭包带 window 上下文）而非裸
+   `cx.spawn`，dialog 同步需要 window。
 
 ## 1. 背景与目标
 
