@@ -447,7 +447,9 @@ impl NoteBrowser {
         });
         let accepted = self.state.read(cx).dialog == AppDialog::None;
         if accepted {
-            self.state.update(cx, |s, _| jobs::start_decrypt(s));
+            // Run a full two-way sync: the session password now present both
+            // decrypts the pending items and lets local changes be uploaded.
+            self.state.update(cx, |s, _| jobs::start_download(s));
             self.pending_dialog = AppDialog::None;
         }
         accepted
