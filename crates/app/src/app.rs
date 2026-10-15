@@ -931,13 +931,6 @@ impl AppState {
         }
     }
 
-    /// Ask for confirmation before deleting the open note.
-    pub fn request_delete_note(&mut self) {
-        if let Some(id) = self.selected_note.clone() {
-            self.request_delete_note_of(&id);
-        }
-    }
-
     /// Ask for confirmation before deleting a specific note.
     pub fn request_delete_note_of(&mut self, id: &str) {
         self.confirm_note_title = self
@@ -1193,11 +1186,20 @@ impl AppState {
         }
     }
 
-    /// From an unlocked protected note, jump back to its gate (where the
-    /// password can remove protection).
-    pub fn gate_open_note(&mut self) {
-        if let Some(id) = self.selected_note.clone() {
-            self.request_open_note(&id);
+    /// Toggle protection of a note from the note-list context menu.
+    ///
+    /// Locking reuses [`Self::protect_open_note`] (which requires a global
+    /// reading password, else opens its settings). Unlocking must verify the
+    /// password, so the note is routed to its gate where the password can be
+    /// entered and the gate's "取消保护" button removes the lock.
+    pub fn toggle_protect_note(&mut self, id: &str) {
+        self.end_edit();
+        if self.protected.contains(id) {
+            self.request_open_note(id);
+            self.set_status("输入阅读密码后点击「取消保护」".into());
+        } else {
+            self.selected_note = Some(id.to_string());
+            self.protect_open_note();
         }
     }
 
@@ -1842,6 +1844,44 @@ mod tests {
         );
     }
 
+    /// Context-menu protection toggle: without a reading password it opens the
+    /// password settings instead of locking; with one it locks the note and
+    /// routes it to the gate (removing the lock also goes through the gate).
+    #[test]
+    fn toggle_protect_note_locks_and_routes_to_gate() {
+        let mut state =
+            AppState::build(Storage::open_in_memory().unwrap(), Config::default()).unwrap();
+        let folder = state.storage.create_folder("F").unwrap();
+        let note = state.storage.create_note(&folder, "N").unwrap();
+        state.refresh_lists();
+        state.request_open_note(&note);
+
+        // No reading password: refused, and the settings dialog opens instead.
+        state.toggle_protect_note(&note);
+        assert_eq!(state.dialog, Dialog::ReaderPasswordSettings);
+        assert!(
+            !state.protected.contains(&note),
+            "not locked without a password"
+        );
+
+        // With a reading password the note is locked and routed to its gate.
+        state.config.reader_password_hash = Some(hash_password("pw"));
+        state.dialog = Dialog::None;
+        state.toggle_protect_note(&note);
+        assert!(state.protected.contains(&note), "note is protected");
+        assert!(state.note_locked, "protected note routes through the gate");
+        assert_eq!(state.selected_note.as_deref(), Some(note.as_str()));
+
+        // Toggling a protected note again goes straight to the gate.
+        state.note_locked = false;
+        state.toggle_protect_note(&note);
+        assert!(state.note_locked, "unlock path lands on the gate");
+        assert!(
+            state.protected.contains(&note),
+            "still protected until the password verifies"
+        );
+    }
+
     /// Regression: submitting the correct E2EE password while a stale job
     /// (started with the wrong fallback password) was still running lost the
     /// submission - the old DecryptDone(Err) handler cleared the session
@@ -2040,7 +2080,7 @@ mod tests {
             "an edited note must be queued for upload"
         );
 
-        state.request_delete_note();
+        state.request_delete_note_of(&note);
         state.confirm_delete();
         assert!(state.selected_note.is_none());
         assert!(state.storage.note(&note).unwrap().is_none());
@@ -2096,7 +2136,7 @@ mod tests {
         state.request_open_note(&note);
 
         // Delete note: opens the confirmation dialog, does not delete yet.
-        state.request_delete_note();
+        state.request_delete_note_of(&note);
         assert_eq!(state.dialog, Dialog::ConfirmDeleteNote);
         assert_eq!(state.confirm_note_title, "N");
         assert!(state.storage.note(&note).unwrap().is_some());

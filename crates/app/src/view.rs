@@ -54,6 +54,7 @@ gpui_kit::actions!(
         ToggleNotes,
         FindInNote,
         GlobalSearch,
+        ToggleEdit,
         Quit,
         ShowAbout
     ]
@@ -72,6 +73,7 @@ fn register(cx: &mut App) {
         KeyBinding::new("cmd-alt-b", ToggleNotes, None),
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-f", FindInNote, None),
+        KeyBinding::new("cmd-e", ToggleEdit, None),
         KeyBinding::new("cmd-alt-f", GlobalSearch, None),
         KeyBinding::new("cmd-,", OpenSettings, None),
     ];
@@ -82,6 +84,7 @@ fn register(cx: &mut App) {
         KeyBinding::new("ctrl-alt-b", ToggleNotes, None),
         KeyBinding::new("ctrl-q", Quit, None),
         KeyBinding::new("ctrl-f", FindInNote, None),
+        KeyBinding::new("ctrl-e", ToggleEdit, None),
         KeyBinding::new("ctrl-alt-f", GlobalSearch, None),
         KeyBinding::new("ctrl-,", OpenSettings, None),
     ];
@@ -126,6 +129,8 @@ fn install_menus(cx: &mut App) {
         Menu::new("View").items(vec![
             MenuItem::action("Toggle Notebooks", ToggleNotebooks),
             MenuItem::action("Toggle Notes", ToggleNotes),
+            MenuItem::separator(),
+            MenuItem::action("Toggle Edit/Preview", ToggleEdit),
         ]),
     ];
     #[cfg(not(target_os = "macos"))]
@@ -147,6 +152,8 @@ fn install_menus(cx: &mut App) {
         Menu::new("View").items(vec![
             MenuItem::action("Toggle Notebooks", ToggleNotebooks),
             MenuItem::action("Toggle Notes", ToggleNotes),
+            MenuItem::separator(),
+            MenuItem::action("Toggle Edit/Preview", ToggleEdit),
         ]),
     ];
     cx.set_menus(menus);
@@ -505,7 +512,7 @@ impl NoteBrowser {
             state.update(cx, |s, _| jobs::start_download(s));
         }
 
-        Self {
+        let this = Self {
             state,
             search_query,
             gate_input,
@@ -534,7 +541,13 @@ impl NoteBrowser {
             set_ca,
             focus: cx.focus_handle(),
             subscriptions,
-        }
+        };
+        // Give the root (key_context "NoteBrowser") focus at startup: with no
+        // focused element GPUI dispatches actions only to the window root node,
+        // so the root's action listeners never fire and every shortcut is dead
+        // until the user clicks a list.
+        window.focus(&this.focus, cx);
+        this
     }
 
     fn sync_clicked(&mut self, _: &Sync, _: &mut Window, cx: &mut Context<Self>) {
@@ -591,6 +604,20 @@ impl NoteBrowser {
 
     fn toggle_notes(&mut self, _: &ToggleNotes, _: &mut Window, cx: &mut Context<Self>) {
         self.state.update(cx, |s, _| s.show_notes = !s.show_notes);
+        cx.notify();
+    }
+
+    /// Toggle edit/preview for the open note (⌘E / ⌃E). `begin_edit` guards on
+    /// `can_edit` (protected/encrypted notes stay read-only); `end_edit` saves
+    /// any pending change.
+    fn toggle_edit(&mut self, _: &ToggleEdit, _: &mut Window, cx: &mut Context<Self>) {
+        self.state.update(cx, |s, _| {
+            if s.editing {
+                s.end_edit();
+            } else {
+                s.begin_edit();
+            }
+        });
         cx.notify();
     }
 
@@ -1513,11 +1540,13 @@ impl Render for NoteBrowser {
         div()
             .id("root")
             .key_context("NoteBrowser")
+            .track_focus(&self.focus)
             .on_action(cx.listener(Self::sync_clicked))
             .on_action(cx.listener(Self::reader_password_clicked))
             .on_action(cx.listener(Self::quit_action))
             .on_action(cx.listener(Self::toggle_notebooks))
             .on_action(cx.listener(Self::toggle_notes))
+            .on_action(cx.listener(Self::toggle_edit))
             .on_action(cx.listener(Self::global_search))
             .on_action(cx.listener(Self::find_in_note))
             .on_action(cx.listener(Self::settings_clicked))
@@ -2036,6 +2065,7 @@ impl NoteBrowser {
                                     .context_menu({
                                         let browser = browser.clone();
                                         let note_id = menu_note_id.clone();
+                                        let note_protected = protected.contains(&note_id);
                                         let parent_id = note
                                             .props
                                             .get("parent_id")
@@ -2079,8 +2109,8 @@ impl NoteBrowser {
                                                             .ok();
                                                     }
                                                 }));
-                                            menu =
-                                                menu.item(PopupMenuItem::new("删除").on_click({
+                                            menu = menu.item(
+                                                PopupMenuItem::new("删除笔记").on_click({
                                                     let browser = browser.clone();
                                                     let note_id = note_id.clone();
                                                     move |_, window, cx| {
@@ -2098,7 +2128,32 @@ impl NoteBrowser {
                                                             })
                                                             .ok();
                                                     }
-                                                }));
+                                                }),
+                                            );
+                                            menu = menu.item(
+                                                PopupMenuItem::new(if note_protected {
+                                                    "取消保护"
+                                                } else {
+                                                    "🔒 保护此笔记"
+                                                })
+                                                .on_click({
+                                                    let browser = browser.clone();
+                                                    let note_id = note_id.clone();
+                                                    move |_, window, cx| {
+                                                        browser
+                                                            .update(cx, |view, cx| {
+                                                                view.state.update(cx, |s, _| {
+                                                                    s.toggle_protect_note(&note_id);
+                                                                });
+                                                                view.sync_dialog_from_state(
+                                                                    window, cx,
+                                                                );
+                                                                cx.notify();
+                                                            })
+                                                            .ok();
+                                                    }
+                                                }),
+                                            );
                                             let sub_browser = browser.clone();
                                             let sub_note_id = note_id.clone();
                                             let sub_folders = folder_list.clone();
@@ -2233,11 +2288,6 @@ impl NoteBrowser {
         let editing = state.editing;
         let vim_mode = state.config.vim_mode;
         let vim_normal = state.vim_normal;
-        let is_protected = state
-            .selected_note
-            .as_deref()
-            .map(|id| state.protected.contains(id))
-            .unwrap_or(false);
         let resource_dir = state.resource_dir.clone();
 
         div()
@@ -2295,41 +2345,6 @@ impl NoteBrowser {
                                                 s.begin_edit();
                                             }
                                         });
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("btn-delete-note")
-                                    .outline()
-                                    .small()
-                                    .danger()
-                                    .label("删除笔记")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.state.update(cx, |s, _| s.request_delete_note());
-                                        this.sync_dialog_from_state(window, cx);
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("btn-protect")
-                                    .outline()
-                                    .small()
-                                    .label(if is_protected {
-                                        "取消保护"
-                                    } else {
-                                        "🔒 保护此笔记"
-                                    })
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.state.update(cx, |s, _| {
-                                            if s.protected
-                                                .contains(s.selected_note.as_deref().unwrap_or(""))
-                                            {
-                                                s.gate_open_note();
-                                            } else {
-                                                s.protect_open_note();
-                                            }
-                                        });
-                                        this.sync_dialog_from_state(window, cx);
                                         cx.notify();
                                     })),
                             ),
