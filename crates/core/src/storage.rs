@@ -925,7 +925,7 @@ mod tests {
         let item = unserialize(NOTE_BLOB).unwrap();
         storage.upsert_item(&item).unwrap();
         storage
-            .save_sync_time(&item.props["id"].as_str().unwrap(), 123, 456)
+            .save_sync_time(item.props["id"].as_str().unwrap(), 123, 456)
             .unwrap();
 
         let notes = storage.notes("", true).unwrap();
@@ -1059,7 +1059,7 @@ mod tests {
         // remote delete.
         storage.delete_item(&folder).unwrap();
         storage.clear_pending_delete(&folder).unwrap();
-        storage.delete_items(&[folder.clone()]).unwrap();
+        storage.delete_items(std::slice::from_ref(&folder)).unwrap();
         assert!(storage.pending_deletes().unwrap().is_empty());
     }
 

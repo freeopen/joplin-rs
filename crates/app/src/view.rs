@@ -24,13 +24,14 @@ use std::sync::Arc;
 use gpui_kit::component::{
     button::{Button, ButtonVariants},
     dialog::{DialogAction, DialogFooter},
-    input::{Copy, Cut, Input, InputEvent, InputState, Paste, SelectAll},
+    input::{Copy, Cut, Input, InputEvent, InputState, Paste, SelectAll, Textarea, TextareaState},
+    scroll::Scrollbar,
     ActiveTheme, Disableable, Sizable, WindowExt,
 };
 use gpui_kit::{
-    div, prelude::*, px, App, Bounds, Context, Entity, FocusHandle, Focusable, Image, ImageFormat,
-    ImageSource, KeyBinding, Menu, MenuItem, Render, Resource, SharedString, SharedUri, Size,
-    Subscription, Window, WindowBounds, WindowOptions,
+    div, prelude::*, px, relative, App, Bounds, Context, Entity, FocusHandle, Focusable, Image,
+    ImageFormat, ImageSource, KeyBinding, Menu, MenuItem, Render, Resource, ScrollHandle,
+    SharedString, SharedUri, Size, Subscription, Window, WindowBounds, WindowOptions,
 };
 
 use crate::app::{is_encrypted_placeholder, short_id, AppState, Dialog as AppDialog};
@@ -38,7 +39,8 @@ use crate::jobs;
 
 gpui_kit::actions!(app, [Sync, Reload, OpenReaderPassword, Quit, ShowAbout]);
 
-const SIDEBAR_WIDTH: f32 = 280.;
+const NOTEBOOKS_WIDTH: f32 = 200.;
+const NOTES_WIDTH: f32 = 300.;
 
 /// Register app-level key bindings and OS menus.
 fn register(cx: &mut App) {
@@ -100,6 +102,17 @@ pub struct NoteBrowser {
     rp_new: Entity<InputState>,
     rp_confirm: Entity<InputState>,
     e2ee_input: Entity<InputState>,
+    /// Note editor fields (title single-line, body multi-line).
+    title_edit: Entity<InputState>,
+    note_edit: Entity<TextareaState>,
+    /// New/rename notebook name field.
+    nb_input: Entity<InputState>,
+    /// Scroll handles backing the list scrollbars.
+    notebook_scroll: ScrollHandle,
+    note_scroll: ScrollHandle,
+    /// Last seen `edit_epoch`: the persistent editor fields are (re)seeded
+    /// into `set_value` when it changes.
+    edit_epoch_seen: u64,
     /// Dialog the state machine wants shown (mirrors app::Dialog).
     pending_dialog: AppDialog,
     /// Guard: only auto-focus a dialog's first field once per opening.
@@ -151,8 +164,66 @@ impl NoteBrowser {
                 .placeholder("E2EE 主密码")
                 .masked(true)
         });
+        let title_edit = cx.new(|cx| InputState::new(window, cx).placeholder("标题"));
+        let note_edit = cx.new(|cx| TextareaState::new(window, cx).placeholder("Markdown 正文…"));
+        let nb_input = cx.new(|cx| InputState::new(window, cx).placeholder("笔记本名称"));
 
         let mut subscriptions = Vec::new();
+        // Note title: mirror into the working copy on change; save on blur.
+        subscriptions.push(cx.subscribe(
+            &title_edit,
+            |this: &mut Self, state, event: &InputEvent, cx| {
+                match event {
+                    InputEvent::Change => {
+                        let text = state.read(cx).value().to_string();
+                        this.state.update(cx, |s, _| {
+                            s.edit_title = text;
+                            s.mark_edit_dirty();
+                        });
+                    }
+                    InputEvent::Blur => {
+                        this.state.update(cx, |s, _| {
+                            s.save_edit();
+                        });
+                    }
+                    _ => return,
+                }
+                cx.notify();
+            },
+        ));
+        // Note body: mirror into the working copy on change; save on blur.
+        subscriptions.push(cx.subscribe(
+            &note_edit,
+            |this: &mut Self, state, event: &InputEvent, cx| {
+                match event {
+                    InputEvent::Change => {
+                        let text = state.read(cx).value().to_string();
+                        this.state.update(cx, |s, _| {
+                            s.edit_body = text;
+                            s.mark_edit_dirty();
+                        });
+                    }
+                    InputEvent::Blur => {
+                        this.state.update(cx, |s, _| {
+                            s.save_edit();
+                        });
+                    }
+                    _ => return,
+                }
+                cx.notify();
+            },
+        ));
+        // New/rename notebook dialog field.
+        subscriptions.push(cx.subscribe(
+            &nb_input,
+            |this: &mut Self, state, event: &InputEvent, cx| {
+                if !matches!(event, InputEvent::Change) {
+                    return;
+                }
+                let text = state.read(cx).value().to_string();
+                this.state.update(cx, |s, _| s.nb_input = text);
+            },
+        ));
         // Search-as-you-type: reload the note list whenever the search text
         // changes (replaces the old per-tick value polling).
         subscriptions.push(cx.subscribe(
@@ -164,6 +235,7 @@ impl NoteBrowser {
                 let text = state.read(cx).value().to_string();
                 this.state.update(cx, |s, _| {
                     if s.search != text {
+                        s.end_edit();
                         s.search = text;
                         s.load_notes();
                     }
@@ -248,6 +320,23 @@ impl NoteBrowser {
                         // password is available (mirrors the egui flow's
                         // auto-continue; honours the sticky cancel flag).
                         this.state.update(cx, |s, _| jobs::auto_decrypt(s));
+                        // Debounced autosave (3s after the last change).
+                        this.state.update(cx, |s, _| s.autosave_tick());
+                        // (Re)seed the editor fields when edit mode (re)starts;
+                        // `set_value` emits no Change event, so this does not
+                        // mark the note dirty.
+                        let edit_epoch = this.state.read(cx).edit_epoch;
+                        if edit_epoch != this.edit_epoch_seen {
+                            this.edit_epoch_seen = edit_epoch;
+                            let (title, body) = {
+                                let s = this.state.read(cx);
+                                (s.edit_title.clone(), s.edit_body.clone())
+                            };
+                            this.title_edit
+                                .update(cx, |i, cx| i.set_value(title, window, cx));
+                            this.note_edit
+                                .update(cx, |i, cx| i.set_value(body, window, cx));
+                        }
                         // A protected note (re)locked: clear the gate field so
                         // the re-opened gate never shows the last password.
                         // (`set_value` emits no Change event, so AppState's
@@ -274,6 +363,12 @@ impl NoteBrowser {
             rp_new,
             rp_confirm,
             e2ee_input,
+            title_edit,
+            note_edit,
+            nb_input,
+            notebook_scroll: ScrollHandle::new(),
+            note_scroll: ScrollHandle::new(),
+            edit_epoch_seen: 0,
             pending_dialog: AppDialog::None,
             rp_dialog_focused: Rc::new(Cell::new(false)),
             e2ee_dialog_focused: Rc::new(Cell::new(false)),
@@ -377,6 +472,9 @@ impl NoteBrowser {
             AppDialog::None => {}
             AppDialog::ReaderPasswordSettings => self.open_rp_dialog(window, cx),
             AppDialog::E2eePrompt => self.open_e2ee_dialog(window, cx),
+            AppDialog::NewNotebook | AppDialog::RenameNotebook => {
+                self.open_notebook_dialog(window, cx, want)
+            }
             #[cfg(not(target_os = "macos"))]
             AppDialog::About => self.open_about_dialog(window, cx),
         }
@@ -592,6 +690,93 @@ impl NoteBrowser {
         });
     }
 
+    /// Modal for creating or renaming a notebook.
+    fn open_notebook_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        which: AppDialog,
+    ) {
+        let browser = cx.entity().downgrade();
+        let is_new = matches!(which, AppDialog::NewNotebook);
+        let input = self.nb_input.clone();
+        let initial = self.state.read(cx).nb_input.clone();
+        input.update(cx, |i, cx| i.set_value(initial, window, cx));
+        window.open_dialog(cx, move |dialog, window, cx| {
+            let handle = input.read(cx).focus_handle(cx);
+            window.focus(&handle, cx);
+            let browser_ok = browser.clone();
+            let browser_cancel = browser.clone();
+            let browser_close = browser.clone();
+            let error = browser
+                .update(cx, |view, cx| view.state.read(cx).nb_error.clone())
+                .ok()
+                .flatten();
+            let input = input.clone();
+            dialog
+                .title(if is_new {
+                    "新建笔记本"
+                } else {
+                    "重命名笔记本"
+                })
+                .w(px(360.))
+                .content({
+                    let input = input.clone();
+                    let error = error.clone();
+                    move |content, _window, _cx| {
+                        content
+                            .child(form_row("名称", input.clone()))
+                            .when_some(error.clone(), |el, err| el.child(error_line(err)))
+                    }
+                })
+                .footer(
+                    DialogFooter::new()
+                        .child(Button::new("nb-cancel").label("取消").on_click(
+                            move |_, window, cx| {
+                                browser_cancel
+                                    .update(cx, |view, cx| {
+                                        view.state.update(cx, |s, _| s.dialog = AppDialog::None);
+                                        view.pending_dialog = AppDialog::None;
+                                    })
+                                    .ok();
+                                window.close_dialog(cx);
+                            },
+                        ))
+                        .child(DialogAction::new().child(
+                            Button::new("nb-save").primary().label(if is_new {
+                                "创建"
+                            } else {
+                                "保存"
+                            }),
+                        )),
+                )
+                .on_ok(move |_, _, cx| {
+                    browser_ok
+                        .update(cx, |view, cx| {
+                            let ok = if is_new {
+                                view.state.update(cx, |s, _| s.submit_new_notebook())
+                            } else {
+                                view.state.update(cx, |s, _| s.submit_rename_notebook())
+                            };
+                            if ok {
+                                view.pending_dialog = AppDialog::None;
+                            }
+                            ok
+                        })
+                        .unwrap_or(true)
+                })
+                .on_cancel(move |_, _, cx| {
+                    browser_close
+                        .update(cx, |view, cx| {
+                            view.state.update(cx, |s, _| s.dialog = AppDialog::None);
+                            view.pending_dialog = AppDialog::None;
+                        })
+                        .ok();
+                    true
+                })
+        });
+    }
+
     #[cfg(not(target_os = "macos"))]
     fn open_about_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let browser = cx.entity().downgrade();
@@ -623,6 +808,8 @@ impl Render for NoteBrowser {
         let status = self.state.read(cx).status.clone();
         let busy = self.state.read(cx).jobs.is_busy();
         let worker = self.state.read(cx).jobs.worker_status();
+        let show_notebooks = self.state.read(cx).show_notebooks;
+        let show_notes = self.state.read(cx).show_notes;
         let status_line = if !worker.is_empty() {
             worker
         } else if status.is_empty() {
@@ -691,6 +878,36 @@ impl Render for NoteBrowser {
                                 cx.notify();
                             })),
                     )
+                    .child(
+                        Button::new("toggle-notebooks")
+                            .small()
+                            .outline()
+                            .label(if show_notebooks {
+                                "隐藏笔记本"
+                            } else {
+                                "显示笔记本"
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.state.update(cx, |s, _| {
+                                    s.show_notebooks = !s.show_notebooks;
+                                });
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("toggle-notes")
+                            .small()
+                            .outline()
+                            .label(if show_notes {
+                                "隐藏笔记"
+                            } else {
+                                "显示笔记"
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.state.update(cx, |s, _| s.show_notes = !s.show_notes);
+                                cx.notify();
+                            })),
+                    )
                     // macOS has the native app-menu About panel; other
                     // platforms open the in-window dialog from the toolbar.
                     .child(
@@ -721,44 +938,92 @@ impl Render for NoteBrowser {
                     .border_color(theme.border)
                     .child(Input::new(&self.search_input).id("search").cleanable(true)),
             )
-            // ---- body: sidebar + note panel ----
+            // ---- body: notebooks | notes | note panel ----
             .child(
                 div()
                     .flex_1()
                     .flex()
                     .min_h_0()
-                    .child(self.render_sidebar(cx))
+                    .when(show_notebooks, |el| {
+                        el.child(self.render_notebooks_column(cx))
+                    })
+                    .when(show_notes, |el| el.child(self.render_notes_column(cx)))
                     .child(self.render_note_panel(window, cx)),
             )
     }
 }
 
 impl NoteBrowser {
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+    fn render_notebooks_column(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let theme = cx.theme();
         let state = self.state.read(cx);
         let folders = state.folders.clone();
         let selected_folder = state.selected_folder.clone();
-        let notes = state.notes.clone();
-        let note_tags = state.note_tags.clone();
-        let search_hits = state.search_hits.clone();
-        let protected = state.protected.clone();
-        let selected_note = state.selected_note.clone();
+        let has_selection = selected_folder.is_some();
 
         div()
-            .w(px(SIDEBAR_WIDTH))
+            .w(px(NOTEBOOKS_WIDTH))
             .flex_shrink_0()
             .border_r_1()
             .border_color(theme.border)
             .flex()
             .flex_col()
             .bg(theme.muted)
+            // Header: title + actions (new / rename / delete / hide).
             .child(
                 div()
-                    .px_3()
-                    .py_2()
-                    .font_weight(gpui_kit::FontWeight::BOLD)
-                    .child("Notebooks"),
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_2()
+                    .py_1()
+                    .child(
+                        div()
+                            .font_weight(gpui_kit::FontWeight::BOLD)
+                            .child("Notebooks"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_0p5()
+                            .child(Button::new("nb-new").ghost().small().label("＋").on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.state.update(cx, |s, _| s.open_new_notebook());
+                                    this.sync_dialog_from_state(window, cx);
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(
+                                Button::new("nb-rename")
+                                    .ghost()
+                                    .small()
+                                    .label("✎")
+                                    .disabled(!has_selection)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.state.update(cx, |s, _| s.open_rename_notebook());
+                                        this.sync_dialog_from_state(window, cx);
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("nb-delete")
+                                    .ghost()
+                                    .small()
+                                    .label("🗑")
+                                    .disabled(!has_selection)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.state.update(cx, |s, _| s.delete_selected_notebook());
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(Button::new("nb-hide").ghost().small().label("⯇").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.state.update(cx, |s, _| s.show_notebooks = false);
+                                    cx.notify();
+                                }),
+                            )),
+                    ),
             )
             .child(
                 div()
@@ -766,11 +1031,14 @@ impl NoteBrowser {
                     .px_3()
                     .py_1()
                     .cursor_pointer()
-                    .when(selected_folder.is_none(), |el| el.bg(theme.accent))
-                    .hover(|s| s.bg(theme.accent.opacity(0.6)))
+                    .when(selected_folder.is_none(), |el| {
+                        el.bg(theme.accent.opacity(0.5))
+                    })
+                    .hover(|s| s.bg(theme.accent.opacity(0.25)))
                     .child("All notes")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.state.update(cx, |s, _| {
+                            s.end_edit();
                             s.selected_folder = None;
                             s.load_notes();
                         });
@@ -779,151 +1047,239 @@ impl NoteBrowser {
             )
             .child(
                 div()
-                    .id("folder-list")
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .children(folders.iter().map(|folder| {
-                        let id = folder
-                            .props
-                            .get("id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let title = folder
-                            .props
-                            .get("title")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let selected = selected_folder.as_deref() == Some(id.as_str());
-                        div()
-                            .id(SharedString::from(format!("folder-{id}")))
-                            .px_3()
-                            .py_1()
-                            .cursor_pointer()
-                            .when(selected, |el| el.bg(theme.accent))
-                            .hover(|s| s.bg(theme.accent.opacity(0.6)))
-                            .child(SharedString::from(title))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.state.update(cx, |s, _| {
-                                    s.selected_folder = Some(id.clone());
-                                    s.load_notes();
-                                });
-                                cx.notify();
-                            }))
-                    })),
-            )
-            .child(
-                div()
-                    .px_3()
-                    .py_2()
-                    .font_weight(gpui_kit::FontWeight::BOLD)
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .child("Notes"),
-            )
-            .child(
-                div()
-                    .id("note-list")
+                    .id("folder-list-wrap")
+                    .relative()
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .children(notes.iter().map(|note| {
-                        let id = note
-                            .props
-                            .get("id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let encrypted = is_encrypted_placeholder(note);
-                        let is_protected = protected.contains(&id);
-                        let raw_title = note
-                            .props
-                            .get("title")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let mut title = if encrypted {
-                            if raw_title.is_empty() {
-                                format!("🔒 已加密 {}", short_id(&id))
-                            } else {
-                                format!("🔒 {raw_title}")
-                            }
-                        } else if raw_title.is_empty() {
-                            "(no title)".to_string()
-                        } else {
-                            raw_title
-                        };
-                        if is_protected {
-                            title = format!("🔐 {title}");
-                        }
-                        let is_todo = note
-                            .props
-                            .get("is_todo")
-                            .and_then(|v| v.as_i64())
-                            .unwrap_or(0)
-                            == 1;
-                        let done = note
-                            .props
-                            .get("todo_completed")
-                            .and_then(|v| v.as_i64())
-                            .unwrap_or(0)
-                            > 0;
-                        let label = if is_todo {
-                            format!("{} {}", if done { "☑" } else { "☐" }, title)
-                        } else {
-                            title
-                        };
-                        let selected = selected_note.as_deref() == Some(id.as_str());
-                        let tags = note_tags.get(&id).cloned().unwrap_or_default();
-                        let snippet = search_hits.get(&id).cloned();
-
+                    .child(
                         div()
-                            .id(SharedString::from(format!("note-{id}")))
-                            .px_3()
-                            .py_1()
-                            .cursor_pointer()
-                            .when(selected, |el| el.bg(theme.accent))
-                            .hover(|s| s.bg(theme.accent.opacity(0.6)))
+                            .id("folder-list")
+                            .size_full()
+                            .track_scroll(&self.notebook_scroll)
+                            .overflow_y_scroll()
+                            .children(folders.iter().map(|folder| {
+                                let id = folder
+                                    .props
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let title = folder
+                                    .props
+                                    .get("title")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let selected = selected_folder.as_deref() == Some(id.as_str());
+                                div()
+                                    .id(SharedString::from(format!("folder-{id}")))
+                                    .px_3()
+                                    .py_1()
+                                    .cursor_pointer()
+                                    .when(selected, |el| el.bg(theme.accent.opacity(0.5)))
+                                    .hover(|s| s.bg(theme.accent.opacity(0.25)))
+                                    .child(SharedString::from(title))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.state.update(cx, |s, _| {
+                                            s.end_edit();
+                                            s.selected_folder = Some(id.clone());
+                                            s.load_notes();
+                                        });
+                                        cx.notify();
+                                    }))
+                            })),
+                    )
+                    .child(Scrollbar::vertical(&self.notebook_scroll)),
+            )
+            .into_any_element()
+    }
+
+    fn render_notes_column(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let theme = cx.theme();
+        let state = self.state.read(cx);
+        let notes = state.notes.clone();
+        let note_tags = state.note_tags.clone();
+        let search_hits = state.search_hits.clone();
+        let protected = state.protected.clone();
+        let selected_note = state.selected_note.clone();
+        let has_folder = state.selected_folder.is_some();
+        let has_note = selected_note.is_some();
+
+        div()
+            .w(px(NOTES_WIDTH))
+            .flex_shrink_0()
+            .border_r_1()
+            .border_color(theme.border)
+            .flex()
+            .flex_col()
+            .bg(theme.muted)
+            // Header: title + actions (new / delete / hide).
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_2()
+                    .py_1()
+                    .child(div().font_weight(gpui_kit::FontWeight::BOLD).child("Notes"))
+                    .child(
+                        div()
                             .flex()
-                            .flex_col()
+                            .items_center()
                             .gap_0p5()
-                            .child(SharedString::from(label))
-                            .when(!tags.is_empty(), |el| {
-                                el.child(
-                                    div()
-                                        .flex()
-                                        .gap_1()
-                                        .text_size(px(11.))
-                                        .text_color(theme.muted_foreground)
-                                        .children(
-                                            tags.iter()
-                                                .map(|t| SharedString::from(format!("#{t}"))),
-                                        ),
-                                )
-                            })
-                            .when(snippet.is_some() && !encrypted && !is_protected, |el| {
-                                el.child(
-                                    div()
-                                        .text_size(px(11.))
-                                        .text_color(theme.muted_foreground)
-                                        .child(SharedString::from(snippet.unwrap_or_default())),
-                                )
-                            })
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                let note_id = id.clone();
-                                this.state.update(cx, |s, _| s.request_open_note(&note_id));
-                                // A protected note (re)locks here: drop any
-                                // password still sitting in the gate field so
-                                // re-opening never reuses it.
-                                if this.state.read(cx).note_locked {
-                                    this.gate_input
-                                        .update(cx, |input, cx| input.set_value("", window, cx));
-                                    this.gate_epoch_seen = this.state.read(cx).prot_gate_epoch;
+                            .child(
+                                Button::new("note-new")
+                                    .ghost()
+                                    .small()
+                                    .label("＋")
+                                    .disabled(!has_folder)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.state.update(cx, |s, _| s.new_note());
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("note-delete")
+                                    .ghost()
+                                    .small()
+                                    .label("🗑")
+                                    .disabled(!has_note)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.state.update(cx, |s, _| s.delete_selected_note());
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("note-hide")
+                                    .ghost()
+                                    .small()
+                                    .label("⯈")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.state.update(cx, |s, _| s.show_notes = false);
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .id("note-list-wrap")
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        div()
+                            .id("note-list")
+                            .size_full()
+                            .track_scroll(&self.note_scroll)
+                            .overflow_y_scroll()
+                            .children(notes.iter().map(|note| {
+                                let id = note
+                                    .props
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let encrypted = is_encrypted_placeholder(note);
+                                let is_protected = protected.contains(&id);
+                                let raw_title = note
+                                    .props
+                                    .get("title")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let mut title = if encrypted {
+                                    if raw_title.is_empty() {
+                                        format!("🔒 已加密 {}", short_id(&id))
+                                    } else {
+                                        format!("🔒 {raw_title}")
+                                    }
+                                } else if raw_title.is_empty() {
+                                    "(no title)".to_string()
+                                } else {
+                                    raw_title
+                                };
+                                if is_protected {
+                                    title = format!("🔐 {title}");
                                 }
-                                cx.notify();
-                            }))
-                    })),
+                                let is_todo = note
+                                    .props
+                                    .get("is_todo")
+                                    .and_then(|v| v.as_i64())
+                                    .unwrap_or(0)
+                                    == 1;
+                                let done = note
+                                    .props
+                                    .get("todo_completed")
+                                    .and_then(|v| v.as_i64())
+                                    .unwrap_or(0)
+                                    > 0;
+                                let label = if is_todo {
+                                    format!("{} {}", if done { "☑" } else { "☐" }, title)
+                                } else {
+                                    title
+                                };
+                                let selected = selected_note.as_deref() == Some(id.as_str());
+                                let tags = note_tags.get(&id).cloned().unwrap_or_default();
+                                let snippet = search_hits.get(&id).cloned();
+
+                                div()
+                                    .id(SharedString::from(format!("note-{id}")))
+                                    .px_3()
+                                    .py_1()
+                                    .cursor_pointer()
+                                    .when(selected, |el| el.bg(theme.accent.opacity(0.5)))
+                                    .hover(|s| s.bg(theme.accent.opacity(0.25)))
+                                    .flex()
+                                    .flex_col()
+                                    .gap_0p5()
+                                    .child(SharedString::from(label))
+                                    .when(!tags.is_empty(), |el| {
+                                        el.child(
+                                            div()
+                                                .flex()
+                                                .gap_1()
+                                                .text_size(px(11.))
+                                                .text_color(theme.muted_foreground)
+                                                .children(
+                                                    tags.iter().map(|t| {
+                                                        SharedString::from(format!("#{t}"))
+                                                    }),
+                                                ),
+                                        )
+                                    })
+                                    .when(snippet.is_some() && !encrypted && !is_protected, |el| {
+                                        el.child(
+                                            div()
+                                                .text_size(px(11.))
+                                                .text_color(theme.muted_foreground)
+                                                .child(SharedString::from(
+                                                    snippet.unwrap_or_default(),
+                                                )),
+                                        )
+                                    })
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        let note_id = id.clone();
+                                        this.state.update(cx, |s, _| {
+                                            // Save any pending edit before switching.
+                                            s.end_edit();
+                                            s.request_open_note(&note_id);
+                                        });
+                                        // A protected note (re)locks here: drop any
+                                        // password still sitting in the gate field so
+                                        // re-opening never reuses it.
+                                        if this.state.read(cx).note_locked {
+                                            this.gate_input.update(cx, |input, cx| {
+                                                input.set_value("", window, cx)
+                                            });
+                                            this.gate_epoch_seen =
+                                                this.state.read(cx).prot_gate_epoch;
+                                        }
+                                        cx.notify();
+                                    }))
+                            })),
+                    )
+                    .child(Scrollbar::vertical(&self.note_scroll)),
             )
             .into_any_element()
     }
@@ -1014,6 +1370,7 @@ impl NoteBrowser {
         }
         let title = state.note_title.clone();
         let body = state.note_body.clone();
+        let editing = state.editing;
         let is_protected = state
             .selected_note
             .as_deref()
@@ -1031,41 +1388,91 @@ impl NoteBrowser {
                     .flex()
                     .items_center()
                     .justify_between()
+                    .gap_2()
                     .px_4()
                     .py_2()
                     .border_b_1()
                     .border_color(theme.border)
-                    .child(
+                    .child(if editing {
                         div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Input::new(&self.title_edit).id("note-title"))
+                    } else {
+                        div()
+                            .flex_1()
+                            .min_w_0()
                             .text_size(px(16.))
                             .font_weight(gpui_kit::FontWeight::BOLD)
-                            .child(SharedString::from(title)),
-                    )
+                            .child(SharedString::from(title))
+                    })
                     .child(
-                        Button::new("btn-protect")
-                            .outline()
-                            .small()
-                            .label(if is_protected {
-                                "取消保护"
-                            } else {
-                                "🔒 保护此笔记"
-                            })
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.state.update(cx, |s, _| {
-                                    if s.protected
-                                        .contains(s.selected_note.as_deref().unwrap_or(""))
-                                    {
-                                        s.gate_open_note();
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .flex_shrink_0()
+                            .child(
+                                Button::new("btn-edit-toggle")
+                                    .outline()
+                                    .small()
+                                    .label(if editing { "预览" } else { "编辑" })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.state.update(cx, |s, _| {
+                                            if s.editing {
+                                                s.end_edit();
+                                            } else {
+                                                s.begin_edit();
+                                            }
+                                        });
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("btn-delete-note")
+                                    .outline()
+                                    .small()
+                                    .danger()
+                                    .label("删除笔记")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.state.update(cx, |s, _| s.delete_selected_note());
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("btn-protect")
+                                    .outline()
+                                    .small()
+                                    .label(if is_protected {
+                                        "取消保护"
                                     } else {
-                                        s.protect_open_note();
-                                    }
-                                });
-                                this.sync_dialog_from_state(window, cx);
-                                cx.notify();
-                            })),
+                                        "🔒 保护此笔记"
+                                    })
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.state.update(cx, |s, _| {
+                                            if s.protected
+                                                .contains(s.selected_note.as_deref().unwrap_or(""))
+                                            {
+                                                s.gate_open_note();
+                                            } else {
+                                                s.protect_open_note();
+                                            }
+                                        });
+                                        this.sync_dialog_from_state(window, cx);
+                                        cx.notify();
+                                    })),
+                            ),
                     ),
             )
-            .child(
+            .child(if editing {
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .px_4()
+                    .py_3()
+                    .child(Textarea::new(&self.note_edit).h(relative(1.)))
+                    .into_any_element()
+            } else {
                 div()
                     .id("note-body-scroll")
                     .flex_1()
@@ -1073,8 +1480,9 @@ impl NoteBrowser {
                     .overflow_y_scroll()
                     .px_4()
                     .py_3()
-                    .child(render_markdown(&body, &resource_dir)),
-            )
+                    .child(render_markdown(&body, &resource_dir))
+                    .into_any_element()
+            })
             .into_any_element()
     }
 }

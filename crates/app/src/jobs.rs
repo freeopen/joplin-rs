@@ -12,7 +12,9 @@ use crate::app::{
     e2ee_auto_start_pending, AppState, DecryptSummary, JobChannel, JobEvent, Stage1Summary,
 };
 
-/// Kick off stage 1 (password-less download sync) unless a job is running.
+/// Kick off the sync job (two-way: delete remote, upload local changes, then
+/// download; a provided password also decrypts while downloading) unless a job
+/// is running.
 pub fn start_download(state: &mut AppState) {
     if state.jobs.is_busy() {
         return;
@@ -24,6 +26,15 @@ pub fn start_download(state: &mut AppState) {
     let config = state.config.clone();
     let data_dir = crate::app::data_dir();
     let jobs: JobChannel = state.jobs.clone();
+    // Only a password the user actually supplied this session is used for the
+    // combined pass: the stored/WebDAV fallback must not hard-fail a sync that
+    // would otherwise succeed as a password-less download (the separate
+    // decrypt pass still uses the fallback).
+    let password = if state.e2ee_session_password.is_empty() {
+        None
+    } else {
+        Some(state.e2ee_session_password.clone())
+    };
 
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -39,10 +50,8 @@ pub fn start_download(state: &mut AppState) {
                 &config.tls_options(),
             )?;
             let engine = joplin_rs_core::sync::SyncEngine::new(&client, &storage);
-            // No E2EE password here: encrypted items download as
-            // placeholders and are decrypted in the separate pass.
             let outcome = engine
-                .sync(None, &mut |msg| {
+                .sync(password.as_deref(), &mut |msg| {
                     *jobs.status.lock().unwrap() = msg.to_string();
                 })
                 .await?;
@@ -52,6 +61,9 @@ pub fn start_download(state: &mut AppState) {
                     downloaded: outcome.downloaded,
                     deleted: outcome.deleted,
                     resources: outcome.resources_downloaded,
+                    uploaded: outcome.uploaded,
+                    deleted_remote: outcome.deleted_remote,
+                    conflicts: outcome.skipped_conflicts.clone(),
                 },
                 pending,
             ))

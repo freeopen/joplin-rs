@@ -172,6 +172,10 @@ pub enum Dialog {
     ReaderPasswordSettings,
     /// Prompt for the E2EE master-key password after a sync downloaded items.
     E2eePrompt,
+    /// Create a new notebook (name typed into `nb_input`).
+    NewNotebook,
+    /// Rename the selected notebook.
+    RenameNotebook,
     /// App info: official icon, name, version. Non-macOS only: macOS uses the
     /// native system-menu About panel (see macos_about).
     #[cfg(not(target_os = "macos"))]
@@ -184,6 +188,12 @@ pub struct Stage1Summary {
     pub downloaded: usize,
     pub deleted: usize,
     pub resources: usize,
+    /// Items uploaded to the target.
+    pub uploaded: usize,
+    /// Remote files physically deleted.
+    pub deleted_remote: usize,
+    /// Items skipped as conflicts (remote changed).
+    pub conflicts: Vec<String>,
 }
 
 /// Stage-2 (E2EE decryption) result handed from the worker thread.
@@ -308,6 +318,30 @@ pub struct AppState {
     /// because the persistent GPUI `InputState` keeps typed text otherwise:
     /// re-opening a gated note would show and reuse the previous password.
     pub prot_gate_epoch: u64,
+
+    // ---- note editing ----
+    /// Note panel is in edit mode (title + body editable).
+    pub editing: bool,
+    /// Working copy mirrored from the edit inputs.
+    pub edit_title: String,
+    pub edit_body: String,
+    /// The working copy differs from what is stored (needs saving).
+    pub edit_dirty: bool,
+    /// Millisecond timestamp of the last edit change (autosave debounce).
+    pub edit_changed_ms: i64,
+    /// Raw note body (Joplin `:/id` resource links intact) for the editor.
+    pub note_raw_body: String,
+    /// Bumped when edit mode (re)starts or the working copy is reseeded, so
+    /// the view can push `edit_title`/`edit_body` into the persistent inputs.
+    pub edit_epoch: u64,
+
+    // ---- list layout toggles ----
+    pub show_notebooks: bool,
+    pub show_notes: bool,
+
+    // ---- notebook create/rename dialog ----
+    pub nb_input: String,
+    pub nb_error: Option<String>,
 }
 
 impl AppState {
@@ -353,10 +387,23 @@ impl AppState {
             e2ee_job_password: String::new(),
             e2ee_cancelled: false,
             prot_gate_epoch: 0,
+            editing: false,
+            edit_title: String::new(),
+            edit_body: String::new(),
+            edit_dirty: false,
+            edit_changed_ms: 0,
+            note_raw_body: String::new(),
+            edit_epoch: 0,
+            show_notebooks: true,
+            show_notes: true,
+            nb_input: String::new(),
+            nb_error: None,
         })
     }
 
-    pub fn reload_meta(&mut self) {
+    /// Reload the folder/note lists, tag map and protection markers without
+    /// touching the currently open note. Used after an inline save.
+    pub fn refresh_lists(&mut self) {
         self.folders = self.storage.folders().unwrap_or_default();
         self.load_notes();
         let note_tags = self.storage.note_tags().unwrap_or_default();
@@ -389,11 +436,19 @@ impl AppState {
         }
         self.note_tags = map;
         self.protected = self.storage.protected_note_ids().unwrap_or_default();
+    }
 
-        // A decrypt pass may have just replaced the open placeholder with its
-        // plaintext; refresh the open note so its body/lock state updates.
-        // Route through the gate so a protected note re-locks after sync.
+    pub fn reload_meta(&mut self) {
+        self.refresh_lists();
+
+        // A decrypt pass or a sync may have replaced the open note; refresh it
+        // so its body/lock state updates. An in-progress edit is left alone so
+        // the user does not lose unsaved text.
+        if self.editing {
+            return;
+        }
         if let Some(id) = self.selected_note.clone() {
+            // Route through the gate so a protected note re-locks after sync.
             self.request_open_note(&id);
         }
     }
@@ -434,6 +489,11 @@ impl AppState {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("")
                 .to_string();
+            // Raw body (Joplin `:/id` links intact) is what the editor edits;
+            // `note_body` below becomes the rendered version.
+            self.note_raw_body = note.body.clone();
+            self.editing = false;
+            self.edit_dirty = false;
             let mut body = note.body.clone();
             // Rewrite Joplin resource links ":/id" to decrypted temp files.
             self.resource_dir = data_dir().join("resources");
@@ -467,6 +527,209 @@ impl AppState {
         }
     }
 
+    // ---- note editing ---------------------------------------------------
+
+    /// Whether the open note can be edited (note selected, not locked, not an
+    /// encrypted placeholder).
+    pub fn can_edit(&self) -> bool {
+        self.selected_note.is_some() && !self.note_locked && !self.selected_note_encrypted
+    }
+
+    /// Enter edit mode for the open note, seeding the working copy.
+    pub fn begin_edit(&mut self) {
+        if !self.can_edit() {
+            return;
+        }
+        self.edit_title = self.note_title.clone();
+        self.edit_body = self.note_raw_body.clone();
+        self.edit_dirty = false;
+        self.editing = true;
+        self.edit_epoch = self.edit_epoch.wrapping_add(1);
+    }
+
+    /// Leave edit mode, saving any pending change first.
+    pub fn end_edit(&mut self) {
+        self.save_edit();
+        self.editing = false;
+    }
+
+    /// Mirror a change in the working copy and arm the autosave debounce.
+    pub fn mark_edit_dirty(&mut self) {
+        if !self.editing {
+            return;
+        }
+        self.edit_dirty = true;
+        self.edit_changed_ms = joplin_rs_core::time_ms();
+    }
+
+    /// Persist the working copy if it changed. Returns true on a write.
+    pub fn save_edit(&mut self) -> bool {
+        if !self.editing || !self.edit_dirty {
+            return false;
+        }
+        let Some(id) = self.selected_note.clone() else {
+            return false;
+        };
+        match self
+            .storage
+            .update_note(&id, &self.edit_title, &self.edit_body)
+        {
+            Ok(()) => {
+                self.edit_dirty = false;
+                // Refresh the rendered preview (resource links re-resolved);
+                // open_note clears edit mode, so restore it afterwards.
+                self.open_note(&id);
+                self.editing = true;
+                self.refresh_lists();
+                true
+            }
+            Err(e) => {
+                self.set_status(format!("保存失败: {e}"));
+                false
+            }
+        }
+    }
+
+    /// Autosave after 3 seconds without a change (called from the UI tick).
+    pub fn autosave_tick(&mut self) {
+        const DEBOUNCE_MS: i64 = 3000;
+        if self.editing
+            && self.edit_dirty
+            && joplin_rs_core::time_ms() - self.edit_changed_ms >= DEBOUNCE_MS
+        {
+            self.save_edit();
+        }
+    }
+
+    /// Create a note in the selected notebook and open it for editing.
+    pub fn new_note(&mut self) {
+        let Some(folder) = self.selected_folder.clone() else {
+            self.set_status("请先选择一个笔记本，再新建笔记".into());
+            return;
+        };
+        match self.storage.create_note(&folder, "新建笔记") {
+            Ok(id) => {
+                self.refresh_lists();
+                self.request_open_note(&id);
+                self.begin_edit();
+            }
+            Err(e) => self.set_status(format!("新建笔记失败: {e}")),
+        }
+    }
+
+    /// Delete the open note (locally now, remotely on the next sync).
+    pub fn delete_selected_note(&mut self) {
+        let Some(id) = self.selected_note.clone() else {
+            return;
+        };
+        self.editing = false;
+        self.edit_dirty = false;
+        match self.storage.delete_item(&id) {
+            Ok(()) => {
+                self.selected_note = None;
+                self.note_body.clear();
+                self.note_raw_body.clear();
+                self.note_title.clear();
+                self.selected_note_encrypted = false;
+                self.note_locked = false;
+                self.refresh_lists();
+                self.set_status("已删除笔记".into());
+            }
+            Err(e) => self.set_status(format!("删除笔记失败: {e}")),
+        }
+    }
+
+    // ---- notebooks (create / rename / delete) ---------------------------
+
+    pub fn open_new_notebook(&mut self) {
+        self.nb_input.clear();
+        self.nb_error = None;
+        self.dialog = Dialog::NewNotebook;
+    }
+
+    pub fn open_rename_notebook(&mut self) {
+        let Some(id) = self.selected_folder.clone() else {
+            return;
+        };
+        let title = self
+            .folders
+            .iter()
+            .find(|f| f.props.get("id").and_then(serde_json::Value::as_str) == Some(id.as_str()))
+            .and_then(|f| f.props.get("title"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        self.nb_input = title;
+        self.nb_error = None;
+        self.dialog = Dialog::RenameNotebook;
+    }
+
+    /// Create a notebook from the dialog input; returns true to close.
+    pub fn submit_new_notebook(&mut self) -> bool {
+        let name = self.nb_input.trim().to_string();
+        if name.is_empty() {
+            self.nb_error = Some("名称不能为空".into());
+            return false;
+        }
+        match self.storage.create_folder(&name) {
+            Ok(id) => {
+                self.selected_folder = Some(id);
+                self.refresh_lists();
+                self.dialog = Dialog::None;
+                true
+            }
+            Err(e) => {
+                self.nb_error = Some(format!("创建失败: {e}"));
+                false
+            }
+        }
+    }
+
+    /// Rename the selected notebook from the dialog input.
+    pub fn submit_rename_notebook(&mut self) -> bool {
+        let Some(id) = self.selected_folder.clone() else {
+            return false;
+        };
+        let name = self.nb_input.trim().to_string();
+        if name.is_empty() {
+            self.nb_error = Some("名称不能为空".into());
+            return false;
+        }
+        match self.storage.rename_folder(&id, &name) {
+            Ok(()) => {
+                self.refresh_lists();
+                self.dialog = Dialog::None;
+                true
+            }
+            Err(e) => {
+                self.nb_error = Some(format!("重命名失败: {e}"));
+                false
+            }
+        }
+    }
+
+    /// Delete the selected notebook. Refused while it still holds notes.
+    pub fn delete_selected_notebook(&mut self) {
+        let Some(id) = self.selected_folder.clone() else {
+            return;
+        };
+        match self.storage.notes_in_folder(&id) {
+            Ok(n) if n > 0 => {
+                self.set_status(format!("笔记本中还有 {n} 条笔记，请先删除这些笔记"));
+            }
+            Ok(_) => match self.storage.delete_item(&id) {
+                Ok(()) => {
+                    self.selected_folder = None;
+                    self.refresh_lists();
+                    self.set_status("已删除笔记本".into());
+                }
+                Err(e) => self.set_status(format!("删除笔记本失败: {e}")),
+            },
+            Err(e) => self.set_status(format!("删除笔记本失败: {e}")),
+        }
+        self.dialog = Dialog::None;
+    }
+
     // ---- reading password (per-note protection) ----
 
     pub fn has_reader_password(&self) -> bool {
@@ -492,6 +755,9 @@ impl AppState {
             self.selected_note = Some(id.to_string());
             self.note_locked = true;
             self.note_body.clear();
+            self.note_raw_body.clear();
+            self.editing = false;
+            self.edit_dirty = false;
             self.prot_input.clear();
             self.prot_error = None;
             // Signal the view layer to clear the gate input field: a
@@ -736,10 +1002,20 @@ impl AppState {
                     // decrypt pass tried no longer apply.
                     self.e2ee_cancelled = false;
                     self.e2ee_job_password.clear();
-                    let base = format!(
-                        "同步完成：{} 项已下载，{} 项已删除，{} 个资源",
-                        summary.downloaded, summary.deleted, summary.resources
+                    let mut base = format!(
+                        "同步完成：上传 {}，下载 {}，远端删除 {}，本地删除 {}，资源 {}",
+                        summary.uploaded,
+                        summary.downloaded,
+                        summary.deleted_remote,
+                        summary.deleted,
+                        summary.resources
                     );
+                    if !summary.conflicts.is_empty() {
+                        base.push_str(&format!(
+                            "；{} 项冲突已跳过（保留远端）",
+                            summary.conflicts.len()
+                        ));
+                    }
                     if pending == 0 {
                         self.set_status(base);
                     } else if self.e2ee_password_for_decrypt().is_some() {
@@ -1060,6 +1336,9 @@ mod tests {
                 downloaded: 3,
                 deleted: 0,
                 resources: 0,
+                uploaded: 0,
+                deleted_remote: 0,
+                conflicts: Vec::new(),
             },
             3,
         )));
@@ -1107,6 +1386,9 @@ mod tests {
                 downloaded: 2,
                 deleted: 0,
                 resources: 0,
+                uploaded: 0,
+                deleted_remote: 0,
+                conflicts: Vec::new(),
             },
             2,
         ))));
@@ -1171,6 +1453,82 @@ mod tests {
         assert!(state.note_locked);
         assert_eq!(state.prot_gate_epoch, first_epoch + 1);
         assert!(state.prot_input.is_empty());
+    }
+
+    // ---- note editing / CRUD -------------------------------------------
+
+    #[test]
+    fn edit_save_and_delete_roundtrip() {
+        let mut state =
+            AppState::build(Storage::open_in_memory().unwrap(), Config::default()).unwrap();
+        let folder = state.storage.create_folder("F").unwrap();
+        let note = state.storage.create_note(&folder, "T").unwrap();
+        state.refresh_lists();
+        state.request_open_note(&note);
+        assert!(state.can_edit(), "a plain note is editable");
+
+        state.begin_edit();
+        assert!(state.editing);
+        state.edit_title = "T2".into();
+        state.edit_body = "body text".into();
+        state.mark_edit_dirty();
+        assert!(state.edit_dirty);
+        assert!(state.save_edit());
+        assert!(!state.edit_dirty);
+
+        let saved = state.storage.note(&note).unwrap().unwrap();
+        assert_eq!(saved.props["title"].as_str(), Some("T2"));
+        assert_eq!(saved.body, "body text");
+        assert!(
+            state
+                .storage
+                .items_needing_sync()
+                .unwrap()
+                .iter()
+                .any(|i| i.props["id"].as_str() == Some(note.as_str())),
+            "an edited note must be queued for upload"
+        );
+
+        state.delete_selected_note();
+        assert!(state.selected_note.is_none());
+        assert!(state.storage.note(&note).unwrap().is_none());
+        assert_eq!(state.storage.pending_deletes().unwrap(), vec![note]);
+    }
+
+    #[test]
+    fn edit_disabled_for_protected_note() {
+        let mut state =
+            AppState::build(Storage::open_in_memory().unwrap(), Config::default()).unwrap();
+        let folder = state.storage.create_folder("F").unwrap();
+        let note = state.storage.create_note(&folder, "T").unwrap();
+        state.storage.set_note_protected(&note).unwrap();
+        state.refresh_lists();
+        state.request_open_note(&note);
+        assert!(state.note_locked);
+        assert!(!state.can_edit(), "a locked note cannot be edited");
+    }
+
+    #[test]
+    fn notebook_delete_blocked_while_notes_exist() {
+        let mut state =
+            AppState::build(Storage::open_in_memory().unwrap(), Config::default()).unwrap();
+        let folder = state.storage.create_folder("F").unwrap();
+        let note = state.storage.create_note(&folder, "N").unwrap();
+        state.refresh_lists();
+        state.selected_folder = Some(folder.clone());
+
+        state.delete_selected_notebook();
+        assert_eq!(
+            state.storage.folders().unwrap().len(),
+            1,
+            "a notebook with notes must not be deleted"
+        );
+
+        state.storage.delete_item(&note).unwrap();
+        state.selected_folder = Some(folder.clone());
+        state.delete_selected_notebook();
+        assert!(state.storage.folders().unwrap().is_empty());
+        assert!(state.selected_folder.is_none());
     }
 
     // ---- encrypted config secrets (CLI set-password compatibility) ----

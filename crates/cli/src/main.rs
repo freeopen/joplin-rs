@@ -15,7 +15,7 @@ use toml::Value;
 #[command(
     name = "joplin-rs",
     version = joplin_rs_core::VERSION_DISPLAY,
-    about = "Read-only Joplin client (WebDAV + E2EE)"
+    about = "Joplin client (WebDAV + E2EE); two-way sync"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -30,7 +30,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Sync the vault from the WebDAV target (download only)
+    /// Sync the vault with the WebDAV target (two-way: upload then download)
     Sync {
         /// E2EE password (prompted if the vault is encrypted and this is missing)
         #[arg(long, env = "JOPLIN_RS_PASSWORD")]
@@ -346,10 +346,18 @@ async fn main() -> Result<()> {
                 })
                 .await?;
             println!(
-                "done: {} downloaded, {} deleted, {} resources ({} pending), {} unsupported, {} pending decryption",
-                outcome.downloaded, outcome.deleted, outcome.resources_downloaded,
-                outcome.resources_pending, outcome.skipped_unsupported, outcome.pending_decryption.len()
+                "done: {} uploaded, {} downloaded, {} deleted, {} deleted remote, {} resources ({} pending), {} unsupported, {} pending decryption, {} conflicts",
+                outcome.uploaded, outcome.downloaded, outcome.deleted, outcome.deleted_remote,
+                outcome.resources_downloaded,
+                outcome.resources_pending, outcome.skipped_unsupported, outcome.pending_decryption.len(),
+                outcome.skipped_conflicts.len()
             );
+            if !outcome.skipped_conflicts.is_empty() {
+                println!("conflicts skipped (remote kept):");
+                for c in &outcome.skipped_conflicts {
+                    println!("  - {c}");
+                }
+            }
             if !outcome.pending_decryption.is_empty() {
                 println!("items stored encrypted - run sync again with the E2EE password to decrypt them");
             }

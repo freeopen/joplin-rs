@@ -1,11 +1,12 @@
 # joplin-rs
 
-A read-only Joplin client written in Rust:
+A Joplin client written in Rust:
 
-1. **E2EE sync, WebDAV only** - downloads a Joplin vault from a WebDAV sync
-   target and decrypts end-to-end-encrypted content (password master key).
-2. **Read-only notes** - browse notes in a GUI with Markdown rendering, or use
-   the CLI. Nothing is ever uploaded; sync is download-only.
+1. **E2EE sync, WebDAV only** - syncs a Joplin vault to/from a WebDAV sync
+   target, encrypting and decrypting end-to-end-encrypted content (password
+   master key).
+2. **Notes you can edit** - browse, edit and organize notes in a GUI with
+   Markdown rendering and editing, or use the CLI.
 
 ## Why joplin-rs
 
@@ -19,42 +20,49 @@ joplin-rs is a from-scratch Rust client built for exactly this situation:
 
 1. **Compatibility first** - the primary goal is to run well on macOS Big Sur
    and other hardware/OS combinations the official client has dropped.
-2. **Roadmap** - today: read-only E2EE sync and browsing; next: note editing
-   and upload sync.
+2. **Roadmap** - today: two-way E2EE sync, browsing and note editing; next:
+   attachments/resources upload and more editors.
 3. **Design philosophy** - fast, just-enough features, wide device
    compatibility (速度要快，功能够用，设备兼容).
 
 ## What works
 
-- WebDAV sync (PROPFIND/GET based, basicDelta algorithm like Joplin):
-  initial download, incremental sync via timestamp context, deletion
-  detection with a 90% fail-safe.
-- E2EE decryption:
+- WebDAV two-way sync (PROPFIND/GET/PUT/DELETE, basicDelta algorithm like
+  Joplin): downloads remote changes with a timestamp context, uploads local
+  edits/creations (encrypted for E2EE vaults), physically deletes remote files
+  for locally-deleted items, and refuses mass deletion with a 90% fail-safe.
+  Conflicting items (the remote changed since the last sync) are skipped and
+  reported, keeping the remote version.
+- E2EE encrypt and decrypt:
   - master keys: `KeyV1` (PBKDF2-HMAC-SHA512 x220k + AES-256-GCM) and the legacy
     `SJCL1a/1b/3/4` password master keys used by real Joplin 1.x/2.x vaults
-  - item blobs: `StringV1` (JED01 container, chunked)
-  - resource blobs: `FileV1`
+  - item blobs: `StringV1` (JED01 container, chunked) for both reading and
+    writing (uploads use the active master key)
+  - resource blobs: `FileV1` (download)
   - legacy `SJCL1a/1b/3/4` items (AES-CCM, byte-exact port of sjcl's mode)
   - item payloads encrypted with legacy SJCL (method 1a/1b/3/4) as well as `StringV1`
   - `SJCL`/`SJCL2` (OCB2) and PPK (RSA) master keys are reported as unsupported
     per item instead of failing the sync
 - Local storage: SQLite (`items` + `sync_items` + `kv` + `resource_blobs` +
   `resource_fetch_times`)
-- CLI: `sync`, `doctor`, `list`, `show`, `export`, `set-password`
+- CLI: `sync` (two-way), `doctor`, `list`, `show`, `search`, `export`,
+  `set-password`
 - Encrypted-then-decrypt flow: sync without a password stores items
   encrypted (`pending decryption`); a later sync with the password decrypts
   and replaces them automatically
 - Search: multi-word AND search over title+body (CLI `search` and GUI),
   with notebook/tag/todo filters (`--folder`, `--tag`, `--todo`,
   `--completed`), snippets (`--snippets`) and JSON output (`--json`)
-- GUI (gpui-kit / Zed GPUI): notebook list, note list (todos/tags),
+- GUI (gpui-kit / Zed GPUI): Notebooks column on the left and Notes column on
+  the right (each collapsible, with scrollbars and a highlighted selection),
   full-text search, Markdown rendering (GFM tables/task lists/code blocks,
-  text selection) with decrypted resource images, two-stage sync (download
-  first with live status, then a separate E2EE decryption pass; notes
-  without a password stay in the list as locked placeholders), rounded
-  macOS Joplin app icon (dock/window) and About via the native app-name
-  menu (in-window About on other platforms), optional reading password
-  that gates notes marked as protected
+  text selection) with decrypted resource images, Markdown **editing** with
+  autosave (3s after typing, and immediately on blur or when switching notes),
+  create/delete notes and create/rename/delete notebooks (a notebook can only
+  be deleted once its notes are), two-way sync with live status, rounded
+  macOS Joplin app icon (dock/window) and About via the native app-name menu
+  (in-window About on other platforms), optional reading password that gates
+  notes marked as protected
 
 ## Build
 
@@ -161,8 +169,8 @@ back through the platform font stack for CJK. Set
 
 ## Supported sync-target format
 
-Read-only compatible with Joplin's WebDAV target (sync version 3, `info.json`).
-Legacy `.sync/version.txt` targets are not supported.
+Compatible with Joplin's WebDAV target (sync version 3, `info.json`) for both
+download and upload. Legacy `.sync/version.txt` targets are not supported.
 
 ## Tests
 
@@ -176,6 +184,9 @@ cargo test --workspace
 - `crates/core/tests/e2e_sync.rs`: full sync against a fake WebDAV server
   serving a TS-generated encrypted vault; asserts note/folder/tag/resource
   parity, no-op re-sync, deletions, fail-safe and wrong-password behaviour
+- `crates/core/tests/upload_sync.rs`: two-way sync against a fake WebDAV
+  server - create/edit/rename/delete upload (plaintext and E2EE), a second
+  client reproducing the changes, and a remote-changed conflict being skipped
 - `crates/core/tests/legacy_sjcl_sync.rs`: full sync of a legacy SJCL vault
   (SJCL4 master key + SJCL1b items)
 - `crates/core/tests/plaintext_resource.rs`: unencrypted vault with a binary
@@ -183,9 +194,11 @@ cargo test --workspace
 
 ## Not implemented (yet)
 
-- Uploading / editing (read-only for now; note editing and upload sync are the
-  next milestone, see [Why joplin-rs](#why-joplin-rs))
+- Attachments/resources upload (resource blobs are downloaded and rendered, but
+  new attachments are not created or uploaded)
 - Sync targets other than WebDAV
 - PPK (public/private key) master keys
 - OCB2-based legacy encryption (SJCL 1/2)
+- Conflict copies: a conflicting item keeps the remote version and is reported
+  instead of creating a `(conflict)` note
 - Note history / revisions, plugins, note locking

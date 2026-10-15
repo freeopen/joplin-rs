@@ -59,7 +59,7 @@ fn about_options() -> Option<Retained<NSDictionary<objc2_app_kit::NSAboutPanelOp
         unsafe { objc2_app_kit::NSAboutPanelOptionApplicationVersion },
     ];
     let name = NSString::from_str("joplin-rs-app");
-    let version = NSString::from_str(&format!("版本 {}", crate::APP_VERSION));
+    let version = NSString::from_str(crate::APP_VERSION);
     let name_obj: Retained<AnyObject> = unsafe { Retained::cast_unchecked(name) };
     let version_obj: Retained<AnyObject> = unsafe { Retained::cast_unchecked(version) };
     let objects: [&AnyObject; 3] = [&icon_obj, &name_obj, &version_obj];
