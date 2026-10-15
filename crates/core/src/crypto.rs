@@ -185,6 +185,61 @@ pub fn native_encrypt(password: &str, salt: &[u8], data: &[u8], iterations: u32)
 }
 
 // ---------------------------------------------------------------------------
+// Upload side: JED01 container construction (Joplin EncryptionService)
+// ---------------------------------------------------------------------------
+
+/// Build a JED01 header: `JED01` + 6-hex metadata size + 2-hex method + 32-hex
+/// master key id (mirrors `EncryptionService.encodeHeader_`).
+pub fn encode_header(method: i64, master_key_id: &str) -> Result<String> {
+    if master_key_id.len() != 32 || !master_key_id.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(Error::Crypto(format!(
+            "invalid master key id: {master_key_id}"
+        )));
+    }
+    let metadata = format!("{method:02x}{master_key_id}");
+    Ok(format!("JED01{:06x}{metadata}", metadata.len()))
+}
+
+/// Wrap one encrypted chunk as `6-hex length` + payload.
+pub fn encode_chunk(payload: &str) -> String {
+    format!("{:06x}{payload}", payload.len())
+}
+
+/// Encrypt a plaintext string the way Joplin's default string method
+/// (`StringV1`, method 10) does:
+/// - split the text into blocks of at most 65536 UTF-16 code units (we split
+///   on char boundaries so a surrogate pair is never cut),
+/// - encode each block as little-endian UTF-16 bytes,
+/// - AES-256-GCM encrypt it (PBKDF2-SHA512 over the master key hex, the salt
+///   is stored in each block's envelope, 3 iterations),
+/// - concatenate `header + Σ(6-hex length + envelope)`.
+///
+/// The result decrypts with [`crate::sync::SyncEngine::decrypt_item_blob`].
+pub fn encrypt_string_v1(
+    master_key_hex: &str,
+    master_key_id: &str,
+    plaintext: &str,
+) -> Result<String> {
+    const CHUNK_CHARS: usize = 65536;
+    let mut iv_salt = [0u8; 32];
+    use rand::RngCore;
+    rand::rngs::OsRng.fill_bytes(&mut iv_salt);
+
+    let mut out = encode_header(METHOD_STRING_V1, master_key_id)?;
+    let chars: Vec<char> = plaintext.chars().collect();
+    for chunk in chars.chunks(CHUNK_CHARS) {
+        let block: String = chunk.iter().collect();
+        let mut bytes: Vec<u8> = Vec::with_capacity(block.len() * 2);
+        for unit in block.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        let envelope = native_encrypt(master_key_hex, &iv_salt, &bytes, 3)?;
+        out.push_str(&encode_chunk(&envelope));
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
 // SJCL methods (AES-CCM)
 // ---------------------------------------------------------------------------
 
@@ -549,5 +604,69 @@ mod tests {
         let original = "héllo wörld 你好世界 🎉 +./@*_";
         let unescaped = sjcl_unescape(&sjcl_escape(original)).unwrap();
         assert_eq!(unescaped, original);
+    }
+
+    /// Decrypt a StringV1 blob the way the sync engine does, for round-trip
+    /// testing without depending on `sync`.
+    fn decrypt_string_v1_for_test(blob: &str, key_hex: &str) -> String {
+        let header = decode_header(blob).unwrap();
+        assert_eq!(header.method, METHOD_STRING_V1);
+        let md_size = usize::from_str_radix(&blob[5..11], 16).unwrap();
+        let chunks = decode_chunks(&blob[11 + md_size..]).unwrap();
+        let mut out = String::new();
+        for chunk in chunks {
+            let plain = native_decrypt(key_hex, &chunk, 3).unwrap();
+            let units: Vec<u16> = plain
+                .chunks_exact(2)
+                .map(|p| u16::from_le_bytes([p[0], p[1]]))
+                .collect();
+            out.push_str(&String::from_utf16_lossy(&units));
+        }
+        out
+    }
+
+    #[test]
+    fn encode_header_matches_decoder() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let header = encode_header(METHOD_STRING_V1, id).unwrap();
+        assert_eq!(header, format!("JED010000220a{id}"));
+        let h = decode_header(&header).unwrap();
+        assert_eq!(h.method, METHOD_STRING_V1);
+        assert_eq!(h.master_key_id, id);
+        assert!(encode_header(METHOD_STRING_V1, "short").is_err());
+    }
+
+    #[test]
+    fn string_v1_roundtrip() {
+        let key = "ab".repeat(32);
+        let id = "0123456789abcdef0123456789abcdef";
+        let plain = "第一行 line\nsecond 🎉 line :/0123456789abcdef0123456789abcdef";
+        let blob = encrypt_string_v1(&key, id, plain).unwrap();
+        assert!(blob.starts_with("JED01"), "{blob}");
+        assert_eq!(decrypt_string_v1_for_test(&blob, &key), plain);
+    }
+
+    #[test]
+    fn string_v1_roundtrip_multi_chunk() {
+        let key = "cd".repeat(64);
+        let id = "fedcba9876543210fedcba9876543210";
+        // > 65536 chars forces multiple chunks (and exercises a surrogate pair
+        // straddling a chunk boundary staying intact because we split on chars).
+        let plain = format!("{}{}", "a".repeat(70000), "🎉 tail");
+        let blob = encrypt_string_v1(&key, id, &plain).unwrap();
+        let md_size = usize::from_str_radix(&blob[5..11], 16).unwrap();
+        let chunks = decode_chunks(&blob[11 + md_size..]).unwrap();
+        assert!(chunks.len() >= 2, "expected multiple chunks");
+        assert_eq!(decrypt_string_v1_for_test(&blob, &key), plain);
+    }
+
+    #[test]
+    fn string_v1_empty_plaintext_is_header_only() {
+        let key = "ef".repeat(32);
+        let id = "00112233445566778899aabbccddeeff";
+        let blob = encrypt_string_v1(&key, id, "").unwrap();
+        let md_size = usize::from_str_radix(&blob[5..11], 16).unwrap();
+        assert!(decode_chunks(&blob[11 + md_size..]).unwrap().is_empty());
+        assert_eq!(decrypt_string_v1_for_test(&blob, &key), "");
     }
 }
