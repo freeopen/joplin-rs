@@ -55,14 +55,18 @@ joplin-rs is a from-scratch Rust client built for exactly this situation:
   `--completed`), snippets (`--snippets`) and JSON output (`--json`)
 - GUI (gpui-kit / Zed GPUI): Notebooks column on the left and Notes column on
   the right (each collapsible, with scrollbars and a highlighted selection),
-  full-text search, Markdown rendering (GFM tables/task lists/code blocks,
-  text selection) with decrypted resource images, Markdown **editing** with
-  autosave (3s after typing, and immediately on blur or when switching notes),
-  create/delete notes and create/rename/delete notebooks (a notebook can only
-  be deleted once its notes are), two-way sync with live status, rounded
-  macOS Joplin app icon (dock/window) and About via the native app-name menu
-  (in-window About on other platforms), optional reading password that gates
-  notes marked as protected
+  full-text search via a `Cmd+Option+F` prompt dialog (matches render in the
+  Notes column with snippets, and an active-search bar with a clear button
+  appears while a query is applied), in-note find (`Cmd+F`, `Cmd+Shift+F` to
+  replace), a note-list right-click menu (new / delete / protect / move),
+  Markdown rendering (GFM tables/task lists/code blocks, text selection) with
+  decrypted resource images, Markdown **editing** with autosave (3s after
+  typing, and immediately on blur or when switching notes) toggled with
+  `Cmd+E`, create/delete notes and create/rename/delete notebooks (a notebook
+  can only be deleted once its notes are), two-way sync with live status,
+  rounded macOS Joplin app icon (dock/window) and About via the native
+  app-name menu (in-window About on other platforms), optional reading
+  password that gates notes marked as protected
 
 ## GUI usage
 
@@ -78,11 +82,18 @@ recently opened note; falls back to the newest note) and syncs on launch.
 | Quit (syncs pending changes first) | `Cmd+Q` | `Ctrl+Q` |
 | Find in current note | `Cmd+F` | `Ctrl+F` |
 | Search all notes | `Cmd+Option+F` | `Ctrl+Alt+F` |
+| Toggle edit/preview for the open note | `Cmd+E` | `Ctrl+E` |
 | Settings | `Cmd+,` | `Ctrl+,` |
 | Sync | `Cmd+R` | `Ctrl+R` |
 
 When a list panel has focus, `j`/`k` move the highlight and `Enter` selects
 (notebooks are sorted by name, notes by most-recent update).
+
+Right-click a note in the Notes column for **新增 / 删除笔记 / 保护此笔记 /
+移动**; protecting a note (or removing its lock) uses the reading password.
+
+Global shortcuts work immediately after launch (the root view takes focus on
+startup).
 
 **Vim editing** is on by default (`vim_mode`); the note editor starts in
 NORMAL mode with an indicator in the header. Supported: `Esc`, `i a I A o O`,
@@ -131,6 +142,11 @@ published as an official GitHub Release; CI creates the matching tag
 `vM.I.P-g<hash>` on the pushed commit. To mark a milestone manually, push a
 tag like `v0.2.0` (prefer bumping minor/major so the new patch base does not
 go backwards relative to the automatically accumulated patch number).
+
+Each Release body is generated from the git log: CI groups the commits since
+the previous tag by their Conventional Commits prefix (`feat` -> ✨ 新增功能,
+`fix` -> 🐛 修复缺陷, `perf` -> ⚡ 性能优化, everything else -> 🔧 其他变更), so
+the Release page lists exactly what was added or fixed for that version.
 
 Release artifacts: Linux and Windows ship both binaries (CLI `joplin-rs` +
 GUI `joplin-rs-app`) in `tar.gz` / `zip`. On macOS the `tar.gz` carries the

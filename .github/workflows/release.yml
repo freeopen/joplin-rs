@@ -8,6 +8,9 @@ name: Release
 #   本流水线，无递归风险）；若该版本号的 tag 已存在（本次 push 没有
 #   feat/fix 提交，版本未变），则跳过发布
 # - push 人工 tag vX.Y.Z：发布绑定该 tag 的正式 Release
+# Release 正文：release job 用 `git log <上一个 tag>..HEAD` 按
+#   conventional-commit 前缀分组生成（feat→新增功能，fix→修复缺陷，
+#   perf→性能优化，其余→其他变更），见 release-body.md
 # 产物形态：Linux/Windows tar.gz/zip 打 CLI + GUI 两个二进制；macOS 的
 # tar.gz 仅打 CLI（joplin-rs）一个二进制，GUI（joplin-rs-app）单独打成
 # .dmg（joplin-rs.app bundle，拖入 Applications 即用，见 tools/make-dmg.sh）
@@ -148,6 +151,13 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      # 需要完整历史 + 所有 tag，才能用 `git log <上一个 tag>..HEAD` 生成本次
+      # 版本的变更说明（fetch-depth: 0 会一并拉取 tag）。
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -156,6 +166,8 @@ jobs:
 
       - name: Resolve version and tag
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -e
           mkdir -p rel
@@ -178,13 +190,69 @@ jobs:
           echo "TAG_NAME=$TAG_NAME" >> "$GITHUB_ENV"
           echo "Releasing $VERSION as $TAG_NAME"
 
+      # 从 git 日志生成本次版本的变更说明（Release 正文的来源）：按
+      # conventional-commit 前缀分组 —— feat 归“新增功能”，fix 归“修复缺陷”，
+      # perf 归“性能优化”，其余归“其他变更”。范围是上一个发布 tag..HEAD。
+      - name: Generate release notes from git log
+        if: env.SKIP_RELEASE != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG_NAME="${{ env.TAG_NAME }}"
+          VERSION="${{ env.VERSION }}"
+          PREV_TAG="$(git tag --list 'v[0-9]*' --sort=-v:refname | grep -vx "$TAG_NAME" | head -n1 || true)"
+          if [ -n "$PREV_TAG" ]; then RANGE="$PREV_TAG..HEAD"; else RANGE="HEAD"; fi
+          echo "Generating release notes for $VERSION (range: $RANGE)"
+
+          d="$(mktemp -d)"
+          : > "$d/feat"; : > "$d/fix"; : > "$d/perf"; : > "$d/other"
+          git log "$RANGE" --no-merges --pretty=format:'%s' | while IFS= read -r subject; do
+            [ -z "$subject" ] && continue
+            case "$subject" in
+              chore\(release*|Release\ v*|v[0-9]*.[0-9]*.[0-9]*) continue ;;
+            esac
+            case "$subject" in
+              feat:*|feat\(*\):*|feat!:*|feat\(*\)!:*) section="feat" ;;
+              fix:*|fix\(*\):*|fix!:*|fix\(*\)!:*)   section="fix" ;;
+              perf:*|perf\(*\):*|perf!:*)             section="perf" ;;
+              *)                                       section="other" ;;
+            esac
+            text="$(printf '%s' "$subject" | sed -E 's/^[a-z]+(\([^)]*\))?!?: //')"
+            printf -- '- %s\n' "$text" >> "$d/$section"
+          done
+
+          {
+            echo "## joplin-rs $VERSION"
+            echo
+            if [ -n "$PREV_TAG" ]; then
+              echo "_变更自 \`$PREV_TAG\`_"
+            else
+              echo "_首个发布_"
+            fi
+            echo
+            if [ -s "$d/feat" ]; then echo "### ✨ 新增功能"; cat "$d/feat"; echo; fi
+            if [ -s "$d/fix" ]; then echo "### 🐛 修复缺陷"; cat "$d/fix"; echo; fi
+            if [ -s "$d/perf" ]; then echo "### ⚡ 性能优化"; cat "$d/perf"; echo; fi
+            if [ -s "$d/other" ]; then echo "### 🔧 其他变更"; cat "$d/other"; echo; fi
+            if [ -n "$PREV_TAG" ]; then
+              echo "---"
+              echo "完整变更历史：https://github.com/${GITHUB_REPOSITORY}/compare/${PREV_TAG}...${TAG_NAME}"
+            fi
+          } > release-body.md
+
+          echo "----- release-body.md -----"
+          cat release-body.md
+
       - name: Publish Release
         if: env.SKIP_RELEASE != 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.TAG_NAME }}
           name: Release ${{ env.VERSION }}
+          body_path: release-body.md
           files: artifacts/*
-          generate_release_notes: true
+          # 正文来自上一步按 git 日志生成的 release-body.md，而不是 GitHub
+          # 自动汇总（后者看不到本仓库无 PR 的直接提交）。
+          generate_release_notes: false
           draft: false
           prerelease: false
