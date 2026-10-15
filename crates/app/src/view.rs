@@ -25,6 +25,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants},
     dialog::{DialogAction, DialogFooter},
     input::{Copy, Cut, Input, InputEvent, InputState, Paste, SelectAll, Textarea, TextareaState},
+    menu::{ContextMenuExt, PopupMenuItem},
     scroll::Scrollbar,
     ActiveTheme, Disableable, Sizable, WindowExt,
 };
@@ -787,7 +788,7 @@ impl NoteBrowser {
         let browser = cx.entity().downgrade();
         let is_note = matches!(which, AppDialog::ConfirmDeleteNote);
         let (title, description) = if is_note {
-            let note_title = self.state.read(cx).note_title.clone();
+            let note_title = self.state.read(cx).confirm_note_title.clone();
             (
                 "删除笔记",
                 format!("确定删除笔记「{note_title}」？下次同步时会同时删除远端文件。"),
@@ -824,18 +825,7 @@ impl NoteBrowser {
                 .on_ok(move |_, _, cx| {
                     browser_ok
                         .update(cx, |view, cx| {
-                            view.state.update(cx, |s, _| {
-                                if is_note {
-                                    s.delete_selected_note();
-                                } else {
-                                    s.delete_selected_notebook();
-                                }
-                                // Clear the dialog flag: the periodic
-                                // sync_dialog_from_state tick would otherwise
-                                // reopen it (pending_dialog alone is not the
-                                // source of truth).
-                                s.dialog = AppDialog::None;
-                            });
+                            view.state.update(cx, |s, _| s.confirm_delete());
                             view.pending_dialog = AppDialog::None;
                             true
                         })
@@ -1024,7 +1014,7 @@ impl NoteBrowser {
         let state = self.state.read(cx);
         let folders = state.folders.clone();
         let selected_folder = state.selected_folder.clone();
-        let has_selection = selected_folder.is_some();
+        let browser = cx.entity().downgrade();
 
         div()
             .w(px(NOTEBOOKS_WIDTH))
@@ -1048,47 +1038,15 @@ impl NoteBrowser {
                             .child("Notebooks"),
                     )
                     .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_0p5()
-                            .child(Button::new("nb-new").ghost().small().label("＋").on_click(
+                        div().flex().items_center().gap_0p5().child(
+                            Button::new("nb-new").ghost().small().label("＋").on_click(
                                 cx.listener(|this, _, window, cx| {
                                     this.state.update(cx, |s, _| s.open_new_notebook());
                                     this.sync_dialog_from_state(window, cx);
                                     cx.notify();
                                 }),
-                            ))
-                            .child(
-                                Button::new("nb-rename")
-                                    .ghost()
-                                    .small()
-                                    .label("~")
-                                    .disabled(!has_selection)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.state.update(cx, |s, _| s.open_rename_notebook());
-                                        this.sync_dialog_from_state(window, cx);
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("nb-delete")
-                                    .ghost()
-                                    .small()
-                                    .label("-")
-                                    .disabled(!has_selection)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.state.update(cx, |s, _| s.request_delete_notebook());
-                                        this.sync_dialog_from_state(window, cx);
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(Button::new("nb-hide").ghost().small().label("*").on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.state.update(cx, |s, _| s.show_notebooks = false);
-                                    cx.notify();
-                                }),
-                            )),
+                            ),
+                        ),
                     ),
             )
             .child(
@@ -1137,6 +1095,7 @@ impl NoteBrowser {
                                     .unwrap_or("")
                                     .to_string();
                                 let selected = selected_folder.as_deref() == Some(id.as_str());
+                                let folder_id = id.clone();
                                 div()
                                     .id(SharedString::from(format!("folder-{id}")))
                                     .px_3()
@@ -1153,6 +1112,64 @@ impl NoteBrowser {
                                         });
                                         cx.notify();
                                     }))
+                                    .context_menu({
+                                        let browser = browser.clone();
+                                        let folder_id = folder_id.clone();
+                                        move |menu, _window, _cx| {
+                                            menu.item(PopupMenuItem::new("新增").on_click({
+                                                let browser = browser.clone();
+                                                move |_, window, cx| {
+                                                    browser
+                                                        .update(cx, |view, cx| {
+                                                            view.state.update(cx, |s, _| {
+                                                                s.open_new_notebook();
+                                                            });
+                                                            view.sync_dialog_from_state(window, cx);
+                                                            cx.notify();
+                                                        })
+                                                        .ok();
+                                                }
+                                            }))
+                                            .item(PopupMenuItem::new("重命名").on_click({
+                                                let browser = browser.clone();
+                                                let folder_id = folder_id.clone();
+                                                move |_, window, cx| {
+                                                    browser
+                                                        .update(cx, |view, cx| {
+                                                            view.state.update(cx, |s, _| {
+                                                                s.open_rename_notebook_of(
+                                                                    &folder_id,
+                                                                );
+                                                            });
+                                                            view.sync_dialog_from_state(window, cx);
+                                                            cx.notify();
+                                                        })
+                                                        .ok();
+                                                }
+                                            }))
+                                            .item(
+                                                PopupMenuItem::new("删除").on_click({
+                                                    let browser = browser.clone();
+                                                    let folder_id = folder_id.clone();
+                                                    move |_, window, cx| {
+                                                        browser
+                                                            .update(cx, |view, cx| {
+                                                                view.state.update(cx, |s, _| {
+                                                                    s.request_delete_notebook_of(
+                                                                        &folder_id,
+                                                                    );
+                                                                });
+                                                                view.sync_dialog_from_state(
+                                                                    window, cx,
+                                                                );
+                                                                cx.notify();
+                                                            })
+                                                            .ok();
+                                                    }
+                                                }),
+                                            )
+                                        }
+                                    })
                             })),
                     )
                     .child(Scrollbar::vertical(&self.notebook_scroll)),
@@ -1164,12 +1181,13 @@ impl NoteBrowser {
         let theme = cx.theme();
         let state = self.state.read(cx);
         let notes = state.notes.clone();
+        let folders = state.folders.clone();
         let note_tags = state.note_tags.clone();
         let search_hits = state.search_hits.clone();
         let protected = state.protected.clone();
         let selected_note = state.selected_note.clone();
         let has_folder = state.selected_folder.is_some();
-        let has_note = selected_note.is_some();
+        let browser = cx.entity().downgrade();
 
         div()
             .w(px(NOTES_WIDTH))
@@ -1189,43 +1207,17 @@ impl NoteBrowser {
                     .py_1()
                     .child(div().font_weight(gpui_kit::FontWeight::BOLD).child("Notes"))
                     .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_0p5()
-                            .child(
-                                Button::new("note-new")
-                                    .ghost()
-                                    .small()
-                                    .label("＋")
-                                    .disabled(!has_folder)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.state.update(cx, |s, _| s.new_note());
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("note-delete")
-                                    .ghost()
-                                    .small()
-                                    .label("-")
-                                    .disabled(!has_note)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.state.update(cx, |s, _| s.request_delete_note());
-                                        this.sync_dialog_from_state(window, cx);
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("note-hide")
-                                    .ghost()
-                                    .small()
-                                    .label("*")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.state.update(cx, |s, _| s.show_notes = false);
-                                        cx.notify();
-                                    })),
-                            ),
+                        div().flex().items_center().gap_0p5().child(
+                            Button::new("note-new")
+                                .ghost()
+                                .small()
+                                .label("＋")
+                                .disabled(!has_folder)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.state.update(cx, |s, _| s.new_note());
+                                    cx.notify();
+                                })),
+                        ),
                     ),
             )
             .child(
@@ -1289,6 +1281,7 @@ impl NoteBrowser {
                                 let selected = selected_note.as_deref() == Some(id.as_str());
                                 let tags = note_tags.get(&id).cloned().unwrap_or_default();
                                 let snippet = search_hits.get(&id).cloned();
+                                let menu_note_id = id.clone();
 
                                 div()
                                     .id(SharedString::from(format!("note-{id}")))
@@ -1344,6 +1337,110 @@ impl NoteBrowser {
                                         }
                                         cx.notify();
                                     }))
+                                    .context_menu({
+                                        let browser = browser.clone();
+                                        let note_id = menu_note_id.clone();
+                                        let parent_id = note
+                                            .props
+                                            .get("parent_id")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let folder_list: Vec<(String, String)> = folders
+                                            .iter()
+                                            .filter_map(|f| {
+                                                let fid = f
+                                                    .props
+                                                    .get("id")
+                                                    .and_then(|v| v.as_str())?
+                                                    .to_string();
+                                                let ftitle = f
+                                                    .props
+                                                    .get("title")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("")
+                                                    .to_string();
+                                                Some((fid, ftitle))
+                                            })
+                                            .collect();
+                                        move |menu, window, cx| {
+                                            let mut menu =
+                                                menu.item(PopupMenuItem::new("新增").on_click({
+                                                    let browser = browser.clone();
+                                                    let parent_id = parent_id.clone();
+                                                    move |_, _window, cx| {
+                                                        browser
+                                                            .update(cx, |view, cx| {
+                                                                view.state.update(cx, |s, _| {
+                                                                    if parent_id.is_empty() {
+                                                                        s.new_note();
+                                                                    } else {
+                                                                        s.new_note_in(&parent_id);
+                                                                    }
+                                                                });
+                                                                cx.notify();
+                                                            })
+                                                            .ok();
+                                                    }
+                                                }));
+                                            menu =
+                                                menu.item(PopupMenuItem::new("删除").on_click({
+                                                    let browser = browser.clone();
+                                                    let note_id = note_id.clone();
+                                                    move |_, window, cx| {
+                                                        browser
+                                                            .update(cx, |view, cx| {
+                                                                view.state.update(cx, |s, _| {
+                                                                    s.request_delete_note_of(
+                                                                        &note_id,
+                                                                    );
+                                                                });
+                                                                view.sync_dialog_from_state(
+                                                                    window, cx,
+                                                                );
+                                                                cx.notify();
+                                                            })
+                                                            .ok();
+                                                    }
+                                                }));
+                                            let sub_browser = browser.clone();
+                                            let sub_note_id = note_id.clone();
+                                            let sub_folders = folder_list.clone();
+                                            menu.submenu(
+                                                "移动",
+                                                window,
+                                                cx,
+                                                move |submenu, _window, _cx| {
+                                                    let mut sub = submenu;
+                                                    for (fid, ftitle) in sub_folders.clone() {
+                                                        let browser = sub_browser.clone();
+                                                        let note_id = sub_note_id.clone();
+                                                        sub = sub.item(
+                                                            PopupMenuItem::new(ftitle).on_click(
+                                                                move |_, _window, cx| {
+                                                                    browser
+                                                                        .update(cx, |view, cx| {
+                                                                            view.state.update(
+                                                                                cx,
+                                                                                |s, _| {
+                                                                                    s.move_note_to(
+                                                                                        &note_id,
+                                                                                        &fid,
+                                                                                    );
+                                                                                },
+                                                                            );
+                                                                            cx.notify();
+                                                                        })
+                                                                        .ok();
+                                                                },
+                                                            ),
+                                                        );
+                                                    }
+                                                    sub
+                                                },
+                                            )
+                                        }
+                                    })
                             })),
                     )
                     .child(Scrollbar::vertical(&self.note_scroll)),

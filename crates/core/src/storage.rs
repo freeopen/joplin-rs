@@ -608,6 +608,27 @@ impl Storage {
         self.upsert_item(&item)
     }
 
+    /// Move a note to another notebook, bumping `updated_time` so the change
+    /// is uploaded on the next sync.
+    pub fn move_note(&self, id: &str, folder_id: &str) -> Result<()> {
+        let Some(mut item) = self.note(id)? else {
+            return Err(Error::Storage(format!("note not found: {id}")));
+        };
+        item.props.insert(
+            "parent_id".to_string(),
+            Value::String(folder_id.to_string()),
+        );
+        let previous = item
+            .props
+            .get("updated_time")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let next = crate::time_ms().max(previous + 1);
+        item.props
+            .insert("updated_time".to_string(), Value::from(next));
+        self.upsert_item(&item)
+    }
+
     /// Create a new (empty) note in a folder and return its id.
     pub fn create_note(&self, folder_id: &str, title: &str) -> Result<String> {
         let id = new_item_id();

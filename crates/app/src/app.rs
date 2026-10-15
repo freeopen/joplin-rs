@@ -346,6 +346,12 @@ pub struct AppState {
     // ---- notebook create/rename dialog ----
     pub nb_input: String,
     pub nb_error: Option<String>,
+    /// Id targeted by the pending confirm-delete dialog.
+    pub confirm_target: Option<String>,
+    /// Title of the note pending deletion (used in the dialog description).
+    pub confirm_note_title: String,
+    /// Id targeted by the pending rename dialog.
+    pub rename_target: Option<String>,
 }
 
 impl AppState {
@@ -402,6 +408,9 @@ impl AppState {
             show_notes: true,
             nb_input: String::new(),
             nb_error: None,
+            confirm_target: None,
+            confirm_note_title: String::new(),
+            rename_target: None,
         })
     }
 
@@ -611,8 +620,14 @@ impl AppState {
             self.set_status("请先选择一个笔记本，再新建笔记".into());
             return;
         };
-        match self.storage.create_note(&folder, "新建笔记") {
+        self.new_note_in(&folder);
+    }
+
+    /// Create a note in a specific notebook and open it for editing.
+    pub fn new_note_in(&mut self, folder_id: &str) {
+        match self.storage.create_note(folder_id, "新建笔记") {
             Ok(id) => {
+                self.selected_folder = Some(folder_id.to_string());
                 self.refresh_lists();
                 self.request_open_note(&id);
                 self.begin_edit();
@@ -621,21 +636,31 @@ impl AppState {
         }
     }
 
-    /// Delete the open note (locally now, remotely on the next sync).
-    pub fn delete_selected_note(&mut self) {
-        let Some(id) = self.selected_note.clone() else {
-            return;
-        };
+    /// Move a note to another notebook.
+    pub fn move_note_to(&mut self, note_id: &str, folder_id: &str) {
+        match self.storage.move_note(note_id, folder_id) {
+            Ok(()) => {
+                self.refresh_lists();
+                self.set_status("已移动笔记".into());
+            }
+            Err(e) => self.set_status(format!("移动笔记失败: {e}")),
+        }
+    }
+
+    fn delete_note(&mut self, id: &str) {
+        let was_open = self.selected_note.as_deref() == Some(id);
         self.editing = false;
         self.edit_dirty = false;
-        match self.storage.delete_item(&id) {
+        match self.storage.delete_item(id) {
             Ok(()) => {
-                self.selected_note = None;
-                self.note_body.clear();
-                self.note_raw_body.clear();
-                self.note_title.clear();
-                self.selected_note_encrypted = false;
-                self.note_locked = false;
+                if was_open {
+                    self.selected_note = None;
+                    self.note_body.clear();
+                    self.note_raw_body.clear();
+                    self.note_title.clear();
+                    self.selected_note_encrypted = false;
+                    self.note_locked = false;
+                }
                 self.refresh_lists();
                 self.set_status("已删除笔记".into());
             }
@@ -645,8 +670,75 @@ impl AppState {
 
     /// Ask for confirmation before deleting the open note.
     pub fn request_delete_note(&mut self) {
-        if self.selected_note.is_some() {
-            self.dialog = Dialog::ConfirmDeleteNote;
+        if let Some(id) = self.selected_note.clone() {
+            self.request_delete_note_of(&id);
+        }
+    }
+
+    /// Ask for confirmation before deleting a specific note.
+    pub fn request_delete_note_of(&mut self, id: &str) {
+        self.confirm_note_title = self
+            .storage
+            .note(id)
+            .ok()
+            .flatten()
+            .and_then(|n| {
+                n.props
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from)
+            })
+            .unwrap_or_default();
+        self.confirm_target = Some(id.to_string());
+        self.dialog = Dialog::ConfirmDeleteNote;
+    }
+
+    /// Ask for confirmation before deleting a specific notebook. Refused
+    /// (with a status message) while the notebook still holds notes.
+    pub fn request_delete_notebook_of(&mut self, id: &str) {
+        match self.storage.notes_in_folder(id) {
+            Ok(n) if n > 0 => {
+                self.set_status(format!("笔记本中还有 {n} 条笔记，请先删除这些笔记"));
+            }
+            Ok(_) => {
+                self.confirm_target = Some(id.to_string());
+                self.dialog = Dialog::ConfirmDeleteNotebook;
+            }
+            Err(e) => self.set_status(format!("删除笔记本失败: {e}")),
+        }
+    }
+
+    /// Apply the delete requested by the open confirmation dialog.
+    pub fn confirm_delete(&mut self) {
+        let Some(id) = self.confirm_target.clone() else {
+            self.dialog = Dialog::None;
+            return;
+        };
+        match self.dialog {
+            Dialog::ConfirmDeleteNote => self.delete_note(&id),
+            Dialog::ConfirmDeleteNotebook => self.delete_notebook(&id),
+            _ => {}
+        }
+        self.confirm_target = None;
+        self.dialog = Dialog::None;
+    }
+
+    fn delete_notebook(&mut self, id: &str) {
+        match self.storage.notes_in_folder(id) {
+            Ok(n) if n > 0 => {
+                self.set_status(format!("笔记本中还有 {n} 条笔记，请先删除这些笔记"));
+            }
+            Ok(_) => match self.storage.delete_item(id) {
+                Ok(()) => {
+                    if self.selected_folder.as_deref() == Some(id) {
+                        self.selected_folder = None;
+                    }
+                    self.refresh_lists();
+                    self.set_status("已删除笔记本".into());
+                }
+                Err(e) => self.set_status(format!("删除笔记本失败: {e}")),
+            },
+            Err(e) => self.set_status(format!("删除笔记本失败: {e}")),
         }
     }
 
@@ -658,20 +750,19 @@ impl AppState {
         self.dialog = Dialog::NewNotebook;
     }
 
-    pub fn open_rename_notebook(&mut self) {
-        let Some(id) = self.selected_folder.clone() else {
-            return;
-        };
+    /// Open the rename dialog for a specific notebook.
+    pub fn open_rename_notebook_of(&mut self, id: &str) {
         let title = self
             .folders
             .iter()
-            .find(|f| f.props.get("id").and_then(serde_json::Value::as_str) == Some(id.as_str()))
+            .find(|f| f.props.get("id").and_then(serde_json::Value::as_str) == Some(id))
             .and_then(|f| f.props.get("title"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or("")
             .to_string();
         self.nb_input = title;
         self.nb_error = None;
+        self.rename_target = Some(id.to_string());
         self.dialog = Dialog::RenameNotebook;
     }
 
@@ -696,9 +787,9 @@ impl AppState {
         }
     }
 
-    /// Rename the selected notebook from the dialog input.
+    /// Rename the notebook targeted by the dialog.
     pub fn submit_rename_notebook(&mut self) -> bool {
-        let Some(id) = self.selected_folder.clone() else {
+        let Some(id) = self.rename_target.clone() else {
             return false;
         };
         let name = self.nb_input.trim().to_string();
@@ -717,43 +808,6 @@ impl AppState {
                 false
             }
         }
-    }
-
-    /// Ask for confirmation before deleting the selected notebook. Refused
-    /// (with a status message) while the notebook still holds notes.
-    pub fn request_delete_notebook(&mut self) {
-        let Some(id) = self.selected_folder.clone() else {
-            return;
-        };
-        match self.storage.notes_in_folder(&id) {
-            Ok(n) if n > 0 => {
-                self.set_status(format!("笔记本中还有 {n} 条笔记，请先删除这些笔记"));
-            }
-            Ok(_) => self.dialog = Dialog::ConfirmDeleteNotebook,
-            Err(e) => self.set_status(format!("删除笔记本失败: {e}")),
-        }
-    }
-
-    /// Delete the selected notebook. Refused while it still holds notes.
-    pub fn delete_selected_notebook(&mut self) {
-        let Some(id) = self.selected_folder.clone() else {
-            return;
-        };
-        match self.storage.notes_in_folder(&id) {
-            Ok(n) if n > 0 => {
-                self.set_status(format!("笔记本中还有 {n} 条笔记，请先删除这些笔记"));
-            }
-            Ok(_) => match self.storage.delete_item(&id) {
-                Ok(()) => {
-                    self.selected_folder = None;
-                    self.refresh_lists();
-                    self.set_status("已删除笔记本".into());
-                }
-                Err(e) => self.set_status(format!("删除笔记本失败: {e}")),
-            },
-            Err(e) => self.set_status(format!("删除笔记本失败: {e}")),
-        }
-        self.dialog = Dialog::None;
     }
 
     // ---- reading password (per-note protection) ----
@@ -1515,7 +1569,8 @@ mod tests {
             "an edited note must be queued for upload"
         );
 
-        state.delete_selected_note();
+        state.request_delete_note();
+        state.confirm_delete();
         assert!(state.selected_note.is_none());
         assert!(state.storage.note(&note).unwrap().is_none());
         assert_eq!(state.storage.pending_deletes().unwrap(), vec![note]);
@@ -1543,7 +1598,8 @@ mod tests {
         state.refresh_lists();
         state.selected_folder = Some(folder.clone());
 
-        state.delete_selected_notebook();
+        state.request_delete_notebook_of(&folder);
+        state.confirm_delete();
         assert_eq!(
             state.storage.folders().unwrap().len(),
             1,
@@ -1552,7 +1608,8 @@ mod tests {
 
         state.storage.delete_item(&note).unwrap();
         state.selected_folder = Some(folder.clone());
-        state.delete_selected_notebook();
+        state.request_delete_notebook_of(&folder);
+        state.confirm_delete();
         assert!(state.storage.folders().unwrap().is_empty());
         assert!(state.selected_folder.is_none());
     }
@@ -1570,19 +1627,54 @@ mod tests {
         // Delete note: opens the confirmation dialog, does not delete yet.
         state.request_delete_note();
         assert_eq!(state.dialog, Dialog::ConfirmDeleteNote);
+        assert_eq!(state.confirm_note_title, "N");
         assert!(state.storage.note(&note).unwrap().is_some());
 
-        // Notebook with notes is refused outright (no dialog).
-        state.dialog = Dialog::None;
-        state.request_delete_notebook();
+        // Confirming deletes and closes the dialog (no reopen).
+        state.confirm_delete();
+        assert_eq!(state.dialog, Dialog::None);
+        assert!(state.storage.note(&note).unwrap().is_none());
+
+        // Notebook delete is refused outright while it holds notes.
+        let note2 = state.storage.create_note(&folder, "N2").unwrap();
+        state.refresh_lists();
+        state.request_delete_notebook_of(&folder);
         assert_eq!(state.dialog, Dialog::None);
         assert_eq!(state.storage.folders().unwrap().len(), 1);
 
-        // Empty notebook: opens the confirmation dialog.
-        state.storage.delete_item(&note).unwrap();
-        state.selected_folder = Some(folder);
-        state.request_delete_notebook();
+        // Empty notebook: opens the confirmation dialog, then deletes.
+        state.storage.delete_item(&note2).unwrap();
+        state.request_delete_notebook_of(&folder);
         assert_eq!(state.dialog, Dialog::ConfirmDeleteNotebook);
+        state.confirm_delete();
+        assert!(state.storage.folders().unwrap().is_empty());
+    }
+
+    #[test]
+    fn move_note_to_another_notebook() {
+        let mut state =
+            AppState::build(Storage::open_in_memory().unwrap(), Config::default()).unwrap();
+        let f1 = state.storage.create_folder("F1").unwrap();
+        let f2 = state.storage.create_folder("F2").unwrap();
+        let note = state.storage.create_note(&f1, "N").unwrap();
+        state.refresh_lists();
+
+        state.move_note_to(&note, &f2);
+        assert_eq!(
+            state.storage.note(&note).unwrap().unwrap().props["parent_id"].as_str(),
+            Some(f2.as_str())
+        );
+        assert_eq!(state.storage.notes_in_folder(&f2).unwrap(), 1);
+        assert_eq!(state.storage.notes_in_folder(&f1).unwrap(), 0);
+        assert!(
+            state
+                .storage
+                .items_needing_sync()
+                .unwrap()
+                .iter()
+                .any(|i| i.props["id"].as_str() == Some(note.as_str())),
+            "a moved note must be queued for upload"
+        );
     }
 
     // ---- encrypted config secrets (CLI set-password compatibility) ----
