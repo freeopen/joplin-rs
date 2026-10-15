@@ -159,7 +159,7 @@ pub struct NoteBrowser {
     /// which event callbacks do not have, so every field the app ever shows
     /// is created once at startup and cleared with `set_value("")` when the
     /// owning dialog opens (mirrors the egui per-open field lifecycle).
-    search_input: Entity<InputState>,
+    search_query: Entity<InputState>,
     gate_input: Entity<InputState>,
     rp_current: Entity<InputState>,
     rp_new: Entity<InputState>,
@@ -168,6 +168,10 @@ pub struct NoteBrowser {
     /// Note editor fields (title single-line, body multi-line).
     title_edit: Entity<InputState>,
     note_edit: Entity<TextareaState>,
+    /// ⌘F was pressed from preview mode: the editor element only renders on the
+    /// next frame, so the focus + `Search` dispatch is deferred to the tick
+    /// (a synchronous dispatch lands before the textarea exists and is dropped).
+    pending_find: bool,
     /// New/rename notebook name field.
     nb_input: Entity<InputState>,
     /// Scroll handles backing the list scrollbars.
@@ -216,7 +220,7 @@ impl NoteBrowser {
             s.restore_last_session();
         });
 
-        let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search…"));
+        let search_query = cx.new(|cx| InputState::new(window, cx).placeholder("搜索全部笔记…"));
         let gate_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("阅读密码")
@@ -243,13 +247,27 @@ impl NoteBrowser {
                 .masked(true)
         });
         let title_edit = cx.new(|cx| InputState::new(window, cx).placeholder("标题"));
-        let note_edit = cx.new(|cx| TextareaState::new(window, cx).placeholder("Markdown 正文…"));
+        let note_edit = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .placeholder("Markdown 正文…")
+                // Enables the in-editor find panel opened by ⌘F (FindInNote).
+                .searchable(true)
+        });
         let nb_input = cx.new(|cx| InputState::new(window, cx).placeholder("笔记本名称"));
         // Settings dialog fields (webdav url / username / passwords / CA cert).
-        let set_url = cx.new(|cx| InputState::new(window, cx).placeholder("https://host/dav/joplin"));
+        let set_url =
+            cx.new(|cx| InputState::new(window, cx).placeholder("https://host/dav/joplin"));
         let set_user = cx.new(|cx| InputState::new(window, cx).placeholder("用户名"));
-        let set_pw = cx.new(|cx| InputState::new(window, cx).placeholder("留空则不修改").masked(true));
-        let set_e2ee = cx.new(|cx| InputState::new(window, cx).placeholder("留空则不修改").masked(true));
+        let set_pw = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("留空则不修改")
+                .masked(true)
+        });
+        let set_e2ee = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("留空则不修改")
+                .masked(true)
+        });
         let set_ca = cx.new(|cx| InputState::new(window, cx).placeholder("PEM 证书路径（可选）"));
 
         let mut subscriptions = Vec::new();
@@ -306,25 +324,6 @@ impl NoteBrowser {
                 }
                 let text = state.read(cx).value().to_string();
                 this.state.update(cx, |s, _| s.nb_input = text);
-            },
-        ));
-        // Search-as-you-type: reload the note list whenever the search text
-        // changes (replaces the old per-tick value polling).
-        subscriptions.push(cx.subscribe(
-            &search_input,
-            |this: &mut Self, state, event: &InputEvent, cx| {
-                if !matches!(event, InputEvent::Change) {
-                    return;
-                }
-                let text = state.read(cx).value().to_string();
-                this.state.update(cx, |s, _| {
-                    if s.search != text {
-                        s.end_edit();
-                        s.search = text;
-                        s.load_notes();
-                    }
-                });
-                cx.notify();
             },
         ));
         // Note-gate fields mirror into AppState on every change; unlock with
@@ -472,6 +471,15 @@ impl NoteBrowser {
                                 .update(cx, |input, cx| input.set_value("", window, cx));
                         }
                         this.sync_dialog_from_state(window, cx);
+                        // Deferred in-note find (⌘F from preview mode): the
+                        // editor is mounted by now, so the panel can open.
+                        if this.pending_find {
+                            this.pending_find = false;
+                            let handle = this.note_edit.read(cx).focus_handle(cx);
+                            window.focus(&handle, cx);
+                            window.dispatch_action(Box::new(Search), cx);
+                            cx.notify();
+                        }
                         // Quit-after-sync: leave once the sync job finished.
                         let quit_now = {
                             let s = this.state.read(cx);
@@ -499,7 +507,7 @@ impl NoteBrowser {
 
         Self {
             state,
-            search_input,
+            search_query,
             gate_input,
             rp_current,
             rp_new,
@@ -507,6 +515,7 @@ impl NoteBrowser {
             e2ee_input,
             title_edit,
             note_edit,
+            pending_find: false,
             nb_input,
             notebook_scroll: ScrollHandle::new(),
             note_scroll: ScrollHandle::new(),
@@ -567,14 +576,16 @@ impl NoteBrowser {
             self.state.update(cx, |s, _| jobs::start_download(s));
         }
         self.state.update(cx, |s, _| s.quit_after_sync = true);
-        self.state
-            .update(cx, |s, _| s.set_status(format!("退出前同步 {pending} 项更改…")));
+        self.state.update(cx, |s, _| {
+            s.set_status(format!("退出前同步 {pending} 项更改…"))
+        });
         cx.notify();
         true
     }
 
     fn toggle_notebooks(&mut self, _: &ToggleNotebooks, _: &mut Window, cx: &mut Context<Self>) {
-        self.state.update(cx, |s, _| s.show_notebooks = !s.show_notebooks);
+        self.state
+            .update(cx, |s, _| s.show_notebooks = !s.show_notebooks);
         cx.notify();
     }
 
@@ -583,10 +594,10 @@ impl NoteBrowser {
         cx.notify();
     }
 
-    /// Focus the global search box (searches across all notes).
+    /// Open the global search dialog (⌘⌥F): type a query, Enter runs it.
     fn global_search(&mut self, _: &GlobalSearch, window: &mut Window, cx: &mut Context<Self>) {
-        let handle = self.search_input.read(cx).focus_handle(cx);
-        window.focus(&handle, cx);
+        self.state.update(cx, |s, _| s.dialog = AppDialog::Search);
+        self.sync_dialog_from_state(window, cx);
         cx.notify();
     }
 
@@ -608,6 +619,12 @@ impl NoteBrowser {
             self.note_edit
                 .update(cx, |i, cx| i.set_value(body, window, cx));
             self.edit_epoch_seen = self.state.read(cx).edit_epoch;
+            // The editor element is only rendered on the next frame; defer the
+            // focus + Search dispatch to the tick, otherwise the action is
+            // dropped and the find panel never opens on the first ⌘F.
+            self.pending_find = true;
+            cx.notify();
+            return;
         }
         let handle = self.note_edit.read(cx).focus_handle(cx);
         window.focus(&handle, cx);
@@ -625,12 +642,14 @@ impl NoteBrowser {
                 s.set_ca_cert.clone(),
             )
         };
-        self.set_url.update(cx, |i, cx| i.set_value(url, window, cx));
+        self.set_url
+            .update(cx, |i, cx| i.set_value(url, window, cx));
         self.set_user
             .update(cx, |i, cx| i.set_value(user, window, cx));
         self.set_ca.update(cx, |i, cx| i.set_value(ca, window, cx));
         self.set_pw.update(cx, |i, cx| i.set_value("", window, cx));
-        self.set_e2ee.update(cx, |i, cx| i.set_value("", window, cx));
+        self.set_e2ee
+            .update(cx, |i, cx| i.set_value("", window, cx));
         self.sync_dialog_from_state(window, cx);
         cx.notify();
     }
@@ -659,12 +678,8 @@ impl NoteBrowser {
 
     fn notebooks_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         match event.keystroke.key.as_str() {
-            "j" => self
-                .state
-                .update(cx, |s, _| s.move_folder_cursor(1)),
-            "k" => self
-                .state
-                .update(cx, |s, _| s.move_folder_cursor(-1)),
+            "j" => self.state.update(cx, |s, _| s.move_folder_cursor(1)),
+            "k" => self.state.update(cx, |s, _| s.move_folder_cursor(-1)),
             "enter" => self.state.update(cx, |s, _| s.select_folder_at_cursor()),
             _ => return,
         }
@@ -692,6 +707,12 @@ impl NoteBrowser {
         if ks.modifiers.platform {
             return;
         }
+        // The in-editor find panel (⌘F) renders inside this capture container
+        // but owns its own input; when it holds focus the vim layer must not
+        // swallow its keystrokes.
+        if !self.note_edit.read(cx).focus_handle(cx).is_focused(window) {
+            return;
+        }
         let (enabled, editing, normal) = {
             let s = self.state.read(cx);
             (s.config.vim_mode, s.editing, s.vim_normal)
@@ -699,7 +720,11 @@ impl NoteBrowser {
         if !enabled || !editing {
             return;
         }
-        let mode = if normal { VimMode::Normal } else { VimMode::Insert };
+        let mode = if normal {
+            VimMode::Normal
+        } else {
+            VimMode::Insert
+        };
         let key = ks.key.clone();
         let ctrl = ks.modifiers.control;
         let action = {
@@ -748,8 +773,7 @@ impl NoteBrowser {
             VimAction::PasteAfter => {
                 let reg = self.vim_register.clone();
                 if !reg.is_empty() {
-                    self.note_edit
-                        .update(cx, |s, cx| s.insert(reg, window, cx));
+                    self.note_edit.update(cx, |s, cx| s.insert(reg, window, cx));
                 }
             }
             VimAction::Undo => window.dispatch_action(Box::new(Undo), cx),
@@ -872,6 +896,7 @@ impl NoteBrowser {
             AppDialog::None => {}
             AppDialog::ReaderPasswordSettings => self.open_rp_dialog(window, cx),
             AppDialog::E2eePrompt => self.open_e2ee_dialog(window, cx),
+            AppDialog::Search => self.open_search_dialog(window, cx),
             AppDialog::NewNotebook | AppDialog::RenameNotebook => {
                 self.open_notebook_dialog(window, cx, want)
             }
@@ -1181,6 +1206,72 @@ impl NoteBrowser {
         });
     }
 
+    /// Modal for a global search query (⌘⌥F). Enter applies the query and
+    /// closes; Esc/Cancel leaves the current filter untouched.
+    fn open_search_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let browser = cx.entity().downgrade();
+        let input = self.search_query.clone();
+        // Prefill with the active query so it can be edited or cleared.
+        let initial = self.state.read(cx).search.clone();
+        input.update(cx, |i, cx| i.set_value(initial, window, cx));
+        window.open_dialog(cx, move |dialog, window, cx| {
+            let handle = input.read(cx).focus_handle(cx);
+            window.focus(&handle, cx);
+            let browser_ok = browser.clone();
+            let browser_cancel = browser.clone();
+            let browser_close = browser.clone();
+            let input_field = input.clone();
+            let input_ok = input.clone();
+            dialog
+                .title("搜索笔记")
+                .w(px(420.))
+                .content(move |content, _window, _cx| {
+                    content
+                        .child(form_row("查询", input_field.clone()))
+                        .child(hint_line(
+                            "输入关键词后回车搜索全部笔记；留空回车则清除筛选。",
+                        ))
+                })
+                .footer(
+                    DialogFooter::new()
+                        .child(Button::new("search-cancel").label("取消").on_click(
+                            move |_, window, cx| {
+                                browser_cancel
+                                    .update(cx, |view, cx| {
+                                        view.state.update(cx, |s, _| s.dialog = AppDialog::None);
+                                        view.pending_dialog = AppDialog::None;
+                                    })
+                                    .ok();
+                                window.close_dialog(cx);
+                            },
+                        ))
+                        .child(
+                            DialogAction::new()
+                                .child(Button::new("search-ok").primary().label("搜索")),
+                        ),
+                )
+                .on_ok(move |_, _, cx| {
+                    let query = input_ok.read(cx).value().to_string();
+                    browser_ok
+                        .update(cx, |view, cx| {
+                            view.state.update(cx, |s, _| s.apply_search(&query));
+                            view.pending_dialog = AppDialog::None;
+                        })
+                        .ok();
+                    true
+                })
+                .on_cancel(move |_, _, cx| {
+                    browser_close
+                        .update(cx, |view, cx| {
+                            view.state.update(cx, |s, _| s.dialog = AppDialog::None);
+                            view.pending_dialog = AppDialog::None;
+                        })
+                        .ok();
+                    true
+                })
+        });
+    }
+
     /// Confirmation modal shown before deleting a note or a notebook.
     fn open_confirm_delete_dialog(
         &mut self,
@@ -1327,19 +1418,17 @@ impl NoteBrowser {
                 })
                 .footer(
                     DialogFooter::new()
-                        .child(
-                            Button::new("set-cancel").label("取消").on_click(
-                                move |_, window, cx| {
-                                    b_cancel
-                                        .update(cx, |view, cx| {
-                                            view.state.update(cx, |s, _| s.dialog = AppDialog::None);
-                                            view.pending_dialog = AppDialog::None;
-                                        })
-                                        .ok();
-                                    window.close_dialog(cx);
-                                },
-                            ),
-                        )
+                        .child(Button::new("set-cancel").label("取消").on_click(
+                            move |_, window, cx| {
+                                b_cancel
+                                    .update(cx, |view, cx| {
+                                        view.state.update(cx, |s, _| s.dialog = AppDialog::None);
+                                        view.pending_dialog = AppDialog::None;
+                                    })
+                                    .ok();
+                                window.close_dialog(cx);
+                            },
+                        ))
                         .child(
                             DialogAction::new()
                                 .child(Button::new("set-save").primary().label("保存")),
@@ -1405,6 +1494,7 @@ impl Render for NoteBrowser {
         let show_notebooks = self.state.read(cx).show_notebooks;
         let show_notes = self.state.read(cx).show_notes;
         let pending = self.state.read(cx).local_pending;
+        let active_search = self.state.read(cx).search.clone();
         let base = if !worker.is_empty() {
             worker
         } else if status.is_empty() {
@@ -1526,10 +1616,8 @@ impl Render for NoteBrowser {
                                     .update(cx, |i, cx| i.set_value(url, window, cx));
                                 this.set_user
                                     .update(cx, |i, cx| i.set_value(user, window, cx));
-                                this.set_ca
-                                    .update(cx, |i, cx| i.set_value(ca, window, cx));
-                                this.set_pw
-                                    .update(cx, |i, cx| i.set_value("", window, cx));
+                                this.set_ca.update(cx, |i, cx| i.set_value(ca, window, cx));
+                                this.set_pw.update(cx, |i, cx| i.set_value("", window, cx));
                                 this.set_e2ee
                                     .update(cx, |i, cx| i.set_value("", window, cx));
                                 this.sync_dialog_from_state(window, cx);
@@ -1555,15 +1643,35 @@ impl Render for NoteBrowser {
                             })),
                     ),
             )
-            // ---- search row ----
-            .child(
-                div()
-                    .px_3()
-                    .py_2()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .child(Input::new(&self.search_input).id("search").cleanable(true)),
-            )
+            // ---- active-search indicator (the query is entered via ⌘⌥F) ----
+            .when(!active_search.is_empty(), |el| {
+                el.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .py_1()
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_color(theme.muted_foreground)
+                                .child(SharedString::from(format!("🔍 搜索：{active_search}"))),
+                        )
+                        .child(
+                            Button::new("search-clear")
+                                .ghost()
+                                .small()
+                                .label("清除")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.state.update(cx, |s, _| s.apply_search(""));
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
             // ---- body: notebooks | note preview | notes ----
             .child(
                 div()
@@ -1574,13 +1682,19 @@ impl Render for NoteBrowser {
                         el.child(self.render_notebooks_column(nb_focused, cx))
                     })
                     .child(self.render_note_panel(window, cx))
-                    .when(show_notes, |el| el.child(self.render_notes_column(notes_focused, cx))),
+                    .when(show_notes, |el| {
+                        el.child(self.render_notes_column(notes_focused, cx))
+                    }),
             )
     }
 }
 
 impl NoteBrowser {
-    fn render_notebooks_column(&self, focused: bool, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+    fn render_notebooks_column(
+        &self,
+        focused: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
         let theme = cx.theme();
         let state = self.state.read(cx);
         let folders = state.folders.clone();
@@ -1678,9 +1792,7 @@ impl NoteBrowser {
                                     .py_1()
                                     .cursor_pointer()
                                     .when(selected, |el| el.bg(theme.selection.opacity(0.35)))
-                                    .when(is_cursor, |el| {
-                                        el.bg(theme.selection.opacity(0.6))
-                                    })
+                                    .when(is_cursor, |el| el.bg(theme.selection.opacity(0.6)))
                                     .hover(|s| s.bg(theme.selection.opacity(0.15)))
                                     .child(SharedString::from(title))
                                     .on_click(cx.listener(move |this, _, window, cx| {

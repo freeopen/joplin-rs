@@ -215,6 +215,9 @@ pub enum Dialog {
     ReaderPasswordSettings,
     /// Prompt for the E2EE master-key password after a sync downloaded items.
     E2eePrompt,
+    /// Global search prompt (⌘⌥F): the query is typed into `search_query` and
+    /// applied on Enter.
+    Search,
     /// Create a new notebook (name typed into `nb_input`).
     NewNotebook,
     /// Rename the selected notebook.
@@ -561,6 +564,16 @@ impl AppState {
             // Route through the gate so a protected note re-locks after sync.
             self.request_open_note(&id);
         }
+    }
+
+    /// Apply a global search query from the search dialog (⌘⌥F). A blank query
+    /// clears the filter (showing the selected notebook's notes). Runs the
+    /// search immediately and closes the dialog.
+    pub fn apply_search(&mut self, query: &str) {
+        self.end_edit();
+        self.search = query.trim().to_string();
+        self.load_notes();
+        self.dialog = Dialog::None;
     }
 
     pub fn load_notes(&mut self) {
@@ -1783,6 +1796,50 @@ mod tests {
         // The WebDAV password is NOT an upload fallback.
         state.config.password = Some("dav-pw".into());
         assert_eq!(state.resolve_upload_password(), None);
+    }
+
+    /// The ⌘⌥F search dialog applies the query through `apply_search`: a
+    /// non-empty query filters the note list, a blank one clears it, and the
+    /// dialog flag is reset either way.
+    #[test]
+    fn apply_search_filters_and_clears() {
+        let mut state =
+            AppState::build(Storage::open_in_memory().unwrap(), Config::default()).unwrap();
+        let folder = state.storage.create_folder("F").unwrap();
+        let a = state.storage.create_note(&folder, "alpha apple").unwrap();
+        let b = state.storage.create_note(&folder, "beta banana").unwrap();
+        state
+            .storage
+            .update_note(&a, "alpha apple", "apple pie")
+            .unwrap();
+        state
+            .storage
+            .update_note(&b, "beta banana", "banana bread")
+            .unwrap();
+        state.selected_folder = Some(folder.clone());
+        state.refresh_lists();
+
+        state.dialog = Dialog::Search;
+        state.apply_search("apple");
+        assert_eq!(state.dialog, Dialog::None, "dialog closes after applying");
+        let ids = |s: &AppState| -> Vec<String> {
+            s.notes
+                .iter()
+                .filter_map(|n| n.props["id"].as_str().map(str::to_string))
+                .collect()
+        };
+        let shown = ids(&state);
+        assert!(shown.contains(&a), "matching note shown: {shown:?}");
+        assert!(!shown.contains(&b), "non-matching note hidden: {shown:?}");
+        assert!(state.search_hits.contains_key(&a), "snippet recorded");
+
+        state.apply_search("   ");
+        assert!(state.search.is_empty(), "blank query clears the filter");
+        let shown = ids(&state);
+        assert!(
+            shown.contains(&a) && shown.contains(&b),
+            "all notes shown after clearing: {shown:?}"
+        );
     }
 
     /// Regression: submitting the correct E2EE password while a stale job
