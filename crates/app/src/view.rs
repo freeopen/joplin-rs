@@ -1109,9 +1109,9 @@ impl NoteBrowser {
                     .py_1()
                     .cursor_pointer()
                     .when(selected_folder.is_none(), |el| {
-                        el.bg(theme.accent.opacity(0.5))
+                        el.bg(theme.selection.opacity(0.35))
                     })
-                    .hover(|s| s.bg(theme.accent.opacity(0.25)))
+                    .hover(|s| s.bg(theme.selection.opacity(0.15)))
                     .child("All notes")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.state.update(cx, |s, _| {
@@ -1153,8 +1153,8 @@ impl NoteBrowser {
                                     .px_3()
                                     .py_1()
                                     .cursor_pointer()
-                                    .when(selected, |el| el.bg(theme.accent.opacity(0.5)))
-                                    .hover(|s| s.bg(theme.accent.opacity(0.25)))
+                                    .when(selected, |el| el.bg(theme.selection.opacity(0.35)))
+                                    .hover(|s| s.bg(theme.selection.opacity(0.15)))
                                     .child(SharedString::from(title))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.state.update(cx, |s, _| {
@@ -1306,8 +1306,8 @@ impl NoteBrowser {
                                     .px_3()
                                     .py_1()
                                     .cursor_pointer()
-                                    .when(selected, |el| el.bg(theme.accent.opacity(0.5)))
-                                    .hover(|s| s.bg(theme.accent.opacity(0.25)))
+                                    .when(selected, |el| el.bg(theme.selection.opacity(0.35)))
+                                    .hover(|s| s.bg(theme.selection.opacity(0.15)))
                                     .flex()
                                     .flex_col()
                                     .gap_0p5()
