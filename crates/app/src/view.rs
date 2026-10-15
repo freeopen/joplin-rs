@@ -37,7 +37,7 @@ use gpui_kit::{
 use crate::app::{is_encrypted_placeholder, short_id, AppState, Dialog as AppDialog};
 use crate::jobs;
 
-gpui_kit::actions!(app, [Sync, Reload, OpenReaderPassword, Quit, ShowAbout]);
+gpui_kit::actions!(app, [Sync, OpenReaderPassword, Quit, ShowAbout]);
 
 const NOTEBOOKS_WIDTH: f32 = 200.;
 const NOTES_WIDTH: f32 = 300.;
@@ -380,11 +380,6 @@ impl NoteBrowser {
 
     fn sync_clicked(&mut self, _: &Sync, _: &mut Window, cx: &mut Context<Self>) {
         self.state.update(cx, |s, _| jobs::start_download(s));
-        cx.notify();
-    }
-
-    fn reload_clicked(&mut self, _: &Reload, _: &mut Window, cx: &mut Context<Self>) {
-        self.state.update(cx, |s, _| s.reload_meta());
         cx.notify();
     }
 
@@ -903,7 +898,6 @@ impl Render for NoteBrowser {
             .id("root")
             .key_context("NoteBrowser")
             .on_action(cx.listener(Self::sync_clicked))
-            .on_action(cx.listener(Self::reload_clicked))
             .on_action(cx.listener(Self::reader_password_clicked))
             .size_full()
             .flex()
@@ -946,16 +940,6 @@ impl Render for NoteBrowser {
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.state.update(cx, |s, _| s.open_reader_pw_settings());
                                 this.sync_dialog_from_state(window, cx);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("btn-reload")
-                            .small()
-                            .ghost()
-                            .label("Reload")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.state.update(cx, |s, _| s.reload_meta());
                                 cx.notify();
                             })),
                     )
@@ -1079,7 +1063,7 @@ impl NoteBrowser {
                                 Button::new("nb-rename")
                                     .ghost()
                                     .small()
-                                    .label("✎")
+                                    .label("~")
                                     .disabled(!has_selection)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.state.update(cx, |s, _| s.open_rename_notebook());
@@ -1091,7 +1075,7 @@ impl NoteBrowser {
                                 Button::new("nb-delete")
                                     .ghost()
                                     .small()
-                                    .label("🗑")
+                                    .label("-")
                                     .disabled(!has_selection)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.state.update(cx, |s, _| s.request_delete_notebook());
@@ -1099,7 +1083,7 @@ impl NoteBrowser {
                                         cx.notify();
                                     })),
                             )
-                            .child(Button::new("nb-hide").ghost().small().label("⯇").on_click(
+                            .child(Button::new("nb-hide").ghost().small().label("*").on_click(
                                 cx.listener(|this, _, _, cx| {
                                     this.state.update(cx, |s, _| s.show_notebooks = false);
                                     cx.notify();
@@ -1224,7 +1208,7 @@ impl NoteBrowser {
                                 Button::new("note-delete")
                                     .ghost()
                                     .small()
-                                    .label("🗑")
+                                    .label("-")
                                     .disabled(!has_note)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.state.update(cx, |s, _| s.request_delete_note());
@@ -1236,7 +1220,7 @@ impl NoteBrowser {
                                 Button::new("note-hide")
                                     .ghost()
                                     .small()
-                                    .label("⯈")
+                                    .label("*")
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.state.update(cx, |s, _| s.show_notes = false);
                                         cx.notify();
