@@ -287,6 +287,76 @@ fn escape_prop(s: &str) -> String {
         .replace('\r', "\\r")
 }
 
+/// Serialize an item back to the Joplin sync format (BaseItem.serialize):
+///
+/// ```text
+/// <title>
+///
+/// <body...>            (notes only)
+///
+/// id: xxxx
+/// type_: 1
+/// ...props...
+/// ```
+///
+/// Known types emit their props in the canonical `table_fields` order with
+/// `type_` last (the same order Joplin uses); unknown types emit whatever
+/// props are held. `title`/`body` are emitted as the leading lines, never as
+/// props, and timestamps are formatted as ISO8601 via [`serialize_prop`].
+///
+/// The result round-trips through [`unserialize`] for notes and folders.
+pub fn serialize(item: &Item) -> String {
+    let title = item
+        .props
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let title_present = item.props.contains_key("title");
+    let body = if item.item_type == TYPE_NOTE {
+        item.body.clone()
+    } else {
+        String::new()
+    };
+
+    let mut props: Vec<String> = Vec::new();
+    match table_fields(item.item_type) {
+        Some(fields) => {
+            for (name, _) in fields {
+                if *name == "title" || *name == "body" {
+                    continue;
+                }
+                if let Some(v) = item.props.get(*name) {
+                    props.push(format!("{name}: {}", serialize_prop(name, v)));
+                }
+            }
+        }
+        None => {
+            for (name, v) in &item.props {
+                if name == "title" || name == "body" {
+                    continue;
+                }
+                props.push(format!("{name}: {}", serialize_prop(name, v)));
+            }
+        }
+    }
+    // `type_` is not part of the table field list; Joplin appends it last.
+    props.push(format!(
+        "type_: {}",
+        serialize_prop("type_", &Value::from(item.item_type))
+    ));
+
+    let mut parts: Vec<String> = Vec::new();
+    if title_present {
+        parts.push(title);
+    }
+    if !body.is_empty() {
+        parts.push(body);
+    }
+    parts.push(props.join("\n"));
+    parts.join("\n\n")
+}
+
 /// Unserialize an item blob (BaseItem.unserialize).
 pub fn unserialize(content: &str) -> Result<Item> {
     // Serialized blobs end with the last property (no trailing newline), but
@@ -478,5 +548,74 @@ mod tests {
         let item = unserialize(blob).unwrap();
         assert!(!item.props.contains_key("some_unknown"));
         assert_eq!(item.body, "body");
+    }
+
+    #[test]
+    fn serialize_roundtrips_note() {
+        // unserialize -> serialize -> unserialize must preserve body and
+        // the identifying/timestamp props.
+        let item = unserialize(SAMPLE).unwrap();
+        let text = serialize(&item);
+        assert!(text.contains("id: 0f1e2d3c4b5a69788796a5b4c3d2e1f0"), "{text}");
+        assert!(text.contains("type_: 1"), "{text}");
+        assert!(text.starts_with("My note title\n\nHello world\nsecond line\n\n"), "{text}");
+
+        let back = unserialize(&text).unwrap();
+        assert_eq!(back.item_type, TYPE_NOTE);
+        assert_eq!(back.body, item.body);
+        assert_eq!(back.props["title"], item.props["title"]);
+        assert_eq!(back.props["is_todo"], item.props["is_todo"]);
+        assert_eq!(back.props["todo_completed"], item.props["todo_completed"]);
+        assert_eq!(back.props["updated_time"], item.props["updated_time"]);
+    }
+
+    #[test]
+    fn serialize_timestamp_is_iso8601() {
+        let item = Item {
+            item_type: TYPE_NOTE,
+            props: {
+                let mut m = BTreeMap::new();
+                m.insert("id".to_string(), Value::from("0123456789abcdef0123456789abcdef"));
+                m.insert("title".to_string(), Value::from("t"));
+                m.insert("updated_time".to_string(), Value::from(1_700_000_000_000i64));
+                m
+            },
+            body: "b".into(),
+        };
+        let text = serialize(&item);
+        assert!(
+            text.contains("updated_time: 2023-11-14T"),
+            "timestamp must be ISO8601: {text}"
+        );
+    }
+
+    #[test]
+    fn serialize_roundtrips_folder() {
+        let blob = "Notebook\n\nid: 0123456789abcdef0123456789abcdef\ntype_: 2";
+        let item = unserialize(blob).unwrap();
+        let text = serialize(&item);
+        let back = unserialize(&text).unwrap();
+        assert_eq!(back.item_type, TYPE_FOLDER);
+        assert_eq!(back.props["title"], item.props["title"]);
+        assert_eq!(back.props["id"], item.props["id"]);
+    }
+
+    #[test]
+    fn serialize_handles_unicode_and_escaping() {
+        let item = Item {
+            item_type: TYPE_NOTE,
+            props: {
+                let mut m = BTreeMap::new();
+                m.insert("id".to_string(), Value::from("0123456789abcdef0123456789abcdef"));
+                m.insert("title".to_string(), Value::from("标题：测试"));
+                m.insert("source_url".to_string(), Value::from("a\nb"));
+                m
+            },
+            body: "第一行\n第二行 :/0123456789abcdef0123456789abcdef".into(),
+        };
+        let text = serialize(&item);
+        let back = unserialize(&text).unwrap();
+        assert_eq!(back.props["title"], item.props["title"]);
+        assert_eq!(back.body, item.body);
     }
 }
