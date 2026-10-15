@@ -835,6 +835,11 @@ impl NoteBrowser {
                                 } else {
                                     s.delete_selected_notebook();
                                 }
+                                // Clear the dialog flag: the periodic
+                                // sync_dialog_from_state tick would otherwise
+                                // reopen it (pending_dialog alone is not the
+                                // source of truth).
+                                s.dialog = AppDialog::None;
                             });
                             view.pending_dialog = AppDialog::None;
                             true
