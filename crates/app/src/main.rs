@@ -8,6 +8,7 @@ mod app;
 mod jobs;
 mod read_password;
 mod view;
+mod vim;
 
 #[cfg(target_os = "macos")]
 mod macos_about;

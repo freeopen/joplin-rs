@@ -33,6 +33,22 @@ pub struct Config {
     /// app on launch; it gates notes the user marked as protected.
     #[serde(default)]
     pub reader_password_hash: Option<String>,
+    /// Default the note editor to a minimal Vim keybinding layer. On by
+    /// default; added after v1.0 so existing configs get Vim too.
+    #[serde(default = "default_true")]
+    pub vim_mode: bool,
+    /// Run a sync when the GUI launches (checks the remote and transfers only
+    /// what changed). On by default.
+    #[serde(default = "default_true")]
+    pub sync_on_startup: bool,
+    /// Sync pending local changes before quitting the GUI. On by default.
+    #[serde(default = "default_true")]
+    pub sync_on_quit: bool,
+}
+
+/// serde default for booleans that should be `true` when the key is absent.
+pub fn default_true() -> bool {
+    true
 }
 
 impl Config {
@@ -119,13 +135,40 @@ pub fn save_reader_password_hash(hash: &Option<String>) -> anyhow::Result<()> {
     write_config_string_key(&config_path(), "reader_password_hash", hash.as_deref())
 }
 
-/// Rewrite one `key = "value"` line in config.toml, keeping every other line
-/// byte-for-byte (the whole struct would silently downgrade on-disk
-/// ciphertext to plaintext).
+/// Render a plain string as a quoted TOML literal with minimal escaping.
+fn toml_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Write a string value: `key = "value"` (or remove the line when `None`).
 pub fn write_config_string_key(
     path: &std::path::Path,
     key: &str,
     value: Option<&str>,
+) -> anyhow::Result<()> {
+    let rendered = value.map(toml_string);
+    write_config_raw_key(path, key, rendered.as_deref())
+}
+
+/// Rewrite one `key = <rendered>` line in config.toml, keeping every other
+/// line byte-for-byte (the whole struct would silently downgrade on-disk
+/// ciphertext to plaintext). `rendered` is the already-formatted TOML value
+/// (e.g. `"text"` quoted, or a bare `true`); `None` removes the key.
+pub fn write_config_raw_key(
+    path: &std::path::Path,
+    key: &str,
+    rendered: Option<&str>,
 ) -> anyhow::Result<()> {
     let raw = std::fs::read_to_string(path).unwrap_or_default();
     let mut replaced = false;
@@ -134,8 +177,8 @@ pub fn write_config_string_key(
     for line in raw.lines() {
         if line.trim_start().starts_with(&needle) {
             replaced = true;
-            if let Some(v) = value {
-                out.push_str(&format!("{key} = \"{v}\"\n"));
+            if let Some(v) = rendered {
+                out.push_str(&format!("{key} = {v}\n"));
             }
             // Removing the key: drop the line entirely.
         } else {
@@ -144,11 +187,11 @@ pub fn write_config_string_key(
         }
     }
     if !replaced {
-        if let Some(v) = value {
+        if let Some(v) = rendered {
             if !out.is_empty() && !out.ends_with('\n') {
                 out.push('\n');
             }
-            out.push_str(&format!("{key} = \"{v}\"\n"));
+            out.push_str(&format!("{key} = {v}\n"));
         }
     }
     std::fs::write(path, out)?;
@@ -180,6 +223,8 @@ pub enum Dialog {
     ConfirmDeleteNote,
     /// Confirm deleting the selected notebook (only when it has no notes).
     ConfirmDeleteNotebook,
+    /// Application settings (connection, E2EE, Vim, sync toggles).
+    Settings,
     /// App info: official icon, name, version. Non-macOS only: macOS uses the
     /// native system-menu About panel (see macos_about).
     #[cfg(not(target_os = "macos"))]
@@ -339,6 +384,38 @@ pub struct AppState {
     /// the view can push `edit_title`/`edit_body` into the persistent inputs.
     pub edit_epoch: u64,
 
+    // ---- list keyboard navigation ----
+    /// Keyboard cursor in the notebooks column: 0 = "All notes", i+1 = folders[i].
+    pub folder_cursor: usize,
+    /// Keyboard cursor in the notes column (index into `notes`).
+    pub note_cursor: usize,
+
+    // ---- vim editing ----
+    /// Editor is in Vim normal mode (vs insert). Only meaningful while editing
+    /// with `config.vim_mode` on.
+    pub vim_normal: bool,
+    /// Pending operator/prefix for the Vim layer ("d", "y", "g", ":", ...).
+    pub vim_pending: String,
+
+    // ---- sync lifecycle ----
+    /// Local changes waiting to be uploaded, mirrored each UI tick.
+    pub local_pending: usize,
+    /// A quit is waiting for an in-flight sync-before-quit to finish.
+    pub quit_after_sync: bool,
+
+    // ---- settings dialog staging ----
+    pub set_webdav_url: String,
+    pub set_username: String,
+    pub set_password: String,
+    pub set_e2ee_password: String,
+    pub set_insecure_tls: bool,
+    pub set_ca_cert: String,
+    pub set_vim_mode: bool,
+    pub set_sync_on_startup: bool,
+    pub set_sync_on_quit: bool,
+    pub set_message: Option<String>,
+    pub set_error: Option<String>,
+
     // ---- list layout toggles ----
     pub show_notebooks: bool,
     pub show_notes: bool,
@@ -404,6 +481,23 @@ impl AppState {
             edit_changed_ms: 0,
             note_raw_body: String::new(),
             edit_epoch: 0,
+            folder_cursor: 0,
+            note_cursor: 0,
+            vim_normal: true,
+            vim_pending: String::new(),
+            local_pending: 0,
+            quit_after_sync: false,
+            set_webdav_url: String::new(),
+            set_username: String::new(),
+            set_password: String::new(),
+            set_e2ee_password: String::new(),
+            set_insecure_tls: false,
+            set_ca_cert: String::new(),
+            set_vim_mode: true,
+            set_sync_on_startup: true,
+            set_sync_on_quit: true,
+            set_message: None,
+            set_error: None,
             show_notebooks: true,
             show_notes: true,
             nb_input: String::new(),
@@ -449,6 +543,7 @@ impl AppState {
         }
         self.note_tags = map;
         self.protected = self.storage.protected_note_ids().unwrap_or_default();
+        self.sync_cursors_to_selection();
     }
 
     pub fn reload_meta(&mut self) {
@@ -491,6 +586,140 @@ impl AppState {
                 .filter_map(|h| self.storage.note(&h.id).ok().flatten())
                 .collect()
         };
+    }
+
+    // ---- list selection & keyboard navigation ---------------------------
+
+    /// Commit the notebooks-column cursor: select that notebook (or
+    /// "All notes" at index 0), load its notes and open its recent note.
+    pub fn select_folder_at_cursor(&mut self) {
+        let folder = if self.folder_cursor == 0 {
+            None
+        } else {
+            self.folders.get(self.folder_cursor - 1).and_then(|f| {
+                f.props
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from)
+            })
+        };
+        self.select_folder(folder);
+    }
+
+    /// Select a notebook (`None` = All notes): persist the choice, reload the
+    /// note list, and open the scope's most recent note.
+    pub fn select_folder(&mut self, folder: Option<String>) {
+        self.end_edit();
+        let _ = self
+            .storage
+            .set_last_selected_folder(folder.as_deref());
+        self.selected_folder = folder;
+        self.load_notes();
+        let scope = self.selected_folder.clone();
+        self.open_recent_in_folder(scope.as_deref());
+    }
+
+    /// Clamp the keyboard cursors to the current selection/lists.
+    pub fn sync_cursors_to_selection(&mut self) {
+        self.folder_cursor = match self.selected_folder.as_deref() {
+            None => 0,
+            Some(id) => self
+                .folders
+                .iter()
+                .position(|f| f.props.get("id").and_then(serde_json::Value::as_str) == Some(id))
+                .map(|i| i + 1)
+                .unwrap_or(0),
+        };
+        self.note_cursor = self
+            .selected_note
+            .as_deref()
+            .and_then(|id| {
+                self.notes
+                    .iter()
+                    .position(|n| n.props.get("id").and_then(serde_json::Value::as_str) == Some(id))
+            })
+            .unwrap_or(0);
+    }
+
+    /// Move the notebooks-column cursor by `delta` (0 = "All notes").
+    pub fn move_folder_cursor(&mut self, delta: i32) {
+        self.folder_cursor = clamp_step(self.folder_cursor, delta, self.folders.len());
+    }
+
+    /// Move the notes-column cursor by `delta`.
+    pub fn move_note_cursor(&mut self, delta: i32) {
+        if self.notes.is_empty() {
+            self.note_cursor = 0;
+            return;
+        }
+        self.note_cursor = clamp_step(self.note_cursor, delta, self.notes.len() - 1);
+    }
+
+    /// Open the note under the notes-column cursor.
+    pub fn open_note_at_cursor(&mut self) {
+        let Some(id) = self
+            .notes
+            .get(self.note_cursor)
+            .and_then(|n| n.props.get("id").and_then(serde_json::Value::as_str))
+            .map(String::from)
+        else {
+            return;
+        };
+        self.end_edit();
+        self.request_open_note(&id);
+    }
+
+    /// Open a scope's most recently opened note, falling back to the newest
+    /// note in the scope (the list is already ordered newest-first).
+    pub fn open_recent_in_folder(&mut self, folder: Option<&str>) {
+        let recent = self.storage.last_opened_note(folder).ok().flatten();
+        let target = recent
+            .filter(|id| {
+                self.notes
+                    .iter()
+                    .any(|n| n.props.get("id").and_then(serde_json::Value::as_str) == Some(id.as_str()))
+            })
+            .or_else(|| {
+                self.notes.first().and_then(|n| {
+                    n.props
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(String::from)
+                })
+            });
+        if let Some(id) = target {
+            self.request_open_note(&id);
+        } else {
+            // Empty scope: clear the open note so a stale selection never
+            // lingers after switching notebooks or deleting the last note.
+            self.selected_note = None;
+            self.note_title.clear();
+            self.note_body.clear();
+            self.note_raw_body.clear();
+            self.selected_note_encrypted = false;
+            self.note_locked = false;
+            self.editing = false;
+        }
+        self.sync_cursors_to_selection();
+    }
+
+    /// Restore the last session on launch: the last selected notebook (if it
+    /// still exists) and that scope's most recent note.
+    pub fn restore_last_session(&mut self) {
+        let last_folder = self
+            .storage
+            .last_selected_folder()
+            .ok()
+            .flatten()
+            .filter(|id| {
+                self.folders
+                    .iter()
+                    .any(|f| f.props.get("id").and_then(serde_json::Value::as_str) == Some(id.as_str()))
+            });
+        self.selected_folder = last_folder;
+        self.load_notes();
+        let scope = self.selected_folder.clone();
+        self.open_recent_in_folder(scope.as_deref());
     }
 
     fn open_note(&mut self, id: &str) {
@@ -537,6 +766,21 @@ impl AppState {
             }
             self.note_body = body;
             self.selected_note = Some(id.to_string());
+            self.record_recent_note(id, &note);
+        }
+    }
+
+    /// Persist the note as the most-recently-opened one, globally and in its
+    /// own notebook, so launch / notebook clicks can restore it.
+    fn record_recent_note(&self, id: &str, note: &Item) {
+        let _ = self.storage.set_last_opened_note(None, id);
+        if let Some(parent) = note
+            .props
+            .get("parent_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|p| !p.is_empty())
+        {
+            let _ = self.storage.set_last_opened_note(Some(parent), id);
         }
     }
 
@@ -557,6 +801,9 @@ impl AppState {
         self.edit_body = self.note_raw_body.clone();
         self.edit_dirty = false;
         self.editing = true;
+        // Vim editing starts in Normal mode when enabled (like vim itself).
+        self.vim_normal = self.config.vim_mode;
+        self.vim_pending.clear();
         self.edit_epoch = self.edit_epoch.wrapping_add(1);
     }
 
@@ -564,6 +811,8 @@ impl AppState {
     pub fn end_edit(&mut self) {
         self.save_edit();
         self.editing = false;
+        self.vim_normal = true;
+        self.vim_pending.clear();
     }
 
     /// Mirror a change in the working copy and arm the autosave debounce.
@@ -628,6 +877,7 @@ impl AppState {
         match self.storage.create_note(folder_id, "新建笔记") {
             Ok(id) => {
                 self.selected_folder = Some(folder_id.to_string());
+                let _ = self.storage.set_last_selected_folder(Some(folder_id));
                 self.refresh_lists();
                 self.request_open_note(&id);
                 self.begin_edit();
@@ -732,6 +982,7 @@ impl AppState {
                 Ok(()) => {
                     if self.selected_folder.as_deref() == Some(id) {
                         self.selected_folder = None;
+                        let _ = self.storage.set_last_selected_folder(None);
                     }
                     self.refresh_lists();
                     self.set_status("已删除笔记本".into());
@@ -775,7 +1026,8 @@ impl AppState {
         }
         match self.storage.create_folder(&name) {
             Ok(id) => {
-                self.selected_folder = Some(id);
+                self.selected_folder = Some(id.clone());
+                let _ = self.storage.set_last_selected_folder(Some(&id));
                 self.refresh_lists();
                 self.dialog = Dialog::None;
                 true
@@ -831,6 +1083,7 @@ impl AppState {
                     .unwrap_or("")
                     .to_string();
                 self.selected_note_encrypted = is_encrypted_placeholder(&note);
+                self.record_recent_note(id, &note);
             }
             self.selected_note = Some(id.to_string());
             self.note_locked = true;
@@ -1165,6 +1418,98 @@ impl AppState {
         }
     }
 
+    // ---- settings (mirrors the CLI config commands) ---------------------
+
+    /// Stage the current config into the settings dialog fields.
+    pub fn open_settings(&mut self) {
+        self.set_webdav_url = self.config.webdav_url.clone();
+        self.set_username = self.config.username.clone();
+        self.set_password.clear();
+        self.set_e2ee_password.clear();
+        self.set_insecure_tls = self.config.insecure_tls;
+        self.set_ca_cert = self.config.ca_cert.clone().unwrap_or_default();
+        self.set_vim_mode = self.config.vim_mode;
+        self.set_sync_on_startup = self.config.sync_on_startup;
+        self.set_sync_on_quit = self.config.sync_on_quit;
+        self.set_message = None;
+        self.set_error = None;
+        self.dialog = Dialog::Settings;
+    }
+
+    /// Persist the settings form. Each key is rewritten on its own so already-
+    /// encrypted secrets stay byte-for-byte; new passwords are encrypted at
+    /// rest exactly like `CLI set-password`. Returns true when the dialog can
+    /// close (no write errors).
+    pub fn submit_settings(&mut self) -> bool {
+        let path = config_path();
+        let mut errors: Vec<String> = Vec::new();
+        macro_rules! put {
+            ($key:expr, $rendered:expr) => {
+                if let Err(e) = write_config_raw_key(&path, $key, $rendered.as_deref()) {
+                    errors.push(format!("{}: {e}", $key));
+                }
+            };
+        }
+
+        put!("webdav_url", Some(toml_string(&self.set_webdav_url)));
+        put!("username", Some(toml_string(&self.set_username)));
+        put!("insecure_tls", Some(self.set_insecure_tls.to_string()));
+        put!("vim_mode", Some(self.set_vim_mode.to_string()));
+        put!("sync_on_startup", Some(self.set_sync_on_startup.to_string()));
+        put!("sync_on_quit", Some(self.set_sync_on_quit.to_string()));
+        let ca = self.set_ca_cert.trim().to_string();
+        put!(
+            "ca_cert",
+            if ca.is_empty() {
+                None
+            } else {
+                Some(toml_string(&ca))
+            }
+        );
+
+        // Passwords are only rewritten when a new value was typed into the form.
+        let staged = [
+            ("password", self.set_password.clone()),
+            ("e2ee_password", self.set_e2ee_password.clone()),
+        ];
+        for (key, plain) in staged {
+            if plain.is_empty() {
+                continue;
+            }
+            match LocalKey::load_or_create(&data_dir().join("secret.key"))
+                .map_err(|e| e.to_string())
+                .and_then(|k| k.encrypt(&plain).map_err(|e| e.to_string()))
+            {
+                Ok(enc) => put!(key, Some(toml_string(&enc))),
+                Err(e) => errors.push(format!("{key}: {e}")),
+            }
+        }
+
+        if !errors.is_empty() {
+            self.set_error = Some(errors.join("; "));
+            return false;
+        }
+
+        // Apply to the in-memory config so the next sync uses the new values.
+        self.config.webdav_url = self.set_webdav_url.clone();
+        self.config.username = self.set_username.clone();
+        self.config.insecure_tls = self.set_insecure_tls;
+        self.config.ca_cert = if ca.is_empty() { None } else { Some(ca) };
+        self.config.vim_mode = self.set_vim_mode;
+        self.config.sync_on_startup = self.set_sync_on_startup;
+        self.config.sync_on_quit = self.set_sync_on_quit;
+        if !self.set_password.is_empty() {
+            self.config.password = Some(self.set_password.clone());
+        }
+        if !self.set_e2ee_password.is_empty() {
+            self.config.e2ee_password = Some(self.set_e2ee_password.clone());
+        }
+        self.set_password.clear();
+        self.set_e2ee_password.clear();
+        self.set_message = Some("设置已保存".into());
+        true
+    }
+
     pub fn set_status(&mut self, text: String) {
         self.status = text.clone();
         *self.jobs.status.lock().unwrap() = text;
@@ -1231,6 +1576,11 @@ pub fn short_id(id: &str) -> String {
     } else {
         id.to_string()
     }
+}
+
+/// Clamp `current + delta` into `0..=max`.
+fn clamp_step(current: usize, delta: i32, max: usize) -> usize {
+    (current as i64 + delta as i64).clamp(0, max as i64) as usize
 }
 
 const HEX: &[u8] = b"0123456789abcdefABCDEF";
@@ -1677,6 +2027,88 @@ mod tests {
         );
     }
 
+    // ---- recent-note restore & navigation --------------------------------
+
+    #[test]
+    fn clamp_step_bounds() {
+        assert_eq!(clamp_step(0, 1, 3), 1);
+        assert_eq!(clamp_step(0, -1, 3), 0);
+        assert_eq!(clamp_step(3, 1, 3), 3);
+        assert_eq!(clamp_step(2, -5, 3), 0);
+    }
+
+    #[test]
+    fn select_folder_opens_recent_then_newest() {
+        let mut state =
+            AppState::build(Storage::open_in_memory().unwrap(), Config::default()).unwrap();
+        let f1 = state.storage.create_folder("F1").unwrap();
+        let f2 = state.storage.create_folder("F2").unwrap();
+        let n1 = state.storage.create_note(&f1, "A").unwrap();
+        let n2 = state.storage.create_note(&f2, "B").unwrap();
+        state.refresh_lists();
+
+        // No recency yet: the newest note of the folder opens.
+        state.select_folder(Some(f2.clone()));
+        assert_eq!(state.selected_note.as_deref(), Some(n2.as_str()));
+        assert_eq!(
+            state.storage.last_selected_folder().unwrap().as_deref(),
+            Some(f2.as_str())
+        );
+
+        // Opening n1 records recency; reselecting f1 restores it.
+        state.request_open_note(&n1);
+        state.select_folder(Some(f1.clone()));
+        assert_eq!(state.selected_note.as_deref(), Some(n1.as_str()));
+
+        // A vanished recent note falls back (here f1 becomes empty).
+        state.storage.delete_item(&n1).unwrap();
+        state.refresh_lists();
+        state.select_folder(Some(f1.clone()));
+        assert!(state.selected_note.is_none());
+    }
+
+    #[test]
+    fn restore_last_session_restores_folder_and_recent_note() {
+        let mut state =
+            AppState::build(Storage::open_in_memory().unwrap(), Config::default()).unwrap();
+        let f1 = state.storage.create_folder("F1").unwrap();
+        let _f2 = state.storage.create_folder("F2").unwrap();
+        let n1 = state.storage.create_note(&f1, "A").unwrap();
+        let _n2 = state.storage.create_note(&f1, "B").unwrap();
+        state.refresh_lists();
+        state.storage.set_last_selected_folder(Some(&f1)).unwrap();
+        state.storage.set_last_opened_note(Some(&f1), &n1).unwrap();
+        state.selected_folder = None;
+        state.selected_note = None;
+
+        state.restore_last_session();
+        assert_eq!(state.selected_folder.as_deref(), Some(f1.as_str()));
+        assert_eq!(state.selected_note.as_deref(), Some(n1.as_str()));
+    }
+
+    #[test]
+    fn raw_writer_sets_bool_and_preserves_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let key = LocalKey::from_bytes([5u8; 32]);
+        let enc = key.encrypt("secret").unwrap();
+        std::fs::write(&path, format!("password = \"{enc}\"\n")).unwrap();
+
+        write_config_raw_key(&path, "vim_mode", Some("false")).unwrap();
+        write_config_raw_key(&path, "webdav_url", Some(&toml_string("https://x/dav"))).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("vim_mode = false"), "{raw}");
+        assert!(raw.contains("webdav_url = \"https://x/dav\""), "{raw}");
+        assert!(
+            raw.contains(&format!("password = \"{enc}\"")),
+            "secret must stay byte-for-byte: {raw}"
+        );
+
+        write_config_raw_key(&path, "vim_mode", None).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("vim_mode"), "{raw}");
+    }
+
     // ---- encrypted config secrets (CLI set-password compatibility) ----
 
     #[test]
@@ -1690,6 +2122,9 @@ mod tests {
             insecure_tls: false,
             ca_cert: None,
             reader_password_hash: None,
+            vim_mode: true,
+            sync_on_startup: true,
+            sync_on_quit: true,
         };
         decrypt_config_secrets(&mut cfg, &key);
         assert_eq!(cfg.password.as_deref(), Some("dav-pw"));

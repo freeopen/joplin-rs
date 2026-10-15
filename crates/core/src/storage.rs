@@ -404,6 +404,57 @@ impl Storage {
         Ok(())
     }
 
+    // -- UI recency (local only) ------------------------------------------
+    //
+    // Remembers the last opened note (globally and per notebook) and the last
+    // selected notebook so the GUI can reopen context on launch. Never synced.
+
+    const LAST_NOTE_KEY: &'static str = "ui:last_note";
+    const LAST_FOLDER_KEY: &'static str = "ui:last_folder";
+
+    fn last_note_key(folder: Option<&str>) -> String {
+        match folder {
+            Some(f) => format!("{}:{}", Self::LAST_NOTE_KEY, f),
+            None => Self::LAST_NOTE_KEY.to_string(),
+        }
+    }
+
+    /// Last note opened in a scope: the global scope when `folder` is `None`,
+    /// else the per-notebook scope.
+    pub fn last_opened_note(&self, folder: Option<&str>) -> Result<Option<String>> {
+        self.kv_get(&Self::last_note_key(folder))
+    }
+
+    /// Record the note opened in a scope.
+    pub fn set_last_opened_note(&self, folder: Option<&str>, note_id: &str) -> Result<()> {
+        self.kv_set(&Self::last_note_key(folder), note_id)
+    }
+
+    /// Last selected notebook id (`None` = the "All notes" view).
+    pub fn last_selected_folder(&self) -> Result<Option<String>> {
+        self.kv_get(Self::LAST_FOLDER_KEY)
+    }
+
+    /// Record the selected notebook; `None` clears it (All notes).
+    pub fn set_last_selected_folder(&self, folder: Option<&str>) -> Result<()> {
+        match folder {
+            Some(f) => self.kv_set(Self::LAST_FOLDER_KEY, f),
+            None => {
+                self.conn
+                    .execute("DELETE FROM kv WHERE key = ?1", [Self::LAST_FOLDER_KEY])
+                    .map_err(|e| Error::Storage(format!("set_last_selected_folder: {e}")))?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Number of local changes waiting to be uploaded: edited/created plaintext
+    /// items plus pending remote deletions. Drives the "unsynced" status line
+    /// and the sync-before-quit check.
+    pub fn local_pending_count(&self) -> Result<usize> {
+        Ok(self.items_needing_sync()?.len() + self.pending_deletes()?.len())
+    }
+
     pub fn save_resource_blob(&self, resource_id: &str, data: &[u8]) -> Result<()> {
         self.conn
             .execute(
@@ -974,6 +1025,41 @@ mod tests {
         storage.kv_set("k", "v1").unwrap();
         storage.kv_set("k", "v2").unwrap();
         assert_eq!(storage.kv_get("k").unwrap().unwrap(), "v2");
+    }
+
+    #[test]
+    fn ui_recency_and_pending_count() {
+        let storage = Storage::open_in_memory().unwrap();
+        // Recency is empty until recorded, and scopes are isolated.
+        assert_eq!(storage.last_opened_note(None).unwrap(), None);
+        storage.set_last_opened_note(None, "n1").unwrap();
+        storage.set_last_opened_note(Some("f1"), "n2").unwrap();
+        assert_eq!(storage.last_opened_note(None).unwrap().as_deref(), Some("n1"));
+        assert_eq!(
+            storage.last_opened_note(Some("f1")).unwrap().as_deref(),
+            Some("n2")
+        );
+        assert_eq!(storage.last_opened_note(Some("f2")).unwrap(), None);
+
+        assert_eq!(storage.last_selected_folder().unwrap(), None);
+        storage.set_last_selected_folder(Some("f1")).unwrap();
+        assert_eq!(
+            storage.last_selected_folder().unwrap().as_deref(),
+            Some("f1")
+        );
+        storage.set_last_selected_folder(None).unwrap();
+        assert_eq!(storage.last_selected_folder().unwrap(), None);
+
+        // Pending count: fresh items count until synced; a pending delete too.
+        assert_eq!(storage.local_pending_count().unwrap(), 0);
+        let folder = storage.create_folder("F").unwrap();
+        let note = storage.create_note(&folder, "N").unwrap();
+        assert_eq!(storage.local_pending_count().unwrap(), 2);
+        storage.save_sync_time(&folder, i64::MAX / 2, 0).unwrap();
+        storage.save_sync_time(&note, i64::MAX / 2, 0).unwrap();
+        assert_eq!(storage.local_pending_count().unwrap(), 0);
+        storage.delete_item(&note).unwrap();
+        assert_eq!(storage.local_pending_count().unwrap(), 1);
     }
 
     #[test]

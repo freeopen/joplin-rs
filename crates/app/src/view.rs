@@ -24,28 +24,70 @@ use std::sync::Arc;
 use gpui_kit::component::{
     button::{Button, ButtonVariants},
     dialog::{DialogAction, DialogFooter},
-    input::{Copy, Cut, Input, InputEvent, InputState, Paste, SelectAll, Textarea, TextareaState},
+    input::{
+        Copy, Cut, Delete, Enter, Input, InputEvent, InputState, MoveDown, MoveLeft, MoveRight,
+        MoveToEnd, MoveToEndOfLine, MoveToNextWord, MoveToPreviousWord, MoveToStart,
+        MoveToStartOfLine, MoveUp, Paste, Redo, Search, SelectAll, SelectToEndOfLine, Textarea,
+        TextareaState, Undo,
+    },
     menu::{ContextMenuExt, PopupMenuItem},
     scroll::Scrollbar,
     ActiveTheme, Disableable, Sizable, WindowExt,
 };
 use gpui_kit::{
     div, prelude::*, px, relative, App, Bounds, Context, Entity, FocusHandle, Focusable, Image,
-    ImageFormat, ImageSource, KeyBinding, Menu, MenuItem, Render, Resource, ScrollHandle,
-    SharedString, SharedUri, Size, Subscription, Window, WindowBounds, WindowOptions,
+    ImageFormat, ImageSource, KeyBinding, KeyDownEvent, Menu, MenuItem, Render, Resource,
+    ScrollHandle, SharedString, SharedUri, Size, Subscription, Window, WindowBounds, WindowOptions,
 };
 
 use crate::app::{is_encrypted_placeholder, short_id, AppState, Dialog as AppDialog};
 use crate::jobs;
+use crate::vim::{self, VimAction, VimMode};
 
-gpui_kit::actions!(app, [Sync, OpenReaderPassword, Quit, ShowAbout]);
+gpui_kit::actions!(
+    app,
+    [
+        Sync,
+        OpenReaderPassword,
+        OpenSettings,
+        ToggleNotebooks,
+        ToggleNotes,
+        FindInNote,
+        GlobalSearch,
+        Quit,
+        ShowAbout
+    ]
+);
 
 const NOTEBOOKS_WIDTH: f32 = 200.;
 const NOTES_WIDTH: f32 = 300.;
 
 /// Register app-level key bindings and OS menus.
 fn register(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new("cmd-r", Sync, None)]);
+    // macOS uses Cmd; other platforms mirror the layout with Ctrl.
+    #[cfg(target_os = "macos")]
+    let bindings = [
+        KeyBinding::new("cmd-r", Sync, None),
+        KeyBinding::new("cmd-b", ToggleNotebooks, None),
+        KeyBinding::new("cmd-alt-b", ToggleNotes, None),
+        KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("cmd-f", FindInNote, None),
+        KeyBinding::new("cmd-alt-f", GlobalSearch, None),
+        KeyBinding::new("cmd-,", OpenSettings, None),
+    ];
+    #[cfg(not(target_os = "macos"))]
+    let bindings = [
+        KeyBinding::new("ctrl-r", Sync, None),
+        KeyBinding::new("ctrl-b", ToggleNotebooks, None),
+        KeyBinding::new("ctrl-alt-b", ToggleNotes, None),
+        KeyBinding::new("ctrl-q", Quit, None),
+        KeyBinding::new("ctrl-f", FindInNote, None),
+        KeyBinding::new("ctrl-alt-f", GlobalSearch, None),
+        KeyBinding::new("ctrl-,", OpenSettings, None),
+    ];
+    cx.bind_keys(bindings);
+    // Fallback quit for when no view handles the action (the view normally
+    // intercepts Quit to sync pending changes first and stops propagation).
     cx.on_action(|_: &Quit, cx| cx.quit());
     // macOS shows the native About panel (rounded icon, version); other
     // platforms open the in-window About dialog via the toolbar button.
@@ -67,6 +109,8 @@ fn install_menus(cx: &mut App) {
         Menu::new("joplin-rs").items(vec![
             MenuItem::action("About joplin-rs", ShowAbout),
             MenuItem::separator(),
+            MenuItem::action("Settings…", OpenSettings),
+            MenuItem::separator(),
             MenuItem::action("Quit joplin-rs", Quit),
         ]),
         Menu::new("File").items(vec![MenuItem::action("Sync", Sync)]),
@@ -75,16 +119,34 @@ fn install_menus(cx: &mut App) {
             MenuItem::os_action("Copy", Copy, OsAction::Copy),
             MenuItem::os_action("Paste", Paste, OsAction::Paste),
             MenuItem::os_action("Select All", SelectAll, OsAction::SelectAll),
+            MenuItem::separator(),
+            MenuItem::action("Find in Note", FindInNote),
+            MenuItem::action("Search All Notes", GlobalSearch),
+        ]),
+        Menu::new("View").items(vec![
+            MenuItem::action("Toggle Notebooks", ToggleNotebooks),
+            MenuItem::action("Toggle Notes", ToggleNotes),
         ]),
     ];
     #[cfg(not(target_os = "macos"))]
     let menus = vec![
-        Menu::new("File").items(vec![MenuItem::action("Quit", Quit)]),
+        Menu::new("File").items(vec![
+            MenuItem::action("Quit", Quit),
+            MenuItem::action("Settings…", OpenSettings),
+            MenuItem::action("Sync", Sync),
+        ]),
         Menu::new("Edit").items(vec![
             MenuItem::os_action("Cut", Cut, OsAction::Cut),
             MenuItem::os_action("Copy", Copy, OsAction::Copy),
             MenuItem::os_action("Paste", Paste, OsAction::Paste),
             MenuItem::os_action("Select All", SelectAll, OsAction::SelectAll),
+            MenuItem::separator(),
+            MenuItem::action("Find in Note", FindInNote),
+            MenuItem::action("Search All Notes", GlobalSearch),
+        ]),
+        Menu::new("View").items(vec![
+            MenuItem::action("Toggle Notebooks", ToggleNotebooks),
+            MenuItem::action("Toggle Notes", ToggleNotes),
         ]),
     ];
     cx.set_menus(menus);
@@ -123,6 +185,17 @@ pub struct NoteBrowser {
     /// (re)locked, and the persistent gate field must be cleared so a
     /// re-opened gate never shows or reuses the previous password.
     gate_epoch_seen: u64,
+    /// Focus handles for the two list panels (j/k/Enter navigation).
+    notebooks_focus: FocusHandle,
+    notes_focus: FocusHandle,
+    /// Single-line yank register for the minimal vim layer.
+    vim_register: String,
+    /// Settings dialog input fields.
+    set_url: Entity<InputState>,
+    set_user: Entity<InputState>,
+    set_pw: Entity<InputState>,
+    set_e2ee: Entity<InputState>,
+    set_ca: Entity<InputState>,
     focus: FocusHandle,
     #[allow(dead_code)]
     subscriptions: Vec<Subscription>,
@@ -137,7 +210,11 @@ impl Focusable for NoteBrowser {
 impl NoteBrowser {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let state = cx.new(|_| AppState::new().expect("open storage"));
-        state.update(cx, |s, _| s.reload_meta());
+        state.update(cx, |s, _| {
+            s.reload_meta();
+            // Reopen the last session: last notebook + its most recent note.
+            s.restore_last_session();
+        });
 
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search…"));
         let gate_input = cx.new(|cx| {
@@ -168,6 +245,12 @@ impl NoteBrowser {
         let title_edit = cx.new(|cx| InputState::new(window, cx).placeholder("标题"));
         let note_edit = cx.new(|cx| TextareaState::new(window, cx).placeholder("Markdown 正文…"));
         let nb_input = cx.new(|cx| InputState::new(window, cx).placeholder("笔记本名称"));
+        // Settings dialog fields (webdav url / username / passwords / CA cert).
+        let set_url = cx.new(|cx| InputState::new(window, cx).placeholder("https://host/dav/joplin"));
+        let set_user = cx.new(|cx| InputState::new(window, cx).placeholder("用户名"));
+        let set_pw = cx.new(|cx| InputState::new(window, cx).placeholder("留空则不修改").masked(true));
+        let set_e2ee = cx.new(|cx| InputState::new(window, cx).placeholder("留空则不修改").masked(true));
+        let set_ca = cx.new(|cx| InputState::new(window, cx).placeholder("PEM 证书路径（可选）"));
 
         let mut subscriptions = Vec::new();
         // Note title: mirror into the working copy on change; save on blur.
@@ -295,6 +378,43 @@ impl NoteBrowser {
                 },
             ));
         }
+        // Settings fields mirror into AppState on change.
+        for (field, which) in [
+            (set_url.clone(), 0usize),
+            (set_user.clone(), 1usize),
+            (set_pw.clone(), 2usize),
+            (set_e2ee.clone(), 3usize),
+            (set_ca.clone(), 4usize),
+        ] {
+            subscriptions.push(cx.subscribe(
+                &field,
+                move |this: &mut Self, state, event: &InputEvent, cx| {
+                    if !matches!(event, InputEvent::Change) {
+                        return;
+                    }
+                    let text = state.read(cx).value().to_string();
+                    this.state.update(cx, |s, _| match which {
+                        0 => s.set_webdav_url = text,
+                        1 => s.set_username = text,
+                        2 => s.set_password = text,
+                        3 => s.set_e2ee_password = text,
+                        _ => s.set_ca_cert = text,
+                    });
+                },
+            ));
+        }
+
+        // Intercept the window close button so pending local changes sync first
+        // (mirrors the Quit action path). Returning false cancels the close.
+        {
+            let browser = cx.entity().downgrade();
+            window.on_window_should_close(cx, move |_window, cx| {
+                let deferred = browser
+                    .update(cx, |this, cx| this.try_defer_quit(cx))
+                    .unwrap_or(false);
+                !deferred
+            });
+        }
 
         // Poll the job channel on a 150ms tick: worker progress lines and
         // finished events arrive through shared mutexes, the UI thread
@@ -316,6 +436,9 @@ impl NoteBrowser {
                                 s.status = worker;
                             }
                             let _ = s.handle_job_event();
+                            // Refresh the pending-local-change count (status
+                            // bar + sync-before-quit decision).
+                            s.local_pending = s.storage.local_pending_count().unwrap_or(0);
                         });
                         // Auto-start the decrypt pass when a not-yet-tried
                         // password is available (mirrors the egui flow's
@@ -349,12 +472,30 @@ impl NoteBrowser {
                                 .update(cx, |input, cx| input.set_value("", window, cx));
                         }
                         this.sync_dialog_from_state(window, cx);
+                        // Quit-after-sync: leave once the sync job finished.
+                        let quit_now = {
+                            let s = this.state.read(cx);
+                            s.quit_after_sync && !s.jobs.is_busy()
+                        };
+                        if quit_now {
+                            cx.quit();
+                            return;
+                        }
                         cx.notify();
                     });
                 });
             }
         })
         .detach();
+
+        // Sync on launch (checks the remote; transfers only what changed).
+        let start_sync = {
+            let s = state.read(cx);
+            s.config.sync_on_startup && !s.config.webdav_url.is_empty()
+        };
+        if start_sync {
+            state.update(cx, |s, _| jobs::start_download(s));
+        }
 
         Self {
             state,
@@ -374,6 +515,14 @@ impl NoteBrowser {
             rp_dialog_focused: Rc::new(Cell::new(false)),
             e2ee_dialog_focused: Rc::new(Cell::new(false)),
             gate_epoch_seen: 0,
+            notebooks_focus: cx.focus_handle(),
+            notes_focus: cx.focus_handle(),
+            vim_register: String::new(),
+            set_url,
+            set_user,
+            set_pw,
+            set_e2ee,
+            set_ca,
             focus: cx.focus_handle(),
             subscriptions,
         }
@@ -392,6 +541,259 @@ impl NoteBrowser {
     ) {
         self.state.update(cx, |s, _| s.open_reader_pw_settings());
         self.sync_dialog_from_state(window, cx);
+        cx.notify();
+    }
+
+    // ---- global shortcuts ------------------------------------------------
+
+    fn quit_action(&mut self, _: &Quit, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.try_defer_quit(cx) {
+            cx.quit();
+        }
+    }
+
+    /// Decide whether a quit must wait for a sync. Returns true when the quit
+    /// is deferred: a sync was started (or is already running) and the tick
+    /// will call `quit` once the job finishes.
+    fn try_defer_quit(&mut self, cx: &mut Context<Self>) -> bool {
+        let (sync_on_quit, pending, busy) = {
+            let s = self.state.read(cx);
+            (s.config.sync_on_quit, s.local_pending, s.jobs.is_busy())
+        };
+        if !sync_on_quit || pending == 0 {
+            return false;
+        }
+        if !busy {
+            self.state.update(cx, |s, _| jobs::start_download(s));
+        }
+        self.state.update(cx, |s, _| s.quit_after_sync = true);
+        self.state
+            .update(cx, |s, _| s.set_status(format!("退出前同步 {pending} 项更改…")));
+        cx.notify();
+        true
+    }
+
+    fn toggle_notebooks(&mut self, _: &ToggleNotebooks, _: &mut Window, cx: &mut Context<Self>) {
+        self.state.update(cx, |s, _| s.show_notebooks = !s.show_notebooks);
+        cx.notify();
+    }
+
+    fn toggle_notes(&mut self, _: &ToggleNotes, _: &mut Window, cx: &mut Context<Self>) {
+        self.state.update(cx, |s, _| s.show_notes = !s.show_notes);
+        cx.notify();
+    }
+
+    /// Focus the global search box (searches across all notes).
+    fn global_search(&mut self, _: &GlobalSearch, window: &mut Window, cx: &mut Context<Self>) {
+        let handle = self.search_input.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+        cx.notify();
+    }
+
+    /// Find within the current note. In edit mode the textarea's own built-in
+    /// find panel opens on the “Search” action; from preview we switch to
+    /// edit mode first (per the agreed design).
+    fn find_in_note(&mut self, _: &FindInNote, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.state.read(cx).can_edit() {
+            return;
+        }
+        if !self.state.read(cx).editing {
+            self.state.update(cx, |s, _| s.begin_edit());
+            let (title, body) = {
+                let s = self.state.read(cx);
+                (s.edit_title.clone(), s.edit_body.clone())
+            };
+            self.title_edit
+                .update(cx, |i, cx| i.set_value(title, window, cx));
+            self.note_edit
+                .update(cx, |i, cx| i.set_value(body, window, cx));
+            self.edit_epoch_seen = self.state.read(cx).edit_epoch;
+        }
+        let handle = self.note_edit.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+        window.dispatch_action(Box::new(Search), cx);
+        cx.notify();
+    }
+
+    fn settings_clicked(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
+        self.state.update(cx, |s, _| s.open_settings());
+        let (url, user, ca) = {
+            let s = self.state.read(cx);
+            (
+                s.set_webdav_url.clone(),
+                s.set_username.clone(),
+                s.set_ca_cert.clone(),
+            )
+        };
+        self.set_url.update(cx, |i, cx| i.set_value(url, window, cx));
+        self.set_user
+            .update(cx, |i, cx| i.set_value(user, window, cx));
+        self.set_ca.update(cx, |i, cx| i.set_value(ca, window, cx));
+        self.set_pw.update(cx, |i, cx| i.set_value("", window, cx));
+        self.set_e2ee.update(cx, |i, cx| i.set_value("", window, cx));
+        self.sync_dialog_from_state(window, cx);
+        cx.notify();
+    }
+
+    /// Submit the settings dialog from its fields. Returns true to close.
+    fn submit_settings_dialog(&mut self, cx: &mut Context<Self>) -> bool {
+        let read = |e: &Entity<InputState>| e.read(cx).value().to_string();
+        let (url, user, pw, e2ee, ca) = (
+            read(&self.set_url),
+            read(&self.set_user),
+            read(&self.set_pw),
+            read(&self.set_e2ee),
+            read(&self.set_ca),
+        );
+        self.state.update(cx, |s, _| {
+            s.set_webdav_url = url;
+            s.set_username = user;
+            s.set_password = pw;
+            s.set_e2ee_password = e2ee;
+            s.set_ca_cert = ca;
+            s.submit_settings()
+        })
+    }
+
+    // ---- list panel keyboard navigation (j/k/Enter) ----------------------
+
+    fn notebooks_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        match event.keystroke.key.as_str() {
+            "j" => self
+                .state
+                .update(cx, |s, _| s.move_folder_cursor(1)),
+            "k" => self
+                .state
+                .update(cx, |s, _| s.move_folder_cursor(-1)),
+            "enter" => self.state.update(cx, |s, _| s.select_folder_at_cursor()),
+            _ => return,
+        }
+        cx.notify();
+    }
+
+    fn notes_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        match event.keystroke.key.as_str() {
+            "j" => self.state.update(cx, |s, _| s.move_note_cursor(1)),
+            "k" => self.state.update(cx, |s, _| s.move_note_cursor(-1)),
+            "enter" => self.state.update(cx, |s, _| s.open_note_at_cursor()),
+            _ => return,
+        }
+        cx.notify();
+    }
+
+    // ---- vim editing layer ----------------------------------------------
+
+    /// Capture-phase key handler over the note body editor. Active only while
+    /// editing with `config.vim_mode` on; consumes keys in Normal mode so they
+    /// do not reach the textarea.
+    fn editor_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let ks = &event.keystroke;
+        // Let Cmd/Ctrl application shortcuts through untouched.
+        if ks.modifiers.platform {
+            return;
+        }
+        let (enabled, editing, normal) = {
+            let s = self.state.read(cx);
+            (s.config.vim_mode, s.editing, s.vim_normal)
+        };
+        if !enabled || !editing {
+            return;
+        }
+        let mode = if normal { VimMode::Normal } else { VimMode::Insert };
+        let key = ks.key.clone();
+        let ctrl = ks.modifiers.control;
+        let action = {
+            let mut pending = self.state.read(cx).vim_pending.clone();
+            let action = vim::translate(mode, &mut pending, &key, ctrl);
+            self.state.update(cx, |s, _| s.vim_pending = pending);
+            action
+        };
+        if action == VimAction::PassThrough {
+            return;
+        }
+        cx.stop_propagation();
+        match action {
+            VimAction::PassThrough | VimAction::Swallow => {}
+            VimAction::ToInsert => self.state.update(cx, |s, _| s.vim_normal = false),
+            VimAction::ToNormal => self.state.update(cx, |s, _| {
+                s.vim_normal = true;
+                s.vim_pending.clear();
+            }),
+            VimAction::MoveLeft => window.dispatch_action(Box::new(MoveLeft), cx),
+            VimAction::MoveRight => window.dispatch_action(Box::new(MoveRight), cx),
+            VimAction::MoveUp => window.dispatch_action(Box::new(MoveUp), cx),
+            VimAction::MoveDown => window.dispatch_action(Box::new(MoveDown), cx),
+            VimAction::WordForward => window.dispatch_action(Box::new(MoveToNextWord), cx),
+            VimAction::WordBackward => window.dispatch_action(Box::new(MoveToPreviousWord), cx),
+            VimAction::LineStart => window.dispatch_action(Box::new(MoveToStartOfLine), cx),
+            VimAction::LineEnd => window.dispatch_action(Box::new(MoveToEndOfLine), cx),
+            VimAction::DocStart => window.dispatch_action(Box::new(MoveToStart), cx),
+            VimAction::DocEnd => window.dispatch_action(Box::new(MoveToEnd), cx),
+            VimAction::DeleteChar => window.dispatch_action(Box::new(Delete), cx),
+            VimAction::DeleteLine => {
+                window.dispatch_action(Box::new(MoveToStartOfLine), cx);
+                window.dispatch_action(Box::new(SelectToEndOfLine), cx);
+                window.dispatch_action(Box::new(Delete), cx);
+                window.dispatch_action(Box::new(Delete), cx);
+            }
+            VimAction::YankLine => {
+                let text = self.note_edit.read(cx).value().to_string();
+                let cursor = self.note_edit.read(cx).cursor();
+                let head = text.get(..cursor).unwrap_or("");
+                let start = head.rfind('\n').map(|i| i + 1).unwrap_or(0);
+                let tail = text.get(cursor..).unwrap_or("");
+                let end = tail.find('\n').map(|i| cursor + i).unwrap_or(text.len());
+                self.vim_register = text.get(start..end).unwrap_or("").to_string();
+            }
+            VimAction::PasteAfter => {
+                let reg = self.vim_register.clone();
+                if !reg.is_empty() {
+                    self.note_edit
+                        .update(cx, |s, cx| s.insert(reg, window, cx));
+                }
+            }
+            VimAction::Undo => window.dispatch_action(Box::new(Undo), cx),
+            VimAction::Redo => window.dispatch_action(Box::new(Redo), cx),
+            VimAction::InsertAfterCursor => {
+                window.dispatch_action(Box::new(MoveRight), cx);
+                self.state.update(cx, |s, _| s.vim_normal = false);
+            }
+            VimAction::InsertAtLineStart => {
+                window.dispatch_action(Box::new(MoveToStartOfLine), cx);
+                self.state.update(cx, |s, _| s.vim_normal = false);
+            }
+            VimAction::InsertAtLineEnd => {
+                window.dispatch_action(Box::new(MoveToEndOfLine), cx);
+                self.state.update(cx, |s, _| s.vim_normal = false);
+            }
+            VimAction::OpenLineBelow => {
+                window.dispatch_action(Box::new(MoveToEndOfLine), cx);
+                window.dispatch_action(
+                    Box::new(Enter {
+                        secondary: false,
+                        shift: false,
+                    }),
+                    cx,
+                );
+                self.state.update(cx, |s, _| s.vim_normal = false);
+            }
+            VimAction::OpenLineAbove => {
+                window.dispatch_action(Box::new(MoveToStartOfLine), cx);
+                window.dispatch_action(
+                    Box::new(Enter {
+                        secondary: false,
+                        shift: false,
+                    }),
+                    cx,
+                );
+                window.dispatch_action(Box::new(MoveUp), cx);
+                window.dispatch_action(Box::new(MoveToEndOfLine), cx);
+                self.state.update(cx, |s, _| s.vim_normal = false);
+            }
+            VimAction::Save => self.state.update(cx, |s, _| {
+                s.save_edit();
+            }),
+        }
         cx.notify();
     }
 
@@ -476,6 +878,7 @@ impl NoteBrowser {
             AppDialog::ConfirmDeleteNote | AppDialog::ConfirmDeleteNotebook => {
                 self.open_confirm_delete_dialog(window, cx, want)
             }
+            AppDialog::Settings => self.open_settings_dialog(window, cx),
             #[cfg(not(target_os = "macos"))]
             AppDialog::About => self.open_about_dialog(window, cx),
         }
@@ -843,6 +1246,131 @@ impl NoteBrowser {
         });
     }
 
+    /// Settings dialog mirroring the CLI config surface, plus Vim/sync toggles.
+    fn open_settings_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let browser = cx.entity().downgrade();
+        let url = self.set_url.clone();
+        let user = self.set_user.clone();
+        let pw = self.set_pw.clone();
+        let e2ee = self.set_e2ee.clone();
+        let ca = self.set_ca.clone();
+        window.open_dialog(cx, move |dialog, _window, cx| {
+            let read = |cx: &mut App| {
+                browser
+                    .update(cx, |view, cx| {
+                        let s = view.state.read(cx);
+                        (
+                            SettingsFlag::InsecureTls.get(s),
+                            SettingsFlag::Vim.get(s),
+                            SettingsFlag::SyncOnStartup.get(s),
+                            SettingsFlag::SyncOnQuit.get(s),
+                            s.set_error.clone(),
+                            s.set_message.clone(),
+                        )
+                    })
+                    .unwrap_or((false, true, true, true, None, None))
+            };
+            let (insecure, vim, sync_start, sync_quit, error, message) = read(cx);
+            let b_save = browser.clone();
+            let b_cancel = browser.clone();
+            let b_close = browser.clone();
+            dialog
+                .title("设置")
+                .w(px(480.))
+                .content({
+                    let url = url.clone();
+                    let user = user.clone();
+                    let pw = pw.clone();
+                    let e2ee = e2ee.clone();
+                    let ca = ca.clone();
+                    let b_toggles = browser.clone();
+                    let error = error.clone();
+                    let message = message.clone();
+                    move |content, _window, _cx| {
+                        content
+                            .child(form_row("WebDAV URL", url.clone()))
+                            .child(form_row("用户名", user.clone()))
+                            .child(form_row("密码（留空不改）", pw.clone()))
+                            .child(form_row("E2EE 密码（留空不改）", e2ee.clone()))
+                            .child(form_row("CA 证书路径", ca.clone()))
+                            .child(settings_toggle_row(
+                                "set-insecure",
+                                "跳过 TLS 校验",
+                                insecure,
+                                SettingsFlag::InsecureTls,
+                                b_toggles.clone(),
+                            ))
+                            .child(settings_toggle_row(
+                                "set-vim",
+                                "Vim 编辑模式",
+                                vim,
+                                SettingsFlag::Vim,
+                                b_toggles.clone(),
+                            ))
+                            .child(settings_toggle_row(
+                                "set-sync-start",
+                                "启动时同步",
+                                sync_start,
+                                SettingsFlag::SyncOnStartup,
+                                b_toggles.clone(),
+                            ))
+                            .child(settings_toggle_row(
+                                "set-sync-quit",
+                                "退出前同步",
+                                sync_quit,
+                                SettingsFlag::SyncOnQuit,
+                                b_toggles.clone(),
+                            ))
+                            .when_some(error.clone(), |el, err| el.child(error_line(err)))
+                            .when_some(message.clone(), |el, msg| el.child(ok_line(msg)))
+                    }
+                })
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            Button::new("set-cancel").label("取消").on_click(
+                                move |_, window, cx| {
+                                    b_cancel
+                                        .update(cx, |view, cx| {
+                                            view.state.update(cx, |s, _| s.dialog = AppDialog::None);
+                                            view.pending_dialog = AppDialog::None;
+                                        })
+                                        .ok();
+                                    window.close_dialog(cx);
+                                },
+                            ),
+                        )
+                        .child(
+                            DialogAction::new()
+                                .child(Button::new("set-save").primary().label("保存")),
+                        ),
+                )
+                .on_ok(move |_, _, cx| {
+                    b_save
+                        .update(cx, |view, cx| {
+                            if view.submit_settings_dialog(cx) {
+                                view.state.update(cx, |s, _| s.dialog = AppDialog::None);
+                                view.pending_dialog = AppDialog::None;
+                                true
+                            } else {
+                                cx.notify();
+                                false
+                            }
+                        })
+                        .unwrap_or(true)
+                })
+                .on_cancel(move |_, _, cx| {
+                    b_close
+                        .update(cx, |view, cx| {
+                            view.state.update(cx, |s, _| s.dialog = AppDialog::None);
+                            view.pending_dialog = AppDialog::None;
+                        })
+                        .ok();
+                    true
+                })
+        });
+    }
+
     #[cfg(not(target_os = "macos"))]
     fn open_about_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let browser = cx.entity().downgrade();
@@ -876,19 +1404,33 @@ impl Render for NoteBrowser {
         let worker = self.state.read(cx).jobs.worker_status();
         let show_notebooks = self.state.read(cx).show_notebooks;
         let show_notes = self.state.read(cx).show_notes;
-        let status_line = if !worker.is_empty() {
+        let pending = self.state.read(cx).local_pending;
+        let base = if !worker.is_empty() {
             worker
         } else if status.is_empty() {
             "ready".to_string()
         } else {
             status
         };
+        let status_line = if pending > 0 {
+            format!("{base} · 本地 {pending} 项待同步")
+        } else {
+            base
+        };
+        let nb_focused = self.notebooks_focus.is_focused(window);
+        let notes_focused = self.notes_focus.is_focused(window);
 
         div()
             .id("root")
             .key_context("NoteBrowser")
             .on_action(cx.listener(Self::sync_clicked))
             .on_action(cx.listener(Self::reader_password_clicked))
+            .on_action(cx.listener(Self::quit_action))
+            .on_action(cx.listener(Self::toggle_notebooks))
+            .on_action(cx.listener(Self::toggle_notes))
+            .on_action(cx.listener(Self::global_search))
+            .on_action(cx.listener(Self::find_in_note))
+            .on_action(cx.listener(Self::settings_clicked))
             .size_full()
             .flex()
             .flex_col()
@@ -966,6 +1508,35 @@ impl Render for NoteBrowser {
                     // macOS has the native app-menu About panel; other
                     // platforms open the in-window dialog from the toolbar.
                     .child(
+                        Button::new("btn-settings")
+                            .small()
+                            .outline()
+                            .label("设置")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.state.update(cx, |s, _| s.open_settings());
+                                let (url, user, ca) = {
+                                    let s = this.state.read(cx);
+                                    (
+                                        s.set_webdav_url.clone(),
+                                        s.set_username.clone(),
+                                        s.set_ca_cert.clone(),
+                                    )
+                                };
+                                this.set_url
+                                    .update(cx, |i, cx| i.set_value(url, window, cx));
+                                this.set_user
+                                    .update(cx, |i, cx| i.set_value(user, window, cx));
+                                this.set_ca
+                                    .update(cx, |i, cx| i.set_value(ca, window, cx));
+                                this.set_pw
+                                    .update(cx, |i, cx| i.set_value("", window, cx));
+                                this.set_e2ee
+                                    .update(cx, |i, cx| i.set_value("", window, cx));
+                                this.sync_dialog_from_state(window, cx);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
                         Button::new("btn-about")
                             .small()
                             .ghost()
@@ -1000,23 +1571,25 @@ impl Render for NoteBrowser {
                     .flex()
                     .min_h_0()
                     .when(show_notebooks, |el| {
-                        el.child(self.render_notebooks_column(cx))
+                        el.child(self.render_notebooks_column(nb_focused, cx))
                     })
                     .child(self.render_note_panel(window, cx))
-                    .when(show_notes, |el| el.child(self.render_notes_column(cx))),
+                    .when(show_notes, |el| el.child(self.render_notes_column(notes_focused, cx))),
             )
     }
 }
 
 impl NoteBrowser {
-    fn render_notebooks_column(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+    fn render_notebooks_column(&self, focused: bool, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let theme = cx.theme();
         let state = self.state.read(cx);
         let folders = state.folders.clone();
         let selected_folder = state.selected_folder.clone();
+        let folder_cursor = state.folder_cursor;
         let browser = cx.entity().downgrade();
 
         div()
+            .id("notebooks-col")
             .w(px(NOTEBOOKS_WIDTH))
             .flex_shrink_0()
             .border_r_1()
@@ -1024,6 +1597,8 @@ impl NoteBrowser {
             .flex()
             .flex_col()
             .bg(theme.muted)
+            .track_focus(&self.notebooks_focus)
+            .on_key_down(cx.listener(Self::notebooks_key))
             // Header: title + actions (new / rename / delete / hide).
             .child(
                 div()
@@ -1058,14 +1633,14 @@ impl NoteBrowser {
                     .when(selected_folder.is_none(), |el| {
                         el.bg(theme.selection.opacity(0.35))
                     })
+                    .when(focused && folder_cursor == 0, |el| {
+                        el.bg(theme.selection.opacity(0.6))
+                    })
                     .hover(|s| s.bg(theme.selection.opacity(0.15)))
                     .child("All notes")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.state.update(cx, |s, _| {
-                            s.end_edit();
-                            s.selected_folder = None;
-                            s.load_notes();
-                        });
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        window.focus(&this.notebooks_focus, cx);
+                        this.state.update(cx, |s, _| s.select_folder(None));
                         cx.notify();
                     })),
             )
@@ -1081,7 +1656,7 @@ impl NoteBrowser {
                             .size_full()
                             .track_scroll(&self.notebook_scroll)
                             .overflow_y_scroll()
-                            .children(folders.iter().map(|folder| {
+                            .children(folders.iter().enumerate().map(|(i, folder)| {
                                 let id = folder
                                     .props
                                     .get("id")
@@ -1095,6 +1670,7 @@ impl NoteBrowser {
                                     .unwrap_or("")
                                     .to_string();
                                 let selected = selected_folder.as_deref() == Some(id.as_str());
+                                let is_cursor = focused && folder_cursor == i + 1;
                                 let folder_id = id.clone();
                                 div()
                                     .id(SharedString::from(format!("folder-{id}")))
@@ -1102,14 +1678,15 @@ impl NoteBrowser {
                                     .py_1()
                                     .cursor_pointer()
                                     .when(selected, |el| el.bg(theme.selection.opacity(0.35)))
+                                    .when(is_cursor, |el| {
+                                        el.bg(theme.selection.opacity(0.6))
+                                    })
                                     .hover(|s| s.bg(theme.selection.opacity(0.15)))
                                     .child(SharedString::from(title))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.state.update(cx, |s, _| {
-                                            s.end_edit();
-                                            s.selected_folder = Some(id.clone());
-                                            s.load_notes();
-                                        });
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        window.focus(&this.notebooks_focus, cx);
+                                        this.state
+                                            .update(cx, |s, _| s.select_folder(Some(id.clone())));
                                         cx.notify();
                                     }))
                                     .context_menu({
@@ -1177,7 +1754,7 @@ impl NoteBrowser {
             .into_any_element()
     }
 
-    fn render_notes_column(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+    fn render_notes_column(&self, focused: bool, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let theme = cx.theme();
         let state = self.state.read(cx);
         let notes = state.notes.clone();
@@ -1186,10 +1763,12 @@ impl NoteBrowser {
         let search_hits = state.search_hits.clone();
         let protected = state.protected.clone();
         let selected_note = state.selected_note.clone();
+        let note_cursor = state.note_cursor;
         let has_folder = state.selected_folder.is_some();
         let browser = cx.entity().downgrade();
 
         div()
+            .id("notes-col")
             .w(px(NOTES_WIDTH))
             .flex_shrink_0()
             .border_l_1()
@@ -1197,6 +1776,8 @@ impl NoteBrowser {
             .flex()
             .flex_col()
             .bg(theme.muted)
+            .track_focus(&self.notes_focus)
+            .on_key_down(cx.listener(Self::notes_key))
             // Header: title + actions (new / delete / hide).
             .child(
                 div()
@@ -1232,7 +1813,7 @@ impl NoteBrowser {
                             .size_full()
                             .track_scroll(&self.note_scroll)
                             .overflow_y_scroll()
-                            .children(notes.iter().map(|note| {
+                            .children(notes.iter().enumerate().map(|(i, note)| {
                                 let id = note
                                     .props
                                     .get("id")
@@ -1279,6 +1860,7 @@ impl NoteBrowser {
                                     title
                                 };
                                 let selected = selected_note.as_deref() == Some(id.as_str());
+                                let is_cursor = focused && note_cursor == i;
                                 let tags = note_tags.get(&id).cloned().unwrap_or_default();
                                 let snippet = search_hits.get(&id).cloned();
                                 let menu_note_id = id.clone();
@@ -1289,6 +1871,7 @@ impl NoteBrowser {
                                     .py_1()
                                     .cursor_pointer()
                                     .when(selected, |el| el.bg(theme.selection.opacity(0.35)))
+                                    .when(is_cursor, |el| el.bg(theme.selection.opacity(0.6)))
                                     .hover(|s| s.bg(theme.selection.opacity(0.15)))
                                     .flex()
                                     .flex_col()
@@ -1319,6 +1902,7 @@ impl NoteBrowser {
                                         )
                                     })
                                     .on_click(cx.listener(move |this, _, window, cx| {
+                                        window.focus(&this.notes_focus, cx);
                                         let note_id = id.clone();
                                         this.state.update(cx, |s, _| {
                                             // Save any pending edit before switching.
@@ -1535,6 +2119,8 @@ impl NoteBrowser {
         let title = state.note_title.clone();
         let body = state.note_body.clone();
         let editing = state.editing;
+        let vim_mode = state.config.vim_mode;
+        let vim_normal = state.vim_normal;
         let is_protected = state
             .selected_note
             .as_deref()
@@ -1576,6 +2162,14 @@ impl NoteBrowser {
                             .items_center()
                             .gap_2()
                             .flex_shrink_0()
+                            .when(editing && vim_mode, |el| {
+                                el.child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(theme.muted_foreground)
+                                        .child(if vim_normal { "NORMAL" } else { "INSERT" }),
+                                )
+                            })
                             .child(
                                 Button::new("btn-edit-toggle")
                                     .outline()
@@ -1630,13 +2224,20 @@ impl NoteBrowser {
                     ),
             )
             .child(if editing {
-                div()
+                let editor = div()
+                    .id("note-editor")
                     .flex_1()
                     .min_h_0()
                     .px_4()
                     .py_3()
-                    .child(Textarea::new(&self.note_edit).h(relative(1.)))
-                    .into_any_element()
+                    .child(Textarea::new(&self.note_edit).h(relative(1.)));
+                if vim_mode {
+                    editor
+                        .capture_key_down(cx.listener(Self::editor_key))
+                        .into_any_element()
+                } else {
+                    editor.into_any_element()
+                }
             } else {
                 div()
                     .id("note-body-scroll")
@@ -1650,6 +2251,65 @@ impl NoteBrowser {
             })
             .into_any_element()
     }
+}
+
+/// One boolean setting exposed in the settings dialog.
+#[derive(Clone, Copy)]
+enum SettingsFlag {
+    InsecureTls,
+    Vim,
+    SyncOnStartup,
+    SyncOnQuit,
+}
+
+impl SettingsFlag {
+    fn get(self, s: &AppState) -> bool {
+        match self {
+            SettingsFlag::InsecureTls => s.set_insecure_tls,
+            SettingsFlag::Vim => s.set_vim_mode,
+            SettingsFlag::SyncOnStartup => s.set_sync_on_startup,
+            SettingsFlag::SyncOnQuit => s.set_sync_on_quit,
+        }
+    }
+
+    fn toggle(self, s: &mut AppState) {
+        match self {
+            SettingsFlag::InsecureTls => s.set_insecure_tls = !s.set_insecure_tls,
+            SettingsFlag::Vim => s.set_vim_mode = !s.set_vim_mode,
+            SettingsFlag::SyncOnStartup => s.set_sync_on_startup = !s.set_sync_on_startup,
+            SettingsFlag::SyncOnQuit => s.set_sync_on_quit = !s.set_sync_on_quit,
+        }
+    }
+}
+
+/// One on/off row for the settings dialog (label left, toggle button right).
+fn settings_toggle_row(
+    id: &'static str,
+    label: &str,
+    value: bool,
+    flag: SettingsFlag,
+    browser: gpui_kit::WeakEntity<NoteBrowser>,
+) -> gpui_kit::AnyElement {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .child(SharedString::from(label.to_string()))
+        .child(
+            Button::new(id)
+                .small()
+                .label(if value { "开启" } else { "关闭" })
+                .on_click(move |_, _, cx| {
+                    browser
+                        .update(cx, |view, cx| {
+                            view.state.update(cx, |s, _| flag.toggle(s));
+                            cx.notify();
+                        })
+                        .ok();
+                }),
+        )
+        .into_any_element()
 }
 
 /// One labeled form row for dialogs (label left, field right).

@@ -64,6 +64,44 @@ joplin-rs is a from-scratch Rust client built for exactly this situation:
   (in-window About on other platforms), optional reading password that gates
   notes marked as protected
 
+## GUI usage
+
+The GUI restores your last session on launch (last notebook + its most
+recently opened note; falls back to the newest note) and syncs on launch.
+
+**Shortcuts** (macOS / Linux+Windows):
+
+| Action | macOS | Linux/Windows |
+| --- | --- | --- |
+| Toggle notebooks panel | `Cmd+B` | `Ctrl+B` |
+| Toggle notes panel | `Cmd+Option+B` | `Ctrl+Alt+B` |
+| Quit (syncs pending changes first) | `Cmd+Q` | `Ctrl+Q` |
+| Find in current note | `Cmd+F` | `Ctrl+F` |
+| Search all notes | `Cmd+Option+F` | `Ctrl+Alt+F` |
+| Settings | `Cmd+,` | `Ctrl+,` |
+| Sync | `Cmd+R` | `Ctrl+R` |
+
+When a list panel has focus, `j`/`k` move the highlight and `Enter` selects
+(notebooks are sorted by name, notes by most-recent update).
+
+**Vim editing** is on by default (`vim_mode`); the note editor starts in
+NORMAL mode with an indicator in the header. Supported: `Esc`, `i a I A o O`,
+`h j k l w b 0 $ gg G`, `x`, `dd`, `yy`, `p`, `u`/`Ctrl-r`, and `:w`. It can be
+turned off in Settings (visual mode, registers, macros and text objects are
+out of scope).
+
+**Settings** (`Cmd+,` / toolbar) mirror the CLI config surface — WebDAV
+URL/username, WebDAV and E2EE passwords (stored encrypted at rest exactly
+like `joplin-rs set-password`), TLS options, and toggles for Vim mode,
+sync-on-startup and sync-before-quit.
+
+**Sync lifecycle**: the status bar shows `· 本地 N 项待同步` while local notes
+have unsynced changes; quitting (menu, `Cmd+Q`, or the window close button)
+syncs first when `sync_on_quit` is on, then exits.
+
+New `config.toml` keys (all default to `true` when absent): `vim_mode`,
+`sync_on_startup`, `sync_on_quit`.
+
 ## Build
 
 ```
