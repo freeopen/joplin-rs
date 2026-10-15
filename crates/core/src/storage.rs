@@ -43,6 +43,14 @@ pub struct Storage {
     conn: Connection,
 }
 
+/// Generate a Joplin-compatible item id: 32 lowercase hex chars (128 bits).
+fn new_item_id() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
 impl Storage {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -237,20 +245,28 @@ impl Storage {
     /// Mark items as deleted locally when they disappear from the target.
     pub fn delete_items(&self, ids: &[String]) -> Result<()> {
         for id in ids {
-            self.conn
-                .execute("DELETE FROM items WHERE id = ?1", [id])
-                .map_err(|e| Error::Storage(format!("delete: {e}")))?;
-            self.conn
-                .execute("DELETE FROM sync_items WHERE item_id = ?1", [id])
-                .map_err(|e| Error::Storage(format!("delete sync: {e}")))?;
-            // Drop the local-only protection marker with the note.
-            self.conn
-                .execute(
-                    "DELETE FROM kv WHERE key = ?1",
-                    [format!("{}{}", Self::NOTE_PROTECT_PREFIX, id)],
-                )
-                .map_err(|e| Error::Storage(format!("delete protection: {e}")))?;
+            self.delete_row(id)?;
         }
+        Ok(())
+    }
+
+    /// Delete a single item's row plus its sync metadata and local-only
+    /// protection marker. Does NOT record a pending remote delete (that is
+    /// [`Self::delete_item`], used by the UI).
+    fn delete_row(&self, id: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM items WHERE id = ?1", [id])
+            .map_err(|e| Error::Storage(format!("delete: {e}")))?;
+        self.conn
+            .execute("DELETE FROM sync_items WHERE item_id = ?1", [id])
+            .map_err(|e| Error::Storage(format!("delete sync: {e}")))?;
+        // Drop the local-only protection marker with the note.
+        self.conn
+            .execute(
+                "DELETE FROM kv WHERE key = ?1",
+                [format!("{}{}", Self::NOTE_PROTECT_PREFIX, id)],
+            )
+            .map_err(|e| Error::Storage(format!("delete protection: {e}")))?;
         Ok(())
     }
 
@@ -337,6 +353,54 @@ impl Storage {
         self.conn
             .execute("DELETE FROM kv WHERE key LIKE ?1", [like])
             .map_err(|e| Error::Storage(format!("clear_note_protections: {e}")))?;
+        Ok(())
+    }
+
+    // -- Pending remote deletions (local only) ----------------------------
+    //
+    // When the UI deletes an item, its row is removed immediately and an id is
+    // recorded under `pending_delete:<id>`. The sync `DELETE_REMOTE` step then
+    // physically deletes `{id}.md` on the target and clears the record. This
+    // mirrors Joplin's local `deleted_items` table (which only exists to retry
+    // a remote delete across syncs); no tombstone file is uploaded.
+
+    const PENDING_DELETE_PREFIX: &'static str = "pending_delete:";
+
+    /// Delete an item locally (row + sync metadata + protection marker) and
+    /// record it for remote deletion on the next sync.
+    pub fn delete_item(&self, id: &str) -> Result<()> {
+        self.delete_row(id)?;
+        self.kv_set(&format!("{}{}", Self::PENDING_DELETE_PREFIX, id), "1")
+    }
+
+    /// Ids awaiting a remote delete.
+    pub fn pending_deletes(&self) -> Result<Vec<String>> {
+        let like = format!("{}%", Self::PENDING_DELETE_PREFIX);
+        let mut stmt = self
+            .conn
+            .prepare("SELECT key FROM kv WHERE key LIKE ?1")
+            .map_err(|e| Error::Storage(format!("pending_deletes: {e}")))?;
+        let rows = stmt
+            .query_map([like], |r| r.get::<_, String>(0))
+            .map_err(|e| Error::Storage(format!("pending_deletes: {e}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let key = row.map_err(|e| Error::Storage(e.to_string()))?;
+            if let Some(id) = key.strip_prefix(Self::PENDING_DELETE_PREFIX) {
+                out.push(id.to_string());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Drop a pending-delete record once the remote file has been deleted.
+    pub fn clear_pending_delete(&self, id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM kv WHERE key = ?1",
+                [format!("{}{}", Self::PENDING_DELETE_PREFIX, id)],
+            )
+            .map_err(|e| Error::Storage(format!("clear_pending_delete: {e}")))?;
         Ok(())
     }
 
@@ -487,6 +551,147 @@ impl Storage {
             }));
         }
         Ok(None)
+    }
+
+    /// Fetch any item (notes/folders/...) by id, with its body for notes.
+    pub fn item(&self, id: &str) -> Result<Option<Item>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT type_, payload FROM items WHERE id = ?1")
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let mut rows = stmt
+            .query([id])
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        if let Some(row) = rows.next().map_err(|e| Error::Storage(e.to_string()))? {
+            let type_: i64 = row.get(0).map_err(|e| Error::Storage(e.to_string()))?;
+            let payload: String = row.get(1).map_err(|e| Error::Storage(e.to_string()))?;
+            return Self::item_from_payload(type_, &payload).map(Some);
+        }
+        Ok(None)
+    }
+
+    fn item_from_payload(item_type: i64, payload: &str) -> Result<Item> {
+        let props: serde_json::Map<String, Value> = serde_json::from_str(payload)
+            .map_err(|e| Error::Storage(format!("payload parse: {e}")))?;
+        let body = props
+            .get("body")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        Ok(Item {
+            item_type,
+            props: props.into_iter().collect(),
+            body,
+        })
+    }
+
+    /// Update a note's title and body, bumping `updated_time` to now so the
+    /// item becomes dirty (`updated_time > sync_time`) and is uploaded on the
+    /// next sync. The stored `sync_time` is deliberately left untouched.
+    pub fn update_note(&self, id: &str, title: &str, body: &str) -> Result<()> {
+        let Some(mut item) = self.note(id)? else {
+            return Err(Error::Storage(format!("note not found: {id}")));
+        };
+        item.props
+            .insert("title".to_string(), Value::String(title.to_string()));
+        item.props
+            .insert("updated_time".to_string(), Value::from(crate::time_ms()));
+        item.body = body.to_string();
+        self.upsert_item(&item)
+    }
+
+    /// Create a new (empty) note in a folder and return its id.
+    pub fn create_note(&self, folder_id: &str, title: &str) -> Result<String> {
+        let id = new_item_id();
+        let now = crate::time_ms();
+        let mut props = std::collections::BTreeMap::new();
+        props.insert("id".to_string(), Value::String(id.clone()));
+        props.insert(
+            "parent_id".to_string(),
+            Value::String(folder_id.to_string()),
+        );
+        props.insert("title".to_string(), Value::String(title.to_string()));
+        props.insert("created_time".to_string(), Value::from(now));
+        props.insert("updated_time".to_string(), Value::from(now));
+        props.insert("is_conflict".to_string(), Value::from(0));
+        props.insert("is_todo".to_string(), Value::from(0));
+        props.insert("markup_language".to_string(), Value::from(1));
+        let item = Item {
+            item_type: crate::items::TYPE_NOTE,
+            props,
+            body: String::new(),
+        };
+        self.upsert_item(&item)?;
+        Ok(id)
+    }
+
+    /// Create a new notebook (folder) and return its id.
+    pub fn create_folder(&self, title: &str) -> Result<String> {
+        let id = new_item_id();
+        let now = crate::time_ms();
+        let mut props = std::collections::BTreeMap::new();
+        props.insert("id".to_string(), Value::String(id.clone()));
+        props.insert("title".to_string(), Value::String(title.to_string()));
+        props.insert("created_time".to_string(), Value::from(now));
+        props.insert("updated_time".to_string(), Value::from(now));
+        let item = Item {
+            item_type: crate::items::TYPE_FOLDER,
+            props,
+            body: String::new(),
+        };
+        self.upsert_item(&item)?;
+        Ok(id)
+    }
+
+    /// Rename a notebook, bumping `updated_time` so it is re-uploaded.
+    pub fn rename_folder(&self, id: &str, title: &str) -> Result<()> {
+        let Some(mut item) = self.item(id)? else {
+            return Err(Error::Storage(format!("folder not found: {id}")));
+        };
+        item.props
+            .insert("title".to_string(), Value::String(title.to_string()));
+        item.props
+            .insert("updated_time".to_string(), Value::from(crate::time_ms()));
+        self.upsert_item(&item)
+    }
+
+    /// Number of live notes directly inside a folder (used to block deleting a
+    /// notebook that still contains notes).
+    pub fn notes_in_folder(&self, folder_id: &str) -> Result<usize> {
+        let n: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM items WHERE type_ = 1 AND parent_id = ?1 AND deleted_time = 0",
+                [folder_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| Error::Storage(format!("notes_in_folder: {e}")))?;
+        Ok(n as usize)
+    }
+
+    /// Locally-modified, decrypted items that must be uploaded: plaintext
+    /// items whose `updated_time` is newer than the last recorded `sync_time`
+    /// (or that were never synced). Mirrors Joplin's `itemsThatNeedSync`.
+    pub fn items_needing_sync(&self) -> Result<Vec<Item>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT i.type_, i.payload FROM items i \
+                 LEFT JOIN sync_items s ON s.item_id = i.id \
+                 WHERE i.deleted_time = 0 AND i.encryption_applied = 0 \
+                   AND i.updated_time > COALESCE(s.sync_time, 0) \
+                 ORDER BY i.updated_time DESC",
+            )
+            .map_err(|e| Error::Storage(format!("items_needing_sync: {e}")))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+            .map_err(|e| Error::Storage(format!("items_needing_sync: {e}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (t, payload) = row.map_err(|e| Error::Storage(e.to_string()))?;
+            out.push(Self::item_from_payload(t, &payload)?);
+        }
+        Ok(out)
     }
 
     pub fn resource(&self, resource_id: &str) -> Result<Option<Item>> {
@@ -772,6 +977,82 @@ mod tests {
             storage.kv_get("delta_context").unwrap().as_deref(),
             Some("x")
         );
+    }
+
+    #[test]
+    fn update_note_marks_dirty_and_clears_on_sync_time() {
+        let storage = Storage::open_in_memory().unwrap();
+        let item = unserialize(NOTE_BLOB).unwrap();
+        let id = item.props["id"].as_str().unwrap().to_string();
+        storage.upsert_item(&item).unwrap();
+        // Already synced: sync_time ahead of updated_time -> nothing to upload.
+        storage.save_sync_time(&id, 1000, 123).unwrap();
+        assert!(storage.items_needing_sync().unwrap().is_empty());
+
+        storage.update_note(&id, "New title", "New body").unwrap();
+        let dirty = storage.items_needing_sync().unwrap();
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty[0].props["id"].as_str(), Some(id.as_str()));
+        assert_eq!(dirty[0].body, "New body");
+        assert_eq!(dirty[0].props["title"].as_str(), Some("New title"));
+
+        // Recording a fresh sync_time clears it again.
+        storage.save_sync_time(&id, i64::MAX / 2, 0).unwrap();
+        assert!(storage.items_needing_sync().unwrap().is_empty());
+    }
+
+    #[test]
+    fn create_note_and_folder_roundtrip() {
+        let storage = Storage::open_in_memory().unwrap();
+        let folder = storage.create_folder("My Notebook").unwrap();
+        assert_eq!(folder.len(), 32);
+        assert!(folder.chars().all(|c| c.is_ascii_hexdigit()));
+        let folders = storage.folders().unwrap();
+        assert_eq!(folders.len(), 1);
+        assert_eq!(folders[0].props["title"].as_str(), Some("My Notebook"));
+
+        let note = storage.create_note(&folder, "New note").unwrap();
+        assert_eq!(note.len(), 32);
+        assert_eq!(storage.notes_in_folder(&folder).unwrap(), 1);
+        let n = storage.note(&note).unwrap().unwrap();
+        assert_eq!(n.props["title"].as_str(), Some("New note"));
+        assert_eq!(n.props["parent_id"].as_str(), Some(folder.as_str()));
+        assert_eq!(n.body, "");
+        // A freshly created note is dirty (never synced).
+        assert!(storage
+            .items_needing_sync()
+            .unwrap()
+            .iter()
+            .any(|i| i.props["id"].as_str() == Some(note.as_str())));
+
+        storage.rename_folder(&folder, "Renamed").unwrap();
+        assert_eq!(
+            storage.folders().unwrap()[0].props["title"].as_str(),
+            Some("Renamed")
+        );
+    }
+
+    #[test]
+    fn delete_item_records_pending_and_frees_folder() {
+        let storage = Storage::open_in_memory().unwrap();
+        let folder = storage.create_folder("F").unwrap();
+        let note = storage.create_note(&folder, "N").unwrap();
+        assert_eq!(storage.notes_in_folder(&folder).unwrap(), 1);
+
+        storage.delete_item(&note).unwrap();
+        assert!(storage.note(&note).unwrap().is_none());
+        assert_eq!(storage.notes_in_folder(&folder).unwrap(), 0);
+        assert_eq!(storage.pending_deletes().unwrap(), vec![note.clone()]);
+
+        storage.clear_pending_delete(&note).unwrap();
+        assert!(storage.pending_deletes().unwrap().is_empty());
+
+        // Deleting via the sync path (delete_items) does NOT record a pending
+        // remote delete.
+        storage.delete_item(&folder).unwrap();
+        storage.clear_pending_delete(&folder).unwrap();
+        storage.delete_items(&[folder.clone()]).unwrap();
+        assert!(storage.pending_deletes().unwrap().is_empty());
     }
 
     #[test]

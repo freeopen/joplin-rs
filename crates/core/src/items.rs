@@ -556,9 +556,15 @@ mod tests {
         // the identifying/timestamp props.
         let item = unserialize(SAMPLE).unwrap();
         let text = serialize(&item);
-        assert!(text.contains("id: 0f1e2d3c4b5a69788796a5b4c3d2e1f0"), "{text}");
+        assert!(
+            text.contains("id: 0f1e2d3c4b5a69788796a5b4c3d2e1f0"),
+            "{text}"
+        );
         assert!(text.contains("type_: 1"), "{text}");
-        assert!(text.starts_with("My note title\n\nHello world\nsecond line\n\n"), "{text}");
+        assert!(
+            text.starts_with("My note title\n\nHello world\nsecond line\n\n"),
+            "{text}"
+        );
 
         let back = unserialize(&text).unwrap();
         assert_eq!(back.item_type, TYPE_NOTE);
@@ -575,9 +581,15 @@ mod tests {
             item_type: TYPE_NOTE,
             props: {
                 let mut m = BTreeMap::new();
-                m.insert("id".to_string(), Value::from("0123456789abcdef0123456789abcdef"));
+                m.insert(
+                    "id".to_string(),
+                    Value::from("0123456789abcdef0123456789abcdef"),
+                );
                 m.insert("title".to_string(), Value::from("t"));
-                m.insert("updated_time".to_string(), Value::from(1_700_000_000_000i64));
+                m.insert(
+                    "updated_time".to_string(),
+                    Value::from(1_700_000_000_000i64),
+                );
                 m
             },
             body: "b".into(),
@@ -606,7 +618,10 @@ mod tests {
             item_type: TYPE_NOTE,
             props: {
                 let mut m = BTreeMap::new();
-                m.insert("id".to_string(), Value::from("0123456789abcdef0123456789abcdef"));
+                m.insert(
+                    "id".to_string(),
+                    Value::from("0123456789abcdef0123456789abcdef"),
+                );
                 m.insert("title".to_string(), Value::from("标题：测试"));
                 m.insert("source_url".to_string(), Value::from("a\nb"));
                 m
