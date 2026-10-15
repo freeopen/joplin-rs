@@ -176,6 +176,10 @@ pub enum Dialog {
     NewNotebook,
     /// Rename the selected notebook.
     RenameNotebook,
+    /// Confirm deleting the selected note.
+    ConfirmDeleteNote,
+    /// Confirm deleting the selected notebook (only when it has no notes).
+    ConfirmDeleteNotebook,
     /// App info: official icon, name, version. Non-macOS only: macOS uses the
     /// native system-menu About panel (see macos_about).
     #[cfg(not(target_os = "macos"))]
@@ -639,6 +643,13 @@ impl AppState {
         }
     }
 
+    /// Ask for confirmation before deleting the open note.
+    pub fn request_delete_note(&mut self) {
+        if self.selected_note.is_some() {
+            self.dialog = Dialog::ConfirmDeleteNote;
+        }
+    }
+
     // ---- notebooks (create / rename / delete) ---------------------------
 
     pub fn open_new_notebook(&mut self) {
@@ -705,6 +716,21 @@ impl AppState {
                 self.nb_error = Some(format!("重命名失败: {e}"));
                 false
             }
+        }
+    }
+
+    /// Ask for confirmation before deleting the selected notebook. Refused
+    /// (with a status message) while the notebook still holds notes.
+    pub fn request_delete_notebook(&mut self) {
+        let Some(id) = self.selected_folder.clone() else {
+            return;
+        };
+        match self.storage.notes_in_folder(&id) {
+            Ok(n) if n > 0 => {
+                self.set_status(format!("笔记本中还有 {n} 条笔记，请先删除这些笔记"));
+            }
+            Ok(_) => self.dialog = Dialog::ConfirmDeleteNotebook,
+            Err(e) => self.set_status(format!("删除笔记本失败: {e}")),
         }
     }
 
@@ -1529,6 +1555,34 @@ mod tests {
         state.delete_selected_notebook();
         assert!(state.storage.folders().unwrap().is_empty());
         assert!(state.selected_folder.is_none());
+    }
+
+    #[test]
+    fn delete_requests_open_confirm_dialog() {
+        let mut state =
+            AppState::build(Storage::open_in_memory().unwrap(), Config::default()).unwrap();
+        let folder = state.storage.create_folder("F").unwrap();
+        let note = state.storage.create_note(&folder, "N").unwrap();
+        state.refresh_lists();
+        state.selected_folder = Some(folder.clone());
+        state.request_open_note(&note);
+
+        // Delete note: opens the confirmation dialog, does not delete yet.
+        state.request_delete_note();
+        assert_eq!(state.dialog, Dialog::ConfirmDeleteNote);
+        assert!(state.storage.note(&note).unwrap().is_some());
+
+        // Notebook with notes is refused outright (no dialog).
+        state.dialog = Dialog::None;
+        state.request_delete_notebook();
+        assert_eq!(state.dialog, Dialog::None);
+        assert_eq!(state.storage.folders().unwrap().len(), 1);
+
+        // Empty notebook: opens the confirmation dialog.
+        state.storage.delete_item(&note).unwrap();
+        state.selected_folder = Some(folder);
+        state.request_delete_notebook();
+        assert_eq!(state.dialog, Dialog::ConfirmDeleteNotebook);
     }
 
     // ---- encrypted config secrets (CLI set-password compatibility) ----

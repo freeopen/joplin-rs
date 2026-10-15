@@ -477,6 +477,9 @@ impl NoteBrowser {
             AppDialog::NewNotebook | AppDialog::RenameNotebook => {
                 self.open_notebook_dialog(window, cx, want)
             }
+            AppDialog::ConfirmDeleteNote | AppDialog::ConfirmDeleteNotebook => {
+                self.open_confirm_delete_dialog(window, cx, want)
+            }
             #[cfg(not(target_os = "macos"))]
             AppDialog::About => self.open_about_dialog(window, cx),
         }
@@ -779,6 +782,77 @@ impl NoteBrowser {
         });
     }
 
+    /// Confirmation modal shown before deleting a note or a notebook.
+    fn open_confirm_delete_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        which: AppDialog,
+    ) {
+        let browser = cx.entity().downgrade();
+        let is_note = matches!(which, AppDialog::ConfirmDeleteNote);
+        let (title, description) = if is_note {
+            let note_title = self.state.read(cx).note_title.clone();
+            (
+                "删除笔记",
+                format!("确定删除笔记「{note_title}」？下次同步时会同时删除远端文件。"),
+            )
+        } else {
+            ("删除笔记本", "确定删除该笔记本？".to_string())
+        };
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            let browser_ok = browser.clone();
+            let browser_cancel = browser.clone();
+            let browser_close = browser.clone();
+            let description = description.clone();
+            dialog
+                .title(title)
+                .w(px(400.))
+                .content(move |content, _window, _cx| content.child(hint_line(&description)))
+                .footer(
+                    DialogFooter::new()
+                        .child(Button::new("del-cancel").label("取消").on_click(
+                            move |_, window, cx| {
+                                browser_cancel
+                                    .update(cx, |view, cx| {
+                                        view.state.update(cx, |s, _| s.dialog = AppDialog::None);
+                                        view.pending_dialog = AppDialog::None;
+                                    })
+                                    .ok();
+                                window.close_dialog(cx);
+                            },
+                        ))
+                        .child(
+                            DialogAction::new().child(Button::new("del-ok").danger().label("删除")),
+                        ),
+                )
+                .on_ok(move |_, _, cx| {
+                    browser_ok
+                        .update(cx, |view, cx| {
+                            view.state.update(cx, |s, _| {
+                                if is_note {
+                                    s.delete_selected_note();
+                                } else {
+                                    s.delete_selected_notebook();
+                                }
+                            });
+                            view.pending_dialog = AppDialog::None;
+                            true
+                        })
+                        .unwrap_or(true)
+                })
+                .on_cancel(move |_, _, cx| {
+                    browser_close
+                        .update(cx, |view, cx| {
+                            view.state.update(cx, |s, _| s.dialog = AppDialog::None);
+                            view.pending_dialog = AppDialog::None;
+                        })
+                        .ok();
+                    true
+                })
+        });
+    }
+
     #[cfg(not(target_os = "macos"))]
     fn open_about_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let browser = cx.entity().downgrade();
@@ -940,7 +1014,7 @@ impl Render for NoteBrowser {
                     .border_color(theme.border)
                     .child(Input::new(&self.search_input).id("search").cleanable(true)),
             )
-            // ---- body: notebooks | notes | note panel ----
+            // ---- body: notebooks | note preview | notes ----
             .child(
                 div()
                     .flex_1()
@@ -949,8 +1023,8 @@ impl Render for NoteBrowser {
                     .when(show_notebooks, |el| {
                         el.child(self.render_notebooks_column(cx))
                     })
-                    .when(show_notes, |el| el.child(self.render_notes_column(cx)))
-                    .child(self.render_note_panel(window, cx)),
+                    .child(self.render_note_panel(window, cx))
+                    .when(show_notes, |el| el.child(self.render_notes_column(cx))),
             )
     }
 }
@@ -1014,8 +1088,9 @@ impl NoteBrowser {
                                     .small()
                                     .label("🗑")
                                     .disabled(!has_selection)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.state.update(cx, |s, _| s.delete_selected_notebook());
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.state.update(cx, |s, _| s.request_delete_notebook());
+                                        this.sync_dialog_from_state(window, cx);
                                         cx.notify();
                                     })),
                             )
@@ -1110,7 +1185,7 @@ impl NoteBrowser {
         div()
             .w(px(NOTES_WIDTH))
             .flex_shrink_0()
-            .border_r_1()
+            .border_l_1()
             .border_color(theme.border)
             .flex()
             .flex_col()
@@ -1146,8 +1221,9 @@ impl NoteBrowser {
                                     .small()
                                     .label("🗑")
                                     .disabled(!has_note)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.state.update(cx, |s, _| s.delete_selected_note());
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.state.update(cx, |s, _| s.request_delete_note());
+                                        this.sync_dialog_from_state(window, cx);
                                         cx.notify();
                                     })),
                             )
@@ -1436,8 +1512,9 @@ impl NoteBrowser {
                                     .small()
                                     .danger()
                                     .label("删除笔记")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.state.update(cx, |s, _| s.delete_selected_note());
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.state.update(cx, |s, _| s.request_delete_note());
+                                        this.sync_dialog_from_state(window, cx);
                                         cx.notify();
                                     })),
                             )
