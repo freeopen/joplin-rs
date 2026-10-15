@@ -98,6 +98,13 @@ pub struct SyncOutcome {
     /// Item ids stored in encrypted form that could not be decrypted (no
     /// password). They are retried on the next sync once a password is given.
     pub pending_decryption: Vec<String>,
+    /// Items uploaded to the target this run (created or updated).
+    pub uploaded: usize,
+    /// Remote files physically deleted (pending local deletions).
+    pub deleted_remote: usize,
+    /// Items skipped because the remote changed since the last sync (conflict):
+    /// the remote version wins and the local change is left for the user.
+    pub skipped_conflicts: Vec<String>,
 }
 
 /// Result of the separate decryption pass ([`SyncEngine::decrypt_pending`]).
@@ -136,6 +143,117 @@ pub struct SyncEngine<'a> {
 impl<'a> SyncEngine<'a> {
     pub fn new(client: &'a WebDavClient, storage: &'a Storage) -> Self {
         Self { client, storage }
+    }
+
+    /// Physically delete remote files for locally-deleted items (Joplin's
+    /// DELETE_REMOTE step). NOT_FOUND is treated as success by the client, so
+    /// this is idempotent and safely retried on the next sync.
+    async fn delete_remote(
+        &self,
+        outcome: &mut SyncOutcome,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<()> {
+        let pending = self.storage.pending_deletes()?;
+        if pending.is_empty() {
+            return Ok(());
+        }
+        progress(&format!("deleting {} remote item(s)", pending.len()));
+        for id in pending {
+            let path = items::system_path(&id);
+            match self.client.delete(&path).await {
+                Ok(()) => {
+                    self.storage.clear_pending_delete(&id)?;
+                    outcome.deleted_remote += 1;
+                }
+                Err(e) => outcome.errors.push(format!("delete {path}: {e}")),
+            }
+        }
+        Ok(())
+    }
+
+    /// The `updated_time` carried by a serialized remote item. Works for both
+    /// plaintext items and E2EE envelopes (where it is kept in clear); a fully
+    /// encrypted blob has no readable timestamp (returns 0).
+    fn remote_item_updated_time(text: &str) -> i64 {
+        if text.starts_with("JED") {
+            return 0;
+        }
+        items::unserialize(text)
+            .ok()
+            .and_then(|i| i.props.get("updated_time").and_then(Value::as_i64))
+            .unwrap_or(0)
+    }
+
+    /// Upload locally-created/modified items (Joplin's UPLOAD step).
+    ///
+    /// For each dirty item the remote is stat'd, and its content read when it
+    /// exists, so a remote change after our last sync is detected: in that case
+    /// the item is skipped as a conflict (remote wins) rather than overwritten.
+    async fn upload(
+        &self,
+        key: &Option<items::SyncKey>,
+        outcome: &mut SyncOutcome,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<()> {
+        let dirty = self.storage.items_needing_sync()?;
+        if dirty.is_empty() {
+            return Ok(());
+        }
+        let total = dirty.len();
+        for (done, item) in dirty.iter().enumerate() {
+            if done % 10 == 0 {
+                progress(&format!("uploading {}/{}", done + 1, total));
+            }
+            let id = item
+                .props
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if id.is_empty() {
+                continue;
+            }
+            let path = items::system_path(&id);
+            let local_updated = item
+                .props
+                .get("updated_time")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+
+            // Joplin checks the remote only for items we have synced before:
+            // an item with no sync metadata has never been uploaded, so it is
+            // created remotely without a remote read (avoids clobbering the
+            // no-op self-heal flow and extra round-trips).
+            let sync_meta = self.storage.sync_time(&id)?;
+            let (conflict, remote_updated_file_time) = match sync_meta {
+                None => (false, 0),
+                Some((local_sync_time, _)) => match self.client.stat(&path).await? {
+                    // Remote absent: a previously-synced item was deleted
+                    // remotely while we changed it locally -> conflict.
+                    None => (local_sync_time != 0, 0),
+                    Some(st) => {
+                        let changed_remotely = match self.client.get_text(&path).await? {
+                            None => false,
+                            Some(text) => Self::remote_item_updated_time(&text) > local_sync_time,
+                        };
+                        (changed_remotely, st.updated_time)
+                    }
+                },
+            };
+            if conflict {
+                outcome.skipped_conflicts.push(format!(
+                    "{id} (remote changed since the last sync; the remote version was kept)"
+                ));
+                continue;
+            }
+
+            let body = items::serialize_for_sync(item, key.as_ref())?;
+            self.client.put(&path, &body).await?;
+            self.storage
+                .save_sync_time(&id, local_updated, remote_updated_file_time)?;
+            outcome.uploaded += 1;
+        }
+        Ok(())
     }
 
     pub async fn fetch_sync_info(&self) -> Result<SyncInfo> {
@@ -465,6 +583,9 @@ impl<'a> SyncEngine<'a> {
             resources_pending: 0,
             errors: Vec::new(),
             pending_decryption: Vec::new(),
+            uploaded: 0,
+            deleted_remote: 0,
+            skipped_conflicts: Vec::new(),
         };
 
         progress("fetching info.json");
@@ -481,6 +602,30 @@ impl<'a> SyncEngine<'a> {
         } else {
             None
         };
+
+        // ---- outgoing: DELETE_REMOTE then UPLOAD (mirrors Joplin's order) ----
+        //
+        // Uploading is only safe when we can encrypt: in an E2EE vault with no
+        // password we must NOT push plaintext items into an encrypted target,
+        // so the whole outgoing phase is skipped until a password is given.
+        let can_upload = !info.e2ee_enabled() || key_material.is_some();
+        if can_upload {
+            let sync_key = key_material.as_ref().and_then(|km| {
+                info.active_master_key_id().map(|id| items::SyncKey {
+                    key_hex: km.clone(),
+                    key_id: id,
+                })
+            });
+            self.delete_remote(&mut outcome, progress).await?;
+            self.upload(&sync_key, &mut outcome, progress).await?;
+        } else {
+            let dirty = self.storage.items_needing_sync()?.len();
+            if dirty > 0 {
+                progress(&format!(
+                    "{dirty} local change(s) pending: provide the E2EE password to upload"
+                ));
+            }
+        }
 
         // ---- basicDelta: list root and diff against context ----
         progress("listing remote items");

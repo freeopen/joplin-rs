@@ -357,6 +357,57 @@ pub fn serialize(item: &Item) -> String {
     parts.join("\n\n")
 }
 
+/// E2EE key material for uploading: the unlocked master key hex and its id.
+#[derive(Debug, Clone)]
+pub struct SyncKey {
+    pub key_hex: String,
+    pub key_id: String,
+}
+
+/// Serialize an item for upload, encrypting it when E2EE is enabled (mirrors
+/// `BaseItem.serializeForSync`).
+///
+/// Without a key the plaintext [`serialize`] is returned. With a key the
+/// plaintext is encrypted as a StringV1 blob and stored under
+/// `encryption_cipher_text` in an "envelope": only the link/sync keys Joplin
+/// keeps in clear (id, parent_id, updated_time, ...) plus
+/// `encryption_applied: 1` and the cipher text. The download side's
+/// `process_item_text` understands this layout symmetrically.
+pub fn serialize_for_sync(item: &Item, key: Option<&SyncKey>) -> Result<String> {
+    let Some(key) = key else {
+        return Ok(serialize(item));
+    };
+    let plain = serialize(item);
+    let cipher = crate::crypto::encrypt_string_v1(&key.key_hex, &key.key_id, &plain)?;
+
+    // Keys kept unencrypted so other clients can link/sync the item.
+    const KEEP: &[&str] = &[
+        "id",
+        "note_id",
+        "tag_id",
+        "parent_id",
+        "share_id",
+        "updated_time",
+        "deleted_time",
+        "is_locked",
+        "extracted_resource_ids",
+    ];
+    let mut props: BTreeMap<String, Value> = BTreeMap::new();
+    for k in KEEP {
+        if let Some(v) = item.props.get(*k) {
+            props.insert((*k).to_string(), v.clone());
+        }
+    }
+    props.insert("encryption_applied".to_string(), Value::from(1));
+    props.insert("encryption_cipher_text".to_string(), Value::String(cipher));
+    let reduced = Item {
+        item_type: item.item_type,
+        props,
+        body: String::new(),
+    };
+    Ok(serialize(&reduced))
+}
+
 /// Unserialize an item blob (BaseItem.unserialize).
 pub fn unserialize(content: &str) -> Result<Item> {
     // Serialized blobs end with the last property (no trailing newline), but
@@ -632,5 +683,51 @@ mod tests {
         let back = unserialize(&text).unwrap();
         assert_eq!(back.props["title"], item.props["title"]);
         assert_eq!(back.body, item.body);
+    }
+
+    #[test]
+    fn serialize_for_sync_without_key_is_plaintext() {
+        let item = unserialize(SAMPLE).unwrap();
+        assert_eq!(serialize_for_sync(&item, None).unwrap(), serialize(&item));
+    }
+
+    #[test]
+    fn serialize_for_sync_encrypts_envelope() {
+        use crate::crypto;
+        let item = unserialize(SAMPLE).unwrap();
+        let key = SyncKey {
+            key_hex: "ab".repeat(32),
+            key_id: "0123456789abcdef0123456789abcdef".into(),
+        };
+        let text = serialize_for_sync(&item, Some(&key)).unwrap();
+        // The plaintext body/title must not leak.
+        assert!(!text.contains("Hello world"), "{text}");
+        assert!(!text.contains("My note title"), "{text}");
+
+        let env = unserialize(&text).unwrap();
+        assert_eq!(env.props["encryption_applied"], Value::from(1));
+        assert_eq!(env.props["id"], item.props["id"]);
+        assert_eq!(env.props["updated_time"], item.props["updated_time"]);
+        assert!(env.body.is_empty(), "envelope carries no body");
+
+        // Decrypt the cipher text and confirm the inner item round-trips.
+        let cipher = env.props["encryption_cipher_text"].as_str().unwrap();
+        let header = crypto::decode_header(cipher).unwrap();
+        assert_eq!(header.method, crypto::METHOD_STRING_V1);
+        let md_size = usize::from_str_radix(&cipher[5..11], 16).unwrap();
+        let chunks = crypto::decode_chunks(&cipher[11 + md_size..]).unwrap();
+        let mut inner_text = String::new();
+        for chunk in chunks {
+            let plain = crypto::native_decrypt(&key.key_hex, &chunk, 3).unwrap();
+            let units: Vec<u16> = plain
+                .chunks_exact(2)
+                .map(|p| u16::from_le_bytes([p[0], p[1]]))
+                .collect();
+            inner_text.push_str(&String::from_utf16_lossy(&units));
+        }
+        let inner = unserialize(&inner_text).unwrap();
+        assert_eq!(inner.body, item.body);
+        assert_eq!(inner.props["title"], item.props["title"]);
+        assert_eq!(inner.props["id"], item.props["id"]);
     }
 }

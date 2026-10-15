@@ -203,6 +203,11 @@ async fn self_heals_only_missing_items_and_retries_unprocessable_blob() {
         let item =
             joplin_rs_core::items::unserialize(&note_blob(id, &format!("Note {id}"))).unwrap();
         storage.upsert_item(&item).unwrap();
+        // They "landed locally" in a prior sync, so they carry sync metadata
+        // (a later edit would make them dirty; an untouched item is not).
+        storage
+            .save_sync_time(id, joplin_rs_core::time_ms(), 0)
+            .unwrap();
     }
     let poisoned = serde_json::json!({
         "timestamp": 1767225600000i64,

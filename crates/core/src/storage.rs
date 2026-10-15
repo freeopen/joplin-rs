@@ -594,8 +594,16 @@ impl Storage {
         };
         item.props
             .insert("title".to_string(), Value::String(title.to_string()));
+        // Strictly increasing: guarantees the item is newer than its recorded
+        // sync_time even if the edit lands in the same millisecond.
+        let previous = item
+            .props
+            .get("updated_time")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let next = crate::time_ms().max(previous + 1);
         item.props
-            .insert("updated_time".to_string(), Value::from(crate::time_ms()));
+            .insert("updated_time".to_string(), Value::from(next));
         item.body = body.to_string();
         self.upsert_item(&item)
     }
