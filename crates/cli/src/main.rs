@@ -346,12 +346,18 @@ async fn main() -> Result<()> {
                 })
                 .await?;
             println!(
-                "done: {} uploaded, {} downloaded, {} deleted, {} deleted remote, {} resources ({} pending), {} unsupported, {} pending decryption, {} conflicts",
+                "done: {} uploaded, {} downloaded, {} deleted, {} deleted remote, {} resources ({} pending), {} unsupported, {} pending decryption, {} conflicts, {} upload blocked",
                 outcome.uploaded, outcome.downloaded, outcome.deleted, outcome.deleted_remote,
                 outcome.resources_downloaded,
                 outcome.resources_pending, outcome.skipped_unsupported, outcome.pending_decryption.len(),
-                outcome.skipped_conflicts.len()
+                outcome.skipped_conflicts.len(), outcome.upload_blocked
             );
+            if outcome.upload_blocked > 0 {
+                println!(
+                    "{} local change(s) could not be uploaded: this target is E2EE and no password was available",
+                    outcome.upload_blocked
+                );
+            }
             if !outcome.skipped_conflicts.is_empty() {
                 println!("conflicts skipped (remote kept):");
                 for c in &outcome.skipped_conflicts {

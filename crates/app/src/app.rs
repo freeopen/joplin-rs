@@ -243,6 +243,8 @@ pub struct Stage1Summary {
     pub deleted_remote: usize,
     /// Items skipped as conflicts (remote changed).
     pub conflicts: Vec<String>,
+    /// Local changes that could not be uploaded (E2EE target, no password).
+    pub upload_blocked: usize,
 }
 
 /// Stage-2 (E2EE decryption) result handed from the worker thread.
@@ -610,9 +612,7 @@ impl AppState {
     /// note list, and open the scope's most recent note.
     pub fn select_folder(&mut self, folder: Option<String>) {
         self.end_edit();
-        let _ = self
-            .storage
-            .set_last_selected_folder(folder.as_deref());
+        let _ = self.storage.set_last_selected_folder(folder.as_deref());
         self.selected_folder = folder;
         self.load_notes();
         let scope = self.selected_folder.clone();
@@ -675,9 +675,9 @@ impl AppState {
         let recent = self.storage.last_opened_note(folder).ok().flatten();
         let target = recent
             .filter(|id| {
-                self.notes
-                    .iter()
-                    .any(|n| n.props.get("id").and_then(serde_json::Value::as_str) == Some(id.as_str()))
+                self.notes.iter().any(|n| {
+                    n.props.get("id").and_then(serde_json::Value::as_str) == Some(id.as_str())
+                })
             })
             .or_else(|| {
                 self.notes.first().and_then(|n| {
@@ -712,9 +712,9 @@ impl AppState {
             .ok()
             .flatten()
             .filter(|id| {
-                self.folders
-                    .iter()
-                    .any(|f| f.props.get("id").and_then(serde_json::Value::as_str) == Some(id.as_str()))
+                self.folders.iter().any(|f| {
+                    f.props.get("id").and_then(serde_json::Value::as_str) == Some(id.as_str())
+                })
             });
         self.selected_folder = last_folder;
         self.load_notes();
@@ -1285,6 +1285,22 @@ impl AppState {
         self.stored_e2ee_password()
     }
 
+    /// Password used for the combined two-way sync (which needs key material to
+    /// ENCRYPT local items for upload). Session prompt first, then the dedicated
+    /// `config.e2ee_password`.
+    ///
+    /// Deliberately does NOT fall back to the WebDAV password: a wrong password
+    /// makes `SyncEngine::sync` fail hard (`unlock_master_key` errors) and would
+    /// abort the whole sync including downloads. Users who only reuse the WebDAV
+    /// password are instead prompted (see `handle_job_event`), and the submitted
+    /// value lands in `e2ee_session_password`.
+    pub fn resolve_upload_password(&self) -> Option<String> {
+        if !self.e2ee_session_password.is_empty() {
+            return Some(self.e2ee_session_password.clone());
+        }
+        self.config.e2ee_password.clone().filter(|p| !p.is_empty())
+    }
+
     /// Accept the E2EE prompt shown after a download and run decryption.
     pub fn submit_e2ee_prompt(&mut self) {
         if self.e2ee_input.is_empty() {
@@ -1349,16 +1365,26 @@ impl AppState {
                             summary.conflicts.len()
                         ));
                     }
-                    if pending == 0 {
-                        self.set_status(base);
-                    } else if self.e2ee_password_for_decrypt().is_some() {
+                    let blocked = summary.upload_blocked;
+                    if blocked > 0 {
+                        base.push_str(&format!("；{blocked} 项本地修改待上传（需 E2EE 密码）"));
+                    }
+                    // Both a download that needs decrypting and a blocked upload
+                    // need the E2EE password; prompting once serves either and
+                    // the submitted value lands in `e2ee_session_password`.
+                    let needs_password = (pending > 0
+                        && self.e2ee_password_for_decrypt().is_none())
+                        || (blocked > 0 && self.resolve_upload_password().is_none());
+                    if pending > 0 && self.e2ee_password_for_decrypt().is_some() {
                         // The caller (jobs layer) starts the decrypt pass.
                         self.set_status(format!("{base}；正在解密 {pending} 项…"));
-                    } else {
-                        self.set_status(format!("{base}；{pending} 项已加密，等待 E2EE 密码"));
+                    } else if needs_password {
+                        self.set_status(format!("{base}；等待 E2EE 密码"));
                         self.e2ee_input.clear();
                         self.e2ee_prompt_error = None;
                         self.dialog = Dialog::E2eePrompt;
+                    } else {
+                        self.set_status(base);
                     }
                     true
                 }
@@ -1455,7 +1481,10 @@ impl AppState {
         put!("username", Some(toml_string(&self.set_username)));
         put!("insecure_tls", Some(self.set_insecure_tls.to_string()));
         put!("vim_mode", Some(self.set_vim_mode.to_string()));
-        put!("sync_on_startup", Some(self.set_sync_on_startup.to_string()));
+        put!(
+            "sync_on_startup",
+            Some(self.set_sync_on_startup.to_string())
+        );
         put!("sync_on_quit", Some(self.set_sync_on_quit.to_string()));
         let ca = self.set_ca_cert.trim().to_string();
         put!(
@@ -1723,6 +1752,39 @@ mod tests {
         ));
     }
 
+    /// The combined sync needs key material to ENCRYPT uploads. The password is
+    /// the session value (user prompt) first, else the dedicated config E2EE
+    /// password; the WebDAV password is never used as a fallback because a wrong
+    /// value would hard-fail the whole sync.
+    #[test]
+    fn resolve_upload_password_session_then_dedicated_config() {
+        let mut state =
+            AppState::build(Storage::open_in_memory().unwrap(), Config::default()).unwrap();
+        assert_eq!(state.resolve_upload_password(), None);
+
+        state.config.e2ee_password = Some("config-pw".into());
+        assert_eq!(
+            state.resolve_upload_password().as_deref(),
+            Some("config-pw")
+        );
+
+        // A session value (user prompt) wins over the stored dedicated value.
+        state.e2ee_session_password = "session-pw".into();
+        assert_eq!(
+            state.resolve_upload_password().as_deref(),
+            Some("session-pw")
+        );
+
+        // Empty stored value is ignored.
+        state.e2ee_session_password.clear();
+        state.config.e2ee_password = Some(String::new());
+        assert_eq!(state.resolve_upload_password(), None);
+
+        // The WebDAV password is NOT an upload fallback.
+        state.config.password = Some("dav-pw".into());
+        assert_eq!(state.resolve_upload_password(), None);
+    }
+
     /// Regression: submitting the correct E2EE password while a stale job
     /// (started with the wrong fallback password) was still running lost the
     /// submission - the old DecryptDone(Err) handler cleared the session
@@ -1769,6 +1831,7 @@ mod tests {
                 uploaded: 0,
                 deleted_remote: 0,
                 conflicts: Vec::new(),
+                upload_blocked: 0,
             },
             3,
         )));
@@ -1819,6 +1882,7 @@ mod tests {
                 uploaded: 0,
                 deleted_remote: 0,
                 conflicts: Vec::new(),
+                upload_blocked: 0,
             },
             2,
         ))));

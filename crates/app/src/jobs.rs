@@ -26,15 +26,14 @@ pub fn start_download(state: &mut AppState) {
     let config = state.config.clone();
     let data_dir = crate::app::data_dir();
     let jobs: JobChannel = state.jobs.clone();
-    // Only a password the user actually supplied this session is used for the
-    // combined pass: the stored/WebDAV fallback must not hard-fail a sync that
-    // would otherwise succeed as a password-less download (the separate
-    // decrypt pass still uses the fallback).
-    let password = if state.e2ee_session_password.is_empty() {
-        None
-    } else {
-        Some(state.e2ee_session_password.clone())
-    };
+    // Key material for the combined pass: the session password the user
+    // supplied, else the dedicated E2EE password from config. The WebDAV
+    // password is deliberately NOT used as a fallback here: a wrong value makes
+    // the engine fail hard (master key unlock error) and would abort the whole
+    // sync, including the password-less download. So without a usable E2EE
+    // password the sync still runs as a download-only pass and reports the
+    // blocked uploads (see `SyncOutcome::upload_blocked`).
+    let password = state.resolve_upload_password();
 
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -64,6 +63,7 @@ pub fn start_download(state: &mut AppState) {
                     uploaded: outcome.uploaded,
                     deleted_remote: outcome.deleted_remote,
                     conflicts: outcome.skipped_conflicts.clone(),
+                    upload_blocked: outcome.upload_blocked,
                 },
                 pending,
             ))

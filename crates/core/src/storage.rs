@@ -242,6 +242,26 @@ impl Storage {
         Ok(out)
     }
 
+    /// Ids that carry sync metadata, i.e. were pushed to or pulled from the
+    /// target at least once (they have a `sync_items` row). Used by the sync
+    /// deletion detection: an item that was never uploaded has no remote
+    /// counterpart, so its absence from a remote listing must NOT be treated
+    /// as a remote deletion.
+    pub fn synced_item_ids(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT item_id FROM sync_items")
+            .map_err(|e| Error::Storage(format!("synced ids: {e}")))?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| Error::Storage(format!("synced ids: {e}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| Error::Storage(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
     /// Mark items as deleted locally when they disappear from the target.
     pub fn delete_items(&self, ids: &[String]) -> Result<()> {
         for id in ids {
@@ -1034,7 +1054,10 @@ mod tests {
         assert_eq!(storage.last_opened_note(None).unwrap(), None);
         storage.set_last_opened_note(None, "n1").unwrap();
         storage.set_last_opened_note(Some("f1"), "n2").unwrap();
-        assert_eq!(storage.last_opened_note(None).unwrap().as_deref(), Some("n1"));
+        assert_eq!(
+            storage.last_opened_note(None).unwrap().as_deref(),
+            Some("n1")
+        );
         assert_eq!(
             storage.last_opened_note(Some("f1")).unwrap().as_deref(),
             Some("n2")

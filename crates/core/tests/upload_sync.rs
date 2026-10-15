@@ -310,3 +310,78 @@ async fn upload_e2ee_edit_roundtrip() {
     assert_eq!(n.body, "a brand new encrypted body");
     assert_eq!(n.props["title"].as_str(), Some("Edited title"));
 }
+
+/// Reporter bug: in an E2EE vault with no password supplied, local changes must
+/// NOT be uploaded (no plaintext leak into the target) but must ALSO not be
+/// deleted locally; the run reports them via `upload_blocked`. Supplying the
+/// password then uploads them as ciphertext.
+#[tokio::test]
+async fn e2ee_upload_blocked_reports_and_preserves_then_uploads_with_password() {
+    let vault_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../fixtures/test_vault.json"
+    );
+    #[derive(serde::Deserialize)]
+    struct Vault {
+        info_json: String,
+        items: HashMap<String, String>,
+        password: String,
+    }
+    let vault: Vault = serde_json::from_str(
+        &std::fs::read_to_string(vault_path).expect("run tools/generate_fixtures.js"),
+    )
+    .unwrap();
+
+    let mut initial: HashMap<String, Vec<u8>> = HashMap::new();
+    initial.insert("info.json".into(), vault.info_json.clone().into_bytes());
+    for (path, content) in &vault.items {
+        initial.insert(path.clone(), content.as_bytes().to_vec());
+    }
+    let (url, files) = spawn_fake_dav(initial).await;
+    let client = WebDavClient::new(&url, "user", "pass").unwrap();
+
+    let s = Storage::open_in_memory().unwrap();
+    let e = SyncEngine::new(&client, &s);
+    // Download + decrypt with the password so the vault is present locally.
+    e.sync(Some(&vault.password), &mut |_| {}).await.unwrap();
+
+    // A brand-new local notebook + note, never uploaded.
+    let folder = s.create_folder("Local only").unwrap();
+    let note = s.create_note(&folder, "Local note").unwrap();
+    s.update_note(&note, "Local note", "not on the server yet")
+        .unwrap();
+    assert!(remote_text(&files, &items::system_path(&note)).is_none());
+
+    // Password-less sync: uploads skipped, reported, and NOTHING deleted locally.
+    let out = e.sync(None, &mut |_| {}).await.unwrap();
+    assert_eq!(
+        out.uploaded, 0,
+        "no plaintext upload without a password: {out:?}"
+    );
+    assert_eq!(
+        out.deleted, 0,
+        "never-uploaded items must not be deleted: {out:?}"
+    );
+    assert!(
+        out.upload_blocked >= 2,
+        "folder + note are pending: {out:?}"
+    );
+    assert!(
+        s.note(&note).unwrap().is_some(),
+        "the new note must survive the password-less sync"
+    );
+
+    // With the password the same pending changes are uploaded as ciphertext.
+    let out2 = e.sync(Some(&vault.password), &mut |_| {}).await.unwrap();
+    assert!(out2.uploaded >= 2, "folder + note uploaded: {out2:?}");
+    assert_eq!(out2.upload_blocked, 0, "nothing left blocked: {out2:?}");
+    let remote = remote_text(&files, &items::system_path(&note)).unwrap();
+    assert!(
+        remote.contains("encryption_applied"),
+        "encrypted envelope: {remote}"
+    );
+    assert!(
+        !remote.contains("not on the server yet"),
+        "no plaintext leak: {remote}"
+    );
+}

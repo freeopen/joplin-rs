@@ -105,6 +105,10 @@ pub struct SyncOutcome {
     /// Items skipped because the remote changed since the last sync (conflict):
     /// the remote version wins and the local change is left for the user.
     pub skipped_conflicts: Vec<String>,
+    /// Locally-modified items that could NOT be uploaded this run because the
+    /// sync target is E2EE and no password was available to encrypt with. They
+    /// stay dirty and are retried on the next sync once a password is given.
+    pub upload_blocked: usize,
 }
 
 /// Result of the separate decryption pass ([`SyncEngine::decrypt_pending`]).
@@ -586,6 +590,7 @@ impl<'a> SyncEngine<'a> {
             uploaded: 0,
             deleted_remote: 0,
             skipped_conflicts: Vec::new(),
+            upload_blocked: 0,
         };
 
         progress("fetching info.json");
@@ -620,6 +625,7 @@ impl<'a> SyncEngine<'a> {
             self.upload(&sync_key, &mut outcome, progress).await?;
         } else {
             let dirty = self.storage.items_needing_sync()?.len();
+            outcome.upload_blocked = dirty;
             if dirty > 0 {
                 progress(&format!(
                     "{dirty} local change(s) pending: provide the E2EE password to upload"
@@ -692,9 +698,20 @@ impl<'a> SyncEngine<'a> {
         // Deletion detection: items in local DB that no longer exist remotely.
         // (Only after the first sync; the failsafe guards against a wiped target.)
         let remote_paths: HashSet<String> = sorted.iter().map(|s| s.path.clone()).collect();
-        // Local contents were fetched above for the self-heal check.
-        if !local_ids.is_empty() {
-            let deleted: Vec<String> = local_ids
+        // Local contents were fetched above for the self-heal check. Only items
+        // that were actually synced before (they carry `sync_items` metadata)
+        // can be "deleted remotely": a brand-new local item that was never
+        // uploaded has no remote counterpart by definition, so its absence from
+        // the listing must not delete it (it may simply be a pending upload that
+        // was skipped, e.g. when no E2EE password was available).
+        let deletion_candidates: Vec<String> = self
+            .storage
+            .synced_item_ids()?
+            .into_iter()
+            .filter(|id| local_id_set.contains(id))
+            .collect();
+        if !deletion_candidates.is_empty() {
+            let deleted: Vec<String> = deletion_candidates
                 .iter()
                 .filter(|id| {
                     let path = items::system_path(id);
@@ -702,10 +719,10 @@ impl<'a> SyncEngine<'a> {
                 })
                 .cloned()
                 .collect();
-            let percent_deleted = if local_ids.is_empty() {
+            let percent_deleted = if deletion_candidates.is_empty() {
                 0.0
             } else {
-                deleted.len() as f64 / local_ids.len() as f64
+                deleted.len() as f64 / deletion_candidates.len() as f64
             };
             if percent_deleted >= FAILSAFE_THRESHOLD {
                 return Err(Error::Sync(format!(
