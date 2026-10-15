@@ -28,7 +28,10 @@ fn main() {
     .unwrap_or_default();
     let version = version::derive_version(cargo_version, tag.as_deref(), &subjects)
         .unwrap_or_else(|| cargo_version.to_string());
-    let display = version::version_display(&version, git(&["rev-parse", "--short=9", "HEAD"]).as_deref());
+    let display = version::version_display(
+        &version,
+        git(&["rev-parse", "--short=9", "HEAD"]).as_deref(),
+    );
     println!("cargo:rustc-env=JOPLIN_RS_GIT_VERSION={version}");
     println!("cargo:rustc-env=JOPLIN_RS_VERSION_DISPLAY={display}");
     // The build script runs with the crate dir (crates/core) as cwd, so

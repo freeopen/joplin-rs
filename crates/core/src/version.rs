@@ -12,7 +12,11 @@
 /// latest `vM.I.P` tag plus the Conventional-Commits bumps after it
 /// (`feat` -> minor, `fix` -> patch, `!` -> major), or from the Cargo.toml
 /// semver over the full history when no version tag exists.
-pub fn derive_version(cargo_version: &str, tag: Option<&str>, subjects: &[String]) -> Option<String> {
+pub fn derive_version(
+    cargo_version: &str,
+    tag: Option<&str>,
+    subjects: &[String],
+) -> Option<String> {
     let (major, minor, patch) = match tag {
         Some(tag) => {
             let base = parse_version_tag(tag)?;
@@ -263,7 +267,10 @@ mod tests {
         );
         assert_eq!(version_display("1.0.0", None), "v1.0.0");
         // A hash that itself starts with `v` must not confuse consumers.
-        assert_eq!(version_display("1.1.0", Some("va2751c")), "v1.1.0 (va2751c)");
+        assert_eq!(
+            version_display("1.1.0", Some("va2751c")),
+            "v1.1.0 (va2751c)"
+        );
     }
 
     /// The CI workflow resolves the release version from the binary's
@@ -312,14 +319,11 @@ mod tests {
             .unwrap_or(s.len());
         let candidate = &s[..end];
         let mut parts = candidate.split('.');
-        let ok = [0, 0, 0]
-            .iter()
-            .all(|_| {
-                parts
-                    .next()
-                    .is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
-            })
-            && parts.next().is_none();
+        let ok = [0, 0, 0].iter().all(|_| {
+            parts
+                .next()
+                .is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        }) && parts.next().is_none();
         ok.then(|| candidate.to_string())
     }
 }

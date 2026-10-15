@@ -5,3 +5,6 @@
 .omx/
 # local packaging outputs (tools/make-dmg.sh)
 /*.dmg
+
+# local packaging outputs (tar.gz)
+/*.tar.gz

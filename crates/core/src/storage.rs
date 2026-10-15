@@ -768,7 +768,10 @@ mod tests {
         storage.clear_note_protections().unwrap();
         assert!(storage.protected_note_ids().unwrap().is_empty());
         // Unrelated kv survives the protection clear.
-        assert_eq!(storage.kv_get("delta_context").unwrap().as_deref(), Some("x"));
+        assert_eq!(
+            storage.kv_get("delta_context").unwrap().as_deref(),
+            Some("x")
+        );
     }
 
     #[test]
