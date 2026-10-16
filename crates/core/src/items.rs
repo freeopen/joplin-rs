@@ -520,9 +520,13 @@ pub fn unserialize(content: &str) -> Result<Item> {
             out_props
                 .entry("title".to_string())
                 .or_insert_with(|| Value::String(title.to_string()));
-            // Skip the blank line between title and body.
-            while body_lines.first().is_some_and(|l| l.trim().is_empty()) {
-                body_lines.remove(0);
+            // Joplin's BaseItem.unserialize does `body.splice(0, 2)`: it drops
+            // exactly TWO leading elements - the title and the single blank
+            // separator line. Blank lines that are part of the body itself must
+            // therefore be preserved (an unconditional `while` here would eat
+            // them and diverge from Joplin for bodies starting with a blank).
+            if !body_lines.is_empty() {
+                body_lines.remove(0); // the blank line between title and body
             }
             body = body_lines.join("\n");
         }
@@ -619,6 +623,30 @@ mod tests {
         let item = unserialize(blob).unwrap();
         assert!(!item.props.contains_key("some_unknown"));
         assert_eq!(item.body, "body");
+    }
+
+    #[test]
+    fn unserialize_preserves_leading_blank_lines_in_body() {
+        // Joplin's BaseItem.unserialize removes exactly two leading body
+        // elements (title + one separator blank). A body that itself starts
+        // with a blank line must keep it; an unconditional strip would diverge.
+        let blob = concat!(
+            "T\n",
+            "\n",
+            "\n", // first line of the body is itself blank
+            "foo\n",
+            "\n",
+            "id: 0123456789abcdef0123456789abcdef\n",
+            "created_time: 2023-11-14T22:13:20.000Z\n",
+            "updated_time: 2023-11-14T22:13:20.000Z\n",
+            "type_: 1"
+        );
+        let item = unserialize(blob).unwrap();
+        assert_eq!(item.props["title"], Value::String("T".into()));
+        assert_eq!(item.body, "\nfoo");
+        // And it survives serialize -> unserialize.
+        let back = unserialize(&serialize(&item)).unwrap();
+        assert_eq!(back.body, "\nfoo");
     }
 
     #[test]
