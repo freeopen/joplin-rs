@@ -1600,17 +1600,23 @@ pub fn e2ee_retry_supersedes_prompt(session: &str, tried: &str) -> bool {
 }
 
 pub fn is_encrypted_placeholder(item: &Item) -> bool {
-    item.props
+    // An item is an (undecrypted) placeholder iff it is flagged as encrypted,
+    // or still carries cipher text (envelope whose flag failed to parse as 1).
+    // Note: a normal plaintext note with an empty body and encryption_applied
+    // = 0 must NOT be treated as encrypted.
+    let applied = item
+        .props
         .get("encryption_applied")
         .and_then(serde_json::Value::as_i64)
-        .unwrap_or(0)
-        == 1
-        || item.body.is_empty()
-            && item
-                .props
-                .get("encryption_applied")
-                .map(|v| !v.is_null())
-                .unwrap_or(false)
+        .unwrap_or(0);
+    if applied == 1 {
+        return true;
+    }
+    item.props
+        .get("encryption_cipher_text")
+        .and_then(serde_json::Value::as_str)
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
 }
 
 /// Shorten an id for display: Joplin ids are 32-hex; show the last 8 chars.

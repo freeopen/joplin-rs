@@ -257,9 +257,18 @@ pub fn serialize_prop(name: &str, value: &Value) -> String {
         Value::String(s) => s.clone(),
         other => other.to_string(),
     };
-    if is_timestamp_field(name) && !raw.is_empty() {
+    // Joplin's serialize_format returns '' for a falsy timestamp (0/empty);
+    // reproducing that keeps uploaded items byte-compatible.
+    if is_timestamp_field(name) {
+        if raw.is_empty() {
+            return String::new();
+        }
         if let Ok(ms) = raw.parse::<i64>() {
-            return escape_prop(&format_ms_iso8601(ms));
+            return if ms == 0 {
+                String::new()
+            } else {
+                escape_prop(&format_ms_iso8601(ms))
+            };
         }
     }
     if name == "body" {
@@ -299,10 +308,11 @@ fn escape_prop(s: &str) -> String {
 /// ...props...
 /// ```
 ///
-/// Known types emit their props in the canonical `table_fields` order with
-/// `type_` last (the same order Joplin uses); unknown types emit whatever
-/// props are held. `title`/`body` are emitted as the leading lines, never as
-/// props, and timestamps are formatted as ISO8601 via [`serialize_prop`].
+/// Known types emit the full canonical `table_fields` list in schema order
+/// (absent/falsy values as empty strings, exactly like `BaseItem.serialize`)
+/// with `type_` last; unknown types emit the props they hold. `title`/`body`
+/// are emitted as the leading lines, never as props, and timestamps are
+/// formatted as ISO8601 via [`serialize_prop`].
 ///
 /// The result round-trips through [`unserialize`] for notes and folders.
 pub fn serialize(item: &Item) -> String {
@@ -322,18 +332,25 @@ pub fn serialize(item: &Item) -> String {
     let mut props: Vec<String> = Vec::new();
     match table_fields(item.item_type) {
         Some(fields) => {
+            // Joplin's BaseItem.serialize iterates `shownKeys = fieldNames +
+            // type_` and writes EVERY field, using '' for absent/falsy values
+            // (serialize_format). Emitting the full field set (not just the
+            // props we happen to hold) is what makes our uploads
+            // indistinguishable from a native Joplin client's.
             for (name, _) in fields {
                 if *name == "title" || *name == "body" {
                     continue;
                 }
-                if let Some(v) = item.props.get(*name) {
-                    props.push(format!("{name}: {}", serialize_prop(name, v)));
-                }
+                let v = item.props.get(*name).cloned().unwrap_or(Value::Null);
+                props.push(format!("{name}: {}", serialize_prop(name, &v)));
             }
         }
         None => {
             for (name, v) in &item.props {
-                if name == "title" || name == "body" {
+                // title/body are emitted as leading lines; type_ is appended
+                // last from item_type, so skip any stored copy to avoid a
+                // duplicate line.
+                if name == "title" || name == "body" || name == "type_" {
                     continue;
                 }
                 props.push(format!("{name}: {}", serialize_prop(name, v)));
@@ -380,7 +397,9 @@ pub fn serialize_for_sync(item: &Item, key: Option<&SyncKey>) -> Result<String> 
     let plain = serialize(item);
     let cipher = crate::crypto::encrypt_string_v1(&key.key_hex, &key.key_id, &plain)?;
 
-    // Keys kept unencrypted so other clients can link/sync the item.
+    // Keys kept unencrypted so other clients can link/sync the item. Mirrors
+    // Joplin's `keepKeys` exactly (it includes `type_`; serialize() re-emits
+    // `type_` last from `item_type` in any case).
     const KEEP: &[&str] = &[
         "id",
         "note_id",
@@ -389,6 +408,7 @@ pub fn serialize_for_sync(item: &Item, key: Option<&SyncKey>) -> Result<String> 
         "share_id",
         "updated_time",
         "deleted_time",
+        "type_",
         "is_locked",
         "extracted_resource_ids",
     ];
@@ -689,6 +709,92 @@ mod tests {
     fn serialize_for_sync_without_key_is_plaintext() {
         let item = unserialize(SAMPLE).unwrap();
         assert_eq!(serialize_for_sync(&item, None).unwrap(), serialize(&item));
+    }
+
+    #[test]
+    fn serialize_emits_full_joplin_field_set() {
+        // A note created locally must serialize to the same field set that
+        // Joplin's BaseItem.serialize emits: EVERY schema field (absent ones as
+        // empty strings), with `type_` last. This is what makes our uploads
+        // indistinguishable from a native client's.
+        let item = Item {
+            item_type: TYPE_NOTE,
+            props: {
+                let mut m = BTreeMap::new();
+                m.insert(
+                    "id".to_string(),
+                    Value::from("0123456789abcdef0123456789abcdef"),
+                );
+                m.insert(
+                    "parent_id".to_string(),
+                    Value::from("fedcba9876543210fedcba9876543210"),
+                );
+                m.insert("title".to_string(), Value::from("T"));
+                m.insert(
+                    "created_time".to_string(),
+                    Value::from(1_700_000_000_000i64),
+                );
+                m.insert(
+                    "updated_time".to_string(),
+                    Value::from(1_700_000_000_000i64),
+                );
+                m.insert(
+                    "user_created_time".to_string(),
+                    Value::from(1_700_000_000_000i64),
+                );
+                m.insert(
+                    "user_updated_time".to_string(),
+                    Value::from(1_700_000_000_000i64),
+                );
+                m.insert("is_todo".to_string(), Value::from(0));
+                m.insert("markup_language".to_string(), Value::from(1));
+                m
+            },
+            body: String::new(),
+        };
+        let text = serialize(&item);
+        for (name, _) in table_fields(TYPE_NOTE).unwrap() {
+            if *name == "title" || *name == "body" {
+                continue;
+            }
+            assert!(
+                text.contains(&format!("\n{name}: ")),
+                "serialized note is missing field `{name}`:\n{text}"
+            );
+        }
+        assert!(text.ends_with("type_: 1"), "{text}");
+        // And it still round-trips through our own parser.
+        let back = unserialize(&text).unwrap();
+        assert_eq!(back.props["id"], item.props["id"]);
+        assert_eq!(
+            back.props["user_created_time"],
+            item.props["user_created_time"]
+        );
+        assert_eq!(back.body, item.body);
+    }
+
+    #[test]
+    fn serialize_absent_and_zero_timestamps_are_empty() {
+        // serialize_format returns '' for falsy timestamps; absent props are
+        // written as empty values (not omitted) so the line count matches
+        // Joplin's output.
+        let item = Item {
+            item_type: TYPE_NOTE,
+            props: {
+                let mut m = BTreeMap::new();
+                m.insert(
+                    "id".to_string(),
+                    Value::from("0123456789abcdef0123456789abcdef"),
+                );
+                m.insert("title".to_string(), Value::from("t"));
+                m
+            },
+            body: String::new(),
+        };
+        let text = serialize(&item);
+        assert!(text.contains("created_time: \n"), "{text}");
+        assert!(text.contains("user_created_time: \n"), "{text}");
+        assert!(text.contains("user_updated_time: \n"), "{text}");
     }
 
     #[test]

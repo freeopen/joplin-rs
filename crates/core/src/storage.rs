@@ -675,6 +675,13 @@ impl Storage {
         let next = crate::time_ms().max(previous + 1);
         item.props
             .insert("updated_time".to_string(), Value::from(next));
+        // Joplin records the user-visible time alongside updated_time; emit
+        // both so native clients order/display the note like their own.
+        item.props
+            .entry("user_created_time".to_string())
+            .or_insert_with(|| Value::from(previous));
+        item.props
+            .insert("user_updated_time".to_string(), Value::from(next));
         item.body = body.to_string();
         self.upsert_item(&item)
     }
@@ -697,6 +704,11 @@ impl Storage {
         let next = crate::time_ms().max(previous + 1);
         item.props
             .insert("updated_time".to_string(), Value::from(next));
+        item.props
+            .entry("user_created_time".to_string())
+            .or_insert_with(|| Value::from(previous));
+        item.props
+            .insert("user_updated_time".to_string(), Value::from(next));
         self.upsert_item(&item)
     }
 
@@ -713,8 +725,16 @@ impl Storage {
         props.insert("title".to_string(), Value::String(title.to_string()));
         props.insert("created_time".to_string(), Value::from(now));
         props.insert("updated_time".to_string(), Value::from(now));
+        // Joplin's own new notes carry user_created_time/user_updated_time and
+        // an initial `order` equal to the creation time; emit them so uploaded
+        // items match a native client's byte-for-byte.
+        props.insert("user_created_time".to_string(), Value::from(now));
+        props.insert("user_updated_time".to_string(), Value::from(now));
+        props.insert("order".to_string(), Value::from(now));
         props.insert("is_conflict".to_string(), Value::from(0));
         props.insert("is_todo".to_string(), Value::from(0));
+        props.insert("deleted_time".to_string(), Value::from(0));
+        props.insert("encryption_applied".to_string(), Value::from(0));
         props.insert("markup_language".to_string(), Value::from(1));
         let item = Item {
             item_type: crate::items::TYPE_NOTE,
@@ -734,6 +754,10 @@ impl Storage {
         props.insert("title".to_string(), Value::String(title.to_string()));
         props.insert("created_time".to_string(), Value::from(now));
         props.insert("updated_time".to_string(), Value::from(now));
+        props.insert("user_created_time".to_string(), Value::from(now));
+        props.insert("user_updated_time".to_string(), Value::from(now));
+        props.insert("deleted_time".to_string(), Value::from(0));
+        props.insert("encryption_applied".to_string(), Value::from(0));
         let item = Item {
             item_type: crate::items::TYPE_FOLDER,
             props,
@@ -750,8 +774,11 @@ impl Storage {
         };
         item.props
             .insert("title".to_string(), Value::String(title.to_string()));
+        let now = crate::time_ms();
         item.props
-            .insert("updated_time".to_string(), Value::from(crate::time_ms()));
+            .insert("updated_time".to_string(), Value::from(now));
+        item.props
+            .insert("user_updated_time".to_string(), Value::from(now));
         self.upsert_item(&item)
     }
 
