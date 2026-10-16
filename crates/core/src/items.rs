@@ -836,4 +836,62 @@ mod tests {
         assert_eq!(inner.props["title"], item.props["title"]);
         assert_eq!(inner.props["id"], item.props["id"]);
     }
+
+    #[test]
+    fn envelope_carries_timestamps_so_joplin_shim_is_safe() {
+        // Joplin's Synchronizer runs, for a remote item without
+        // user_created_time:  content.user_created_time = content.created_time
+        // If created_time is also ABSENT, that yields undefined and
+        // BaseModel.filter turns it into NaN -> "SQLITE_CONSTRAINT: NOT NULL
+        // constraint failed: notes.user_created_time", which aborts the whole
+        // delta step (requiring a client update/repair). Our envelope must
+        // always carry the created_time/user_* lines (empty is fine: Joplin
+        // parses '' into 0), even for a freshly created note that has no
+        // user_created_time prop yet.
+        let item = Item {
+            item_type: TYPE_NOTE,
+            props: {
+                let mut m = BTreeMap::new();
+                m.insert(
+                    "id".to_string(),
+                    Value::from("0123456789abcdef0123456789abcdef"),
+                );
+                m.insert(
+                    "parent_id".to_string(),
+                    Value::from("fedcba9876543210fedcba9876543210"),
+                );
+                m.insert("title".to_string(), Value::from("T"));
+                m.insert(
+                    "created_time".to_string(),
+                    Value::from(1_700_000_000_000i64),
+                );
+                m.insert(
+                    "updated_time".to_string(),
+                    Value::from(1_700_000_000_000i64),
+                );
+                m
+            },
+            body: String::new(),
+        };
+        let key = SyncKey {
+            key_hex: "ab".repeat(32),
+            key_id: "0123456789abcdef0123456789abcdef".into(),
+        };
+        let text = serialize_for_sync(&item, Some(&key)).unwrap();
+        assert!(
+            text.contains("\ncreated_time: "),
+            "envelope must carry a created_time line: {text}"
+        );
+        assert!(
+            text.contains("\nuser_created_time: "),
+            "envelope must carry a user_created_time line: {text}"
+        );
+        assert!(
+            text.contains("\nuser_updated_time: "),
+            "envelope must carry a user_updated_time line: {text}"
+        );
+        // And it still parses (empty timestamps -> 0, not an error).
+        let env = unserialize(&text).unwrap();
+        assert_eq!(env.props["encryption_applied"], Value::from(1));
+    }
 }

@@ -301,6 +301,19 @@ async fn upload_e2ee_edit_roundtrip() {
     let remote = remote_text(&files, &items::system_path(&note_id)).unwrap();
     assert!(remote.contains("encryption_applied"), "{remote}");
     assert!(!remote.contains("a brand new encrypted body"), "{remote}");
+    // The envelope must carry created_time/user_* lines even for items whose
+    // inner value is empty: Joplin's Synchronizer does
+    // `content.user_created_time = content.created_time` and BaseModel.filter
+    // turns a missing value into NaN, which aborts its whole sync with a
+    // NOT NULL constraint error. See envelope_carries_timestamps_so_joplin_shim_is_safe.
+    assert!(
+        remote.contains("\ncreated_time: "),
+        "envelope must carry a created_time line: {remote}"
+    );
+    assert!(
+        remote.contains("\nuser_created_time: "),
+        "envelope must carry a user_created_time line: {remote}"
+    );
 
     // A second client re-downloads and reproduces the edit.
     let s2 = Storage::open_in_memory().unwrap();
