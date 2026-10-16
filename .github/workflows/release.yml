@@ -1,19 +1,24 @@
 name: Release
 
-# 正式发布（非 prerelease）：
-# - push master：从 git 提交记录自动推导版本 X.Y.Z（发布式重置：tag 之后的
-#   feat/fix 提交里取最强级别、只应用一次、低位清零 —— feat 升次版本并
-#   清零补丁，fix 升补丁，`!` 升主版本并清零次/补丁），CI 在当前提交上
-#   自动建 tag vX.Y.Z 并发布 Release（GITHUB_TOKEN 建的 tag 不会再次触发
-#   本流水线，无递归风险）；若该版本号的 tag 已存在（本次 push 没有
-#   feat/fix 提交，版本未变），则跳过发布
-# - push 人工 tag vX.Y.Z：发布绑定该 tag 的正式 Release
-# Release 正文：release job 用 `git log <上一个 tag>..HEAD` 按
-#   conventional-commit 前缀分组生成（feat→新增功能，fix→修复缺陷，
-#   perf→性能优化，其余→其他变更），见 release-body.md
-# 产物形态：Linux/Windows tar.gz/zip 打 CLI + GUI 两个二进制；macOS 的
-# tar.gz 仅打 CLI（joplin-rs）一个二进制，GUI（joplin-rs-app）单独打成
-# .dmg（joplin-rs.app bundle，拖入 Applications 即用，见 tools/make-dmg.sh）
+# Official releases (non-prerelease):
+# - push to master: the version X.Y.Z is derived automatically from git history
+#   (release-style reset: take the strongest level among the feat/fix commits
+#   after the last tag, apply it exactly once, and zero the lower fields -- feat
+#   bumps minor and zeroes patch, fix bumps patch, `!` bumps major and zeroes
+#   minor/patch); CI creates the tag vX.Y.Z on the current commit itself and
+#   publishes the Release (a tag created with GITHUB_TOKEN does not trigger this
+#   pipeline again, so there is no recursion risk); if a tag for that version
+#   already exists (this push had no feat/fix commits, so the version did not
+#   change), the release is skipped
+# - push a manual tag vX.Y.Z: publish an official Release bound to that tag
+# Release body: the release job builds it from `git log <previous tag>..HEAD`,
+#   grouped by conventional-commit prefix (feat -> New features, fix -> Bug
+#   fixes, perf -> Performance, everything else -> Other changes), see
+#   release-body.md
+# Artifacts: Linux/Windows tar.gz/zip bundle both binaries (CLI + GUI); the
+#   macOS tar.gz carries only the CLI (joplin-rs), while the GUI
+#   (joplin-rs-app) ships separately as a .dmg (joplin-rs.app bundle, drag into
+#   Applications, see tools/make-dmg.sh)
 on:
   push:
     branches:
@@ -49,7 +54,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # 需要完整历史与 tag，build.rs 才能用 git describe/log 算版本
+          # a full history and tags are needed so build.rs can derive the
+          # version with git describe/log
           fetch-depth: 0
 
       - name: Install Rust toolchain
@@ -60,11 +66,13 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      # Linux：gpui-pre-linux 依赖的构建期系统库。zed-font-kit 默认走
-      # yeslogic-fontconfig-sys（pkg-config fontconfig）；xkbcommon/x11 需要
-      # 链接期找到 libxkbcommon-x11.so —— 注意 Ubuntu 24.04 的
-      # libxkbcommon-dev 只含 libxkbcommon.so，-x11 的链接符号在
-      # libxkbcommon-x11-0（运行时包）里且不带 .so 软链，需手工补一个。
+      # Linux: build-time system libs required by gpui-pre-linux.
+      # zed-font-kit uses yeslogic-fontconfig-sys by default (pkg-config
+      # fontconfig); xkbcommon/x11 need libxkbcommon-x11.so at link time --
+      # note that on Ubuntu 24.04 libxkbcommon-dev ships only
+      # libxkbcommon.so, while the -x11 link symbols live in
+      # libxkbcommon-x11-0 (a runtime package) with no .so symlink, so add one
+      # by hand.
       - name: Install Linux system deps
         if: runner.os == 'Linux'
         run: |
@@ -75,8 +83,9 @@ jobs:
           sudo ln -sf libxkbcommon-x11.so.0 \
             /usr/lib/x86_64-linux-gnu/libxkbcommon-x11.so
 
-      # 在 workspace 根目录编译，会同时产出两个 bin。失败时把 cargo 输出
-      # 尾部（真正的 error 行）打进日志摘要，便于匿名查看失败原因。
+      # Build from the workspace root so both bins are produced. On failure,
+      # echo the tail of the cargo output (the actual error lines) into the log
+      # so anyone can see why it failed.
       - name: Build
         shell: bash
         run: |
@@ -89,18 +98,19 @@ jobs:
             exit 1
           fi
 
-      # 版本号单一数据源：直接读编译产物的 --version（X.Y.Z）
+      # Single source of truth for the version: read --version (X.Y.Z) from the
+      # compiled binary
       - name: Resolve version
         shell: bash
         run: |
           set -e
           BIN="target/${{ matrix.target }}/release/joplin-rs"
           if [ -f "$BIN.exe" ]; then BIN="$BIN.exe"; fi
-          VERSION="$($BIN --version | sed -E 's/.* v([0-9]+\.[0-9]+\.[0-9]+).*/\1/')" # 剥掉 v 前缀和哈希取纯 X.Y.Z
+          VERSION="$($BIN --version | sed -E 's/.* v([0-9]+\.[0-9]+\.[0-9]+).*/\1/')" # strip the v prefix and hash to get plain X.Y.Z
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "Building version $VERSION"
 
-      # ---------- 打包：CLI 二进制（Linux/Windows 全量，macOS 仅 CLI） ----------
+      # ---------- Packaging: CLI binaries (Linux/Windows both, macOS CLI only) ----------
       - name: Package CLI (Unix)
         if: matrix.archive == 'tar.gz'
         shell: bash
@@ -110,7 +120,7 @@ jobs:
           OUT="joplin-rs-${VERSION}-${{ matrix.target }}.tar.gz"
           mkdir -p stage
           if [ "${{ runner.os }}" = "macOS" ]; then
-            # macOS：CLI 仅打 joplin-rs 一个二进制；GUI 走 .dmg
+            # macOS: the CLI archive carries only the joplin-rs binary; the GUI ships as a .dmg
             cp "$BIN_DIR/joplin-rs" LICENSE stage/
             tar czf "$OUT" -C stage joplin-rs LICENSE
           else
@@ -129,7 +139,7 @@ jobs:
           cp "$BIN_DIR/joplin-rs.exe" "$BIN_DIR/joplin-rs-app.exe" LICENSE stage/
           (cd stage && 7z a "../$OUT" joplin-rs.exe joplin-rs-app.exe LICENSE)
 
-      # ---------- macOS：GUI app 打成 .dmg（app-only bundle） ----------
+      # ---------- macOS: package the GUI app as a .dmg (app-only bundle) ----------
       - name: Package macOS app DMG
         if: runner.os == 'macOS'
         shell: bash
@@ -151,8 +161,9 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      # 需要完整历史 + 所有 tag，才能用 `git log <上一个 tag>..HEAD` 生成本次
-      # 版本的变更说明（fetch-depth: 0 会一并拉取 tag）。
+      # A full history plus all tags are needed to generate this version's
+      # changelog with `git log <previous tag>..HEAD` (fetch-depth: 0 also
+      # fetches tags).
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -172,15 +183,16 @@ jobs:
           set -e
           mkdir -p rel
           tar xzf artifacts/joplin-rs-*-x86_64-unknown-linux-gnu.tar.gz -C rel
-          VERSION="$(./rel/joplin-rs --version | sed -E 's/.* v([0-9]+\.[0-9]+\.[0-9]+).*/\1/')" # 取纯 X.Y.Z；Release/tag 仍用 vX.Y.Z 纯版本号，不带哈希
+          VERSION="$(./rel/joplin-rs --version | sed -E 's/.* v([0-9]+\.[0-9]+\.[0-9]+).*/\1/')" # get plain X.Y.Z; the Release/tag still use plain vX.Y.Z with no hash
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            # 人工发布 tag：Release 直接绑定该 tag
+            # manual release tag: bind the Release to that tag
             TAG_NAME="${GITHUB_REF_NAME}"
           else
-            # 日常 push：版本号即纯 SemVer，直接加 v 前缀作为 tag
+            # daily push: the version is plain SemVer, so prefix it with v to form the tag
             TAG_NAME="v${VERSION}"
-            # 版本号没变（本次 push 无 feat/fix 提交）时 tag 已存在，跳过发布，
-            # 避免把新产物挂到旧提交的 tag 上
+            # when the version did not change (no feat/fix commits in this push) the tag
+            # already exists, so skip the release to avoid attaching new artifacts to
+            # an old commit's tag
             if gh api "repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG_NAME}" >/dev/null 2>&1; then
               echo "Tag ${TAG_NAME} already exists at an older commit; skipping release."
               echo "SKIP_RELEASE=true" >> "$GITHUB_ENV"
@@ -190,9 +202,11 @@ jobs:
           echo "TAG_NAME=$TAG_NAME" >> "$GITHUB_ENV"
           echo "Releasing $VERSION as $TAG_NAME"
 
-      # 从 git 日志生成本次版本的变更说明（Release 正文的来源）：按
-      # conventional-commit 前缀分组 —— feat 归“新增功能”，fix 归“修复缺陷”，
-      # perf 归“性能优化”，其余归“其他变更”。范围是上一个发布 tag..HEAD。
+      # Generate this version's changelog from the git log (the source of the
+      # Release body): group by conventional-commit prefix -- feat under
+      # "New features", fix under "Bug fixes", perf under "Performance", and
+      # everything else under "Other changes". The range is the previous
+      # release tag..HEAD.
       - name: Generate release notes from git log
         if: env.SKIP_RELEASE != 'true'
         shell: bash
@@ -225,18 +239,18 @@ jobs:
             echo "## joplin-rs $VERSION"
             echo
             if [ -n "$PREV_TAG" ]; then
-              echo "_变更自 \`$PREV_TAG\`_"
+              echo "_Changes since \`$PREV_TAG\`_"
             else
-              echo "_首个发布_"
+              echo "_Initial release_"
             fi
             echo
-            if [ -s "$d/feat" ]; then echo "### ✨ 新增功能"; cat "$d/feat"; echo; fi
-            if [ -s "$d/fix" ]; then echo "### 🐛 修复缺陷"; cat "$d/fix"; echo; fi
-            if [ -s "$d/perf" ]; then echo "### ⚡ 性能优化"; cat "$d/perf"; echo; fi
-            if [ -s "$d/other" ]; then echo "### 🔧 其他变更"; cat "$d/other"; echo; fi
+            if [ -s "$d/feat" ]; then echo "### ✨ New features"; cat "$d/feat"; echo; fi
+            if [ -s "$d/fix" ]; then echo "### 🐛 Bug fixes"; cat "$d/fix"; echo; fi
+            if [ -s "$d/perf" ]; then echo "### ⚡ Performance"; cat "$d/perf"; echo; fi
+            if [ -s "$d/other" ]; then echo "### 🔧 Other changes"; cat "$d/other"; echo; fi
             if [ -n "$PREV_TAG" ]; then
               echo "---"
-              echo "完整变更历史：https://github.com/${GITHUB_REPOSITORY}/compare/${PREV_TAG}...${TAG_NAME}"
+              echo "Full changelog: https://github.com/${GITHUB_REPOSITORY}/compare/${PREV_TAG}...${TAG_NAME}"
             fi
           } > release-body.md
 
@@ -251,8 +265,9 @@ jobs:
           name: Release ${{ env.VERSION }}
           body_path: release-body.md
           files: artifacts/*
-          # 正文来自上一步按 git 日志生成的 release-body.md，而不是 GitHub
-          # 自动汇总（后者看不到本仓库无 PR 的直接提交）。
+          # The body comes from release-body.md generated in the previous step,
+          # not from GitHub's automatic summary (which cannot see the direct
+          # commits this repo pushes without PRs).
           generate_release_notes: false
           draft: false
           prerelease: false

@@ -23,7 +23,7 @@ joplin-rs is a from-scratch Rust client built for exactly this situation:
 2. **Roadmap** - today: two-way E2EE sync, browsing and note editing; next:
    attachments/resources upload and more editors.
 3. **Design philosophy** - fast, just-enough features, wide device
-   compatibility (速度要快，功能够用，设备兼容).
+   compatibility.
 
 ## What works
 
@@ -89,8 +89,9 @@ recently opened note; falls back to the newest note) and syncs on launch.
 When a list panel has focus, `j`/`k` move the highlight and `Enter` selects
 (notebooks are sorted by name, notes by most-recent update).
 
-Right-click a note in the Notes column for **新增 / 删除笔记 / 保护此笔记 /
-移动**; protecting a note (or removing its lock) uses the reading password.
+Right-click a note in the Notes column for **New / Delete note / Protect this
+note / Move**; protecting a note (or removing its lock) uses the reading
+password.
 
 Global shortcuts work immediately after launch (the root view takes focus on
 startup).
@@ -106,8 +107,8 @@ URL/username, WebDAV and E2EE passwords (stored encrypted at rest exactly
 like `joplin-rs set-password`), TLS options, and toggles for Vim mode,
 sync-on-startup and sync-before-quit.
 
-**Sync lifecycle**: the status bar shows `· 本地 N 项待同步` while local notes
-have unsynced changes; quitting (menu, `Cmd+Q`, or the window close button)
+**Sync lifecycle**: the status bar shows `· N local changes pending` while local
+notes have unsynced changes; quitting (menu, `Cmd+Q`, or the window close button)
 syncs first when `sync_on_quit` is on, then exits.
 
 New `config.toml` keys (all default to `true` when absent): `vim_mode`,
@@ -138,15 +139,16 @@ checkout). The hash is display-only: GitHub Release tags are the plain
 `vX.Y.Z` with no hash suffix.
 
 Every push to `master` is built for Linux, Windows and macOS (x64/arm64) and
-published as an official GitHub Release; CI creates the matching tag
-`vM.I.P-g<hash>` on the pushed commit. To mark a milestone manually, push a
+published as an official GitHub Release; CI creates the matching plain tag
+`vM.I.P` on the pushed commit. To mark a milestone manually, push a
 tag like `v0.2.0` (prefer bumping minor/major so the new patch base does not
 go backwards relative to the automatically accumulated patch number).
 
 Each Release body is generated from the git log: CI groups the commits since
-the previous tag by their Conventional Commits prefix (`feat` -> ✨ 新增功能,
-`fix` -> 🐛 修复缺陷, `perf` -> ⚡ 性能优化, everything else -> 🔧 其他变更), so
-the Release page lists exactly what was added or fixed for that version.
+the previous tag by their Conventional Commits prefix (`feat` -> ✨ New
+features, `fix` -> 🐛 Bug fixes, `perf` -> ⚡ Performance, everything else ->
+🔧 Other changes), so the Release page lists exactly what was added or fixed
+for that version.
 
 Release artifacts: Linux and Windows ship both binaries (CLI `joplin-rs` +
 GUI `joplin-rs-app`) in `tar.gz` / `zip`. On macOS the `tar.gz` carries the
@@ -199,7 +201,7 @@ JOPLIN_RS_PASSWORD=e2ee-password joplin-rs sync
 joplin-rs list                    # or: list --item-type folder / tag
 joplin-rs search "hello"          # title/body search
 joplin-rs search "meeting notes"  # multi-word AND search
-joplin-rs search project --folder <笔记本id> --snippets
+joplin-rs search project --folder <notebook-id> --snippets
 joplin-rs search todo --todo --completed   # only completed todos
 joplin-rs search xxx --json       # machine-readable output
 joplin-rs show <note-id>
