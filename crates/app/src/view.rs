@@ -155,6 +155,7 @@ fn install_menus(cx: &mut App) {
             MenuItem::separator(),
             MenuItem::action("Toggle Edit/Preview", ToggleEdit),
         ]),
+        Menu::new("Help").items(vec![MenuItem::action("About joplin-rs", ShowAbout)]),
     ];
     cx.set_menus(menus);
 }
@@ -1507,6 +1508,23 @@ impl NoteBrowser {
         });
     }
 
+    /// About entry point. macOS opens the native panel; elsewhere the
+    /// in-window dialog, reached from the Help menu. The main-window toolbar
+    /// has no About button.
+    fn show_about(&mut self, _: &ShowAbout, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = (window, cx);
+            crate::macos_about::show_native_about();
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.state.update(cx, |s, _| s.dialog = AppDialog::About);
+            self.sync_dialog_from_state(window, cx);
+            cx.notify();
+        }
+    }
+
     #[cfg(not(target_os = "macos"))]
     fn open_about_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let browser = cx.entity().downgrade();
@@ -1564,6 +1582,7 @@ impl Render for NoteBrowser {
             .on_action(cx.listener(Self::sync_clicked))
             .on_action(cx.listener(Self::reader_password_clicked))
             .on_action(cx.listener(Self::quit_action))
+            .on_action(cx.listener(Self::show_about))
             .on_action(cx.listener(Self::toggle_notebooks))
             .on_action(cx.listener(Self::toggle_notes))
             .on_action(cx.listener(Self::toggle_edit))
@@ -1644,8 +1663,6 @@ impl Render for NoteBrowser {
                                 cx.notify();
                             })),
                     )
-                    // macOS has the native app-menu About panel; other
-                    // platforms open the in-window dialog from the toolbar.
                     .child(
                         Button::new("btn-settings")
                             .small()
@@ -1671,24 +1688,6 @@ impl Render for NoteBrowser {
                                     .update(cx, |i, cx| i.set_value("", window, cx));
                                 this.sync_dialog_from_state(window, cx);
                                 cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("btn-about")
-                            .small()
-                            .ghost()
-                            .label("About")
-                            .on_click(cx.listener(|_this, _, _window, _cx| {
-                                #[cfg(target_os = "macos")]
-                                {
-                                    crate::macos_about::show_native_about();
-                                }
-                                #[cfg(not(target_os = "macos"))]
-                                {
-                                    _this.state.update(_cx, |s, _| s.dialog = AppDialog::About);
-                                    _this.sync_dialog_from_state(_window, _cx);
-                                    _cx.notify();
-                                }
                             })),
                     ),
             )
