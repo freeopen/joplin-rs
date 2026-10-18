@@ -480,11 +480,16 @@ impl NoteBrowser {
                         this.sync_dialog_from_state(window, cx);
                         // Deferred in-note find (⌘F from preview mode): the
                         // editor is mounted by now, so the panel can open.
+                        // Skip if edit mode was toggled off in the meantime
+                        // (⌘F then ⌘E within one tick): focusing the unmounted
+                        // editor would leave the window with a dead focus path.
                         if this.pending_find {
                             this.pending_find = false;
-                            let handle = this.note_edit.read(cx).focus_handle(cx);
-                            window.focus(&handle, cx);
-                            window.dispatch_action(Box::new(Search), cx);
+                            if this.state.read(cx).editing {
+                                let handle = this.note_edit.read(cx).focus_handle(cx);
+                                window.focus(&handle, cx);
+                                window.dispatch_action(Box::new(Search), cx);
+                            }
                             cx.notify();
                         }
                         // Quit-after-sync: leave once the sync job finished.
@@ -610,7 +615,8 @@ impl NoteBrowser {
     /// Toggle edit/preview for the open note (⌘E / ⌃E). `begin_edit` guards on
     /// `can_edit` (protected/encrypted notes stay read-only); `end_edit` saves
     /// any pending change.
-    fn toggle_edit(&mut self, _: &ToggleEdit, _: &mut Window, cx: &mut Context<Self>) {
+    fn toggle_edit(&mut self, _: &ToggleEdit, window: &mut Window, cx: &mut Context<Self>) {
+        let was_editing = self.state.read(cx).editing;
         self.state.update(cx, |s, _| {
             if s.editing {
                 s.end_edit();
@@ -618,7 +624,21 @@ impl NoteBrowser {
                 s.begin_edit();
             }
         });
+        if was_editing {
+            self.refocus_after_editor_closed(window, cx);
+        }
         cx.notify();
+    }
+
+    /// Hand focus back to the root view when the editor unmounts.
+    ///
+    /// Leaving edit mode drops the textarea (and the in-editor find panel)
+    /// from the element tree while they may hold focus. A focused element that
+    /// disappears takes the key-dispatch path with it, so every shortcut goes
+    /// dead until the user clicks something (repro: ⌘F then ⌘E). Focusing the
+    /// root restores the "NoteBrowser" key context the bindings dispatch from.
+    fn refocus_after_editor_closed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus, cx);
     }
 
     /// Open the global search dialog (⌘⌥F): type a query, Enter runs it.
@@ -2337,7 +2357,8 @@ impl NoteBrowser {
                                     .outline()
                                     .small()
                                     .label(if editing { "预览" } else { "编辑" })
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        let was_editing = this.state.read(cx).editing;
                                         this.state.update(cx, |s, _| {
                                             if s.editing {
                                                 s.end_edit();
@@ -2345,6 +2366,9 @@ impl NoteBrowser {
                                                 s.begin_edit();
                                             }
                                         });
+                                        if was_editing {
+                                            this.refocus_after_editor_closed(window, cx);
+                                        }
                                         cx.notify();
                                     })),
                             ),
