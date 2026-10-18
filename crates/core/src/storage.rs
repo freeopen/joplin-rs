@@ -51,6 +51,16 @@ fn new_item_id() -> String {
     hex::encode(bytes)
 }
 
+/// Note ordering for user-facing lists: newest by the user-visible
+/// modification time first.
+///
+/// `updated_time` is the sync timestamp, and a bulk download stamps every
+/// item in one batch (a few ms apart), so sorting by it reflects fetch order
+/// rather than when the note was last edited. `user_updated_time` is what
+/// Joplin itself sorts by; fall back to `updated_time` for items that predate
+/// it.
+const NOTE_ORDER: &str = "COALESCE(NULLIF(json_extract(payload, '$.user_updated_time'), 0), updated_time) DESC, updated_time DESC";
+
 impl Storage {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -564,10 +574,10 @@ impl Storage {
     /// Notes inside a folder (or all notes when folder_id is empty), newest first.
     pub fn notes(&self, folder_id: &str, include_todos: bool) -> Result<Vec<Item>> {
         let sql = if folder_id.is_empty() {
-            "SELECT payload FROM items WHERE type_ = 1 AND deleted_time = 0 ORDER BY updated_time DESC".to_string()
+            format!("SELECT payload FROM items WHERE type_ = 1 AND deleted_time = 0 ORDER BY {NOTE_ORDER}")
         } else {
             format!(
-                "SELECT payload FROM items WHERE type_ = 1 AND parent_id = '{}' AND deleted_time = 0 ORDER BY updated_time DESC",
+                "SELECT payload FROM items WHERE type_ = 1 AND parent_id = '{}' AND deleted_time = 0 ORDER BY {NOTE_ORDER}",
                 folder_id.replace('\'', "''")
             )
         };
@@ -890,7 +900,7 @@ impl Storage {
         if opts.completed_only {
             sql.push_str(" AND todo_completed > 0");
         }
-        sql.push_str(" ORDER BY updated_time DESC LIMIT 500");
+        sql.push_str(&format!(" ORDER BY {NOTE_ORDER} LIMIT 500"));
 
         let mut stmt = self
             .conn
@@ -1063,6 +1073,49 @@ mod tests {
             .delete_items(&["0f1e2d3c4b5a69788796a5b4c3d2e1f0".to_string()])
             .unwrap();
         assert_eq!(storage.all_item_ids().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn notes_sort_by_user_modification_time_not_sync_time() {
+        let storage = Storage::open_in_memory().unwrap();
+        let note = |id: &str, title: &str, updated: i64, user_updated: i64| Item {
+            item_type: 1,
+            props: [
+                ("id".to_string(), Value::String(id.into())),
+                ("title".to_string(), Value::String(title.into())),
+                ("updated_time".to_string(), Value::from(updated)),
+                ("user_updated_time".to_string(), Value::from(user_updated)),
+            ]
+            .into_iter()
+            .collect(),
+            body: String::new(),
+        };
+        // A bulk download stamps updated_time in fetch order (here: "fetched"
+        // last), while the user-visible modification times point the other way.
+        storage
+            .upsert_item(&note(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "fetched",
+                200,
+                100,
+            ))
+            .unwrap();
+        storage
+            .upsert_item(&note(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "edited",
+                100,
+                200,
+            ))
+            .unwrap();
+
+        let titles: Vec<String> = storage
+            .notes("", true)
+            .unwrap()
+            .iter()
+            .map(|n| n.props["title"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(titles, vec!["edited", "fetched"]);
     }
 
     #[test]
