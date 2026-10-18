@@ -48,21 +48,31 @@ impl AppDelegate {
 
 /// Build the options dictionary for the standard About panel: rounded icon,
 /// name and version.
+///
+/// The panel renders `ApplicationVersion (Version)`, where `Version` is the
+/// build number. Leaving `NSAboutPanelOptionVersion` unset makes AppKit fall
+/// back to the bundle's `CFBundleVersion`, so an app whose Info.plist has the
+/// same value as the release (`1.3.0`) shows a redundant
+/// `v1.3.0 (6b3370cd2) (1.3.0)`. An explicit empty string leaves the build
+/// part blank, matching `--version` exactly.
 fn about_options() -> Option<Retained<NSDictionary<objc2_app_kit::NSAboutPanelOptionKey, AnyObject>>>
 {
     let icon = rounded_icon()?;
     let icon_obj: Retained<AnyObject> = unsafe { Retained::cast_unchecked(icon) };
 
-    let keys: [&NSString; 3] = [
+    let keys: [&NSString; 4] = [
         unsafe { objc2_app_kit::NSAboutPanelOptionApplicationIcon },
         unsafe { objc2_app_kit::NSAboutPanelOptionApplicationName },
         unsafe { objc2_app_kit::NSAboutPanelOptionApplicationVersion },
+        unsafe { objc2_app_kit::NSAboutPanelOptionVersion },
     ];
     let name = NSString::from_str("joplin-rs-app");
     let version = NSString::from_str(crate::APP_VERSION);
+    let build = NSString::from_str("");
     let name_obj: Retained<AnyObject> = unsafe { Retained::cast_unchecked(name) };
     let version_obj: Retained<AnyObject> = unsafe { Retained::cast_unchecked(version) };
-    let objects: [&AnyObject; 3] = [&icon_obj, &name_obj, &version_obj];
+    let build_obj: Retained<AnyObject> = unsafe { Retained::cast_unchecked(build) };
+    let objects: [&AnyObject; 4] = [&icon_obj, &name_obj, &version_obj, &build_obj];
     Some(NSDictionary::from_slices(&keys, &objects))
 }
 
