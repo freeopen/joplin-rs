@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::read_password::{hash_password, verify_password};
+use crate::vim::VimMode;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
@@ -396,9 +397,9 @@ pub struct AppState {
     pub note_cursor: usize,
 
     // ---- vim editing ----
-    /// Editor is in Vim normal mode (vs insert). Only meaningful while editing
-    /// with `config.vim_mode` on.
-    pub vim_normal: bool,
+    /// Current Vim mode. Insert is the plain-editing mode; Normal and Visual
+    /// only occur while editing with `config.vim_mode` on.
+    pub vim_mode: VimMode,
     /// Pending operator/prefix for the Vim layer ("d", "y", "g", ":", ...).
     pub vim_pending: String,
 
@@ -488,7 +489,7 @@ impl AppState {
             edit_epoch: 0,
             folder_cursor: 0,
             note_cursor: 0,
-            vim_normal: true,
+            vim_mode: VimMode::Insert,
             vim_pending: String::new(),
             local_pending: 0,
             quit_after_sync: false,
@@ -815,7 +816,11 @@ impl AppState {
         self.edit_dirty = false;
         self.editing = true;
         // Vim editing starts in Normal mode when enabled (like vim itself).
-        self.vim_normal = self.config.vim_mode;
+        self.vim_mode = if self.config.vim_mode {
+            VimMode::Normal
+        } else {
+            VimMode::Insert
+        };
         self.vim_pending.clear();
         self.edit_epoch = self.edit_epoch.wrapping_add(1);
     }
@@ -824,7 +829,7 @@ impl AppState {
     pub fn end_edit(&mut self) {
         self.save_edit();
         self.editing = false;
-        self.vim_normal = true;
+        self.vim_mode = VimMode::Insert;
         self.vim_pending.clear();
     }
 

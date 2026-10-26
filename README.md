@@ -97,10 +97,17 @@ Global shortcuts work immediately after launch (the root view takes focus on
 startup).
 
 **Vim editing** is on by default (`vim_mode`); the note editor starts in
-NORMAL mode with an indicator in the header. Supported: `Esc`, `i a I A o O`,
-`h j k l w b 0 $ gg G`, `x`, `dd`, `yy`, `p`, `u`/`Ctrl-r`, and `:w`. It can be
-turned off in Settings (visual mode, registers, macros and text objects are
-out of scope).
+NORMAL mode with a mode badge in the header (NORMAL/INSERT/VISUAL, plus the
+pending command such as `:w` or `/word`). NORMAL and VISUAL draw a block cursor
+over the native thin caret, so the mode is visible without reading the badge.
+
+Supported: `Esc`, `i a I A o O`, `h j k l w b 0 $ gg G`, counts (`3j`, `12G`,
+`2dd`, `3x`, `d2w`), `Ctrl-f/b/d/u` page and half-page motions, `x dd yy dw d$`,
+`p P`, `u`/`Ctrl-r`, `.`, `v` with `d`/`y`, `/word ?word n N`, `:w :q :wq :x`,
+`ZZ`, and substitutions (`:%s/old/new/g`, `:2,5s/old/new/g`, `:s/old/new[/g]`).
+It can be turned off in Settings. Macros, named registers, marks, `f/t`, `J`,
+`>>/<<`, visual line/block modes, and text objects remain out of scope; `j`/`k`
+move by visual row when soft wrap is active.
 
 **Settings** (`Cmd+,` / toolbar) mirror the CLI config surface — WebDAV
 URL/username, WebDAV and E2EE passwords (stored encrypted at rest exactly

@@ -25,15 +25,15 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants},
     dialog::{DialogAction, DialogFooter},
     input::{
-        Copy, Cut, Delete, Enter, Input, InputEvent, InputState, MoveDown, MoveLeft, MoveRight,
-        MoveToEnd, MoveToEndOfLine, MoveToNextWord, MoveToPreviousWord, MoveToStart,
-        MoveToStartOfLine, MoveUp, Paste, Redo, Search, SelectAll, SelectToEndOfLine, Textarea,
-        TextareaState, Undo,
+        Copy, Cut, Delete, Enter, Input, InputEvent, InputState, MoveDown, MoveLeft, MovePageDown,
+        MovePageUp, MoveRight, MoveToEnd, MoveToEndOfLine, MoveToStart, MoveToStartOfLine, MoveUp,
+        Paste, Position, Redo, Search, SelectAll, Textarea, TextareaState, Undo,
     },
     menu::{ContextMenuExt, PopupMenuItem},
     scroll::Scrollbar,
     ActiveTheme, Disableable, Sizable, WindowExt,
 };
+use gpui_kit::{canvas, point};
 use gpui_kit::{
     div, prelude::*, px, relative, App, Bounds, Context, Entity, FocusHandle, Focusable, Image,
     ImageFormat, ImageSource, KeyBinding, KeyDownEvent, Menu, MenuItem, Render, Resource,
@@ -42,7 +42,7 @@ use gpui_kit::{
 
 use crate::app::{is_encrypted_placeholder, short_id, AppState, Dialog as AppDialog};
 use crate::jobs;
-use crate::vim::{self, VimAction, VimMode};
+use crate::vim::{self, MoveKind, VimAction, VimMode};
 
 gpui_kit::actions!(
     app,
@@ -160,6 +160,29 @@ fn install_menus(cx: &mut App) {
     cx.set_menus(menus);
 }
 
+/// One yank/delete register for the minimal vim layer. `linewise` text has no
+/// trailing newline; `p`/`P` insert it as whole lines instead of inline.
+#[derive(Debug, Clone, Default)]
+struct VimRegister {
+    text: String,
+    linewise: bool,
+    /// Whether anything was yanked/deleted yet (an empty register can still
+    /// hold an empty line, which pastes as a newline).
+    set: bool,
+}
+
+/// The last change `.` can replay. Insert-mode edits replay only the inserted
+/// text (multi-cursor/IME replacements are not reproduced exactly).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RepeatableChange {
+    DeleteChar(usize),
+    DeleteLines(usize),
+    DeleteWord(usize),
+    DeleteToLineEnd(usize),
+    Paste { before: bool, count: usize },
+    Insert(String),
+}
+
 /// The root view; owns the framework-agnostic state as an entity sibling.
 pub struct NoteBrowser {
     state: Entity<AppState>,
@@ -200,8 +223,28 @@ pub struct NoteBrowser {
     /// Focus handles for the two list panels (j/k/Enter navigation).
     notebooks_focus: FocusHandle,
     notes_focus: FocusHandle,
-    /// Single-line yank register for the minimal vim layer.
-    vim_register: String,
+    /// Vim register (linewise or characterwise).
+    vim_register: VimRegister,
+    /// Visual-mode selection anchor (byte offset).
+    vim_anchor: Option<usize>,
+    /// Last `/` or `?` search: query and direction.
+    vim_last_search: Option<(String, bool)>,
+    /// Last change replayed by `.`.
+    vim_last_change: Option<RepeatableChange>,
+    /// Editor text when Insert mode was entered, used to recover the text
+    /// typed during the insert for `.`.
+    vim_insert_snapshot: Option<String>,
+    /// Preview scroll handle (`#note-body-scroll`), used to restore the scroll
+    /// position after leaving edit mode.
+    preview_scroll: ScrollHandle,
+    /// Ratio (0..=1) of the source line the preview should scroll to, set by
+    /// [`Self::capture_preview_ratio`] and applied by the tick once the
+    /// preview has been laid out.
+    pending_preview_ratio: Option<f32>,
+    /// Note id the preview scroll belongs to; switching notes resets it.
+    preview_note: Option<String>,
+    /// Ticks spent waiting for the preview layout before giving up.
+    preview_retry: u32,
     /// Settings dialog input fields.
     set_url: Entity<InputState>,
     set_user: Entity<InputState>,
@@ -493,6 +536,31 @@ impl NoteBrowser {
                             }
                             cx.notify();
                         }
+                        // Restore the preview scroll position captured when
+                        // edit mode was left. The preview only gets its
+                        // layout after the next frame, so retry a few ticks.
+                        let note_id = this.state.read(cx).selected_note.clone();
+                        if note_id != this.preview_note {
+                            this.preview_note = note_id;
+                            this.pending_preview_ratio = None;
+                            this.preview_retry = 0;
+                            this.preview_scroll.set_offset(point(px(0.), px(0.)));
+                        }
+                        if let Some(ratio) = this.pending_preview_ratio {
+                            if !this.state.read(cx).editing {
+                                let max = this.preview_scroll.max_offset();
+                                if max.y > px(0.) {
+                                    this.preview_scroll
+                                        .set_offset(point(px(0.), -max.y * ratio));
+                                    this.pending_preview_ratio = None;
+                                } else {
+                                    this.preview_retry = this.preview_retry.saturating_add(1);
+                                    if this.preview_retry > 20 {
+                                        this.pending_preview_ratio = None;
+                                    }
+                                }
+                            }
+                        }
                         // Quit-after-sync: leave once the sync job finished.
                         let quit_now = {
                             let s = this.state.read(cx);
@@ -539,7 +607,15 @@ impl NoteBrowser {
             gate_epoch_seen: 0,
             notebooks_focus: cx.focus_handle(),
             notes_focus: cx.focus_handle(),
-            vim_register: String::new(),
+            vim_register: VimRegister::default(),
+            vim_anchor: None,
+            vim_last_search: None,
+            vim_last_change: None,
+            vim_insert_snapshot: None,
+            preview_scroll: ScrollHandle::new(),
+            pending_preview_ratio: None,
+            preview_note: None,
+            preview_retry: 0,
             set_url,
             set_user,
             set_pw,
@@ -618,15 +694,10 @@ impl NoteBrowser {
     /// any pending change.
     fn toggle_edit(&mut self, _: &ToggleEdit, window: &mut Window, cx: &mut Context<Self>) {
         let was_editing = self.state.read(cx).editing;
-        self.state.update(cx, |s, _| {
-            if s.editing {
-                s.end_edit();
-            } else {
-                s.begin_edit();
-            }
-        });
         if was_editing {
-            self.refocus_after_editor_closed(window, cx);
+            self.finish_edit(window, cx);
+        } else {
+            self.state.update(cx, |s, _| s.begin_edit());
         }
         cx.notify();
     }
@@ -747,12 +818,18 @@ impl NoteBrowser {
     // ---- vim editing layer ----------------------------------------------
 
     /// Capture-phase key handler over the note body editor. Active only while
-    /// editing with `config.vim_mode` on; consumes keys in Normal mode so they
-    /// do not reach the textarea.
+    /// editing with `config.vim_mode` on; consumes keys in Normal/Visual mode
+    /// so they do not reach the textarea.
     fn editor_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &event.keystroke;
         // Let Cmd/Ctrl application shortcuts through untouched.
-        if ks.modifiers.platform {
+        // On non-macOS `platform` *is* Ctrl, which Vim also uses for
+        // Ctrl-r/f/b/d/u, so those keys still reach the vim layer.
+        let vim_ctrl = ks.modifiers.control
+            && !ks.modifiers.alt
+            && !ks.modifiers.shift
+            && matches!(ks.key.as_str(), "r" | "f" | "b" | "d" | "u");
+        if ks.modifiers.platform && !vim_ctrl {
             return;
         }
         // The in-editor find panel (⌘F) renders inside this capture container
@@ -761,18 +838,13 @@ impl NoteBrowser {
         if !self.note_edit.read(cx).focus_handle(cx).is_focused(window) {
             return;
         }
-        let (enabled, editing, normal) = {
+        let (enabled, editing, mode) = {
             let s = self.state.read(cx);
-            (s.config.vim_mode, s.editing, s.vim_normal)
+            (s.config.vim_mode, s.editing, s.vim_mode)
         };
         if !enabled || !editing {
             return;
         }
-        let mode = if normal {
-            VimMode::Normal
-        } else {
-            VimMode::Insert
-        };
         let key = ks.key.clone();
         let ctrl = ks.modifiers.control;
         let action = {
@@ -785,58 +857,405 @@ impl NoteBrowser {
             return;
         }
         cx.stop_propagation();
-        match action {
-            VimAction::PassThrough | VimAction::Swallow => {}
-            VimAction::ToInsert => self.state.update(cx, |s, _| s.vim_normal = false),
-            VimAction::ToNormal => self.state.update(cx, |s, _| {
-                s.vim_normal = true;
-                s.vim_pending.clear();
-            }),
-            VimAction::MoveLeft => window.dispatch_action(Box::new(MoveLeft), cx),
-            VimAction::MoveRight => window.dispatch_action(Box::new(MoveRight), cx),
-            VimAction::MoveUp => window.dispatch_action(Box::new(MoveUp), cx),
-            VimAction::MoveDown => window.dispatch_action(Box::new(MoveDown), cx),
-            VimAction::WordForward => window.dispatch_action(Box::new(MoveToNextWord), cx),
-            VimAction::WordBackward => window.dispatch_action(Box::new(MoveToPreviousWord), cx),
-            VimAction::LineStart => window.dispatch_action(Box::new(MoveToStartOfLine), cx),
-            VimAction::LineEnd => window.dispatch_action(Box::new(MoveToEndOfLine), cx),
-            VimAction::DocStart => window.dispatch_action(Box::new(MoveToStart), cx),
-            VimAction::DocEnd => window.dispatch_action(Box::new(MoveToEnd), cx),
-            VimAction::DeleteChar => window.dispatch_action(Box::new(Delete), cx),
-            VimAction::DeleteLine => {
-                window.dispatch_action(Box::new(MoveToStartOfLine), cx);
-                window.dispatch_action(Box::new(SelectToEndOfLine), cx);
-                window.dispatch_action(Box::new(Delete), cx);
-                window.dispatch_action(Box::new(Delete), cx);
-            }
-            VimAction::YankLine => {
-                let text = self.note_edit.read(cx).value().to_string();
-                let cursor = self.note_edit.read(cx).cursor();
-                let head = text.get(..cursor).unwrap_or("");
-                let start = head.rfind('\n').map(|i| i + 1).unwrap_or(0);
-                let tail = text.get(cursor..).unwrap_or("");
-                let end = tail.find('\n').map(|i| cursor + i).unwrap_or(text.len());
-                self.vim_register = text.get(start..end).unwrap_or("").to_string();
-            }
-            VimAction::PasteAfter => {
-                let reg = self.vim_register.clone();
-                if !reg.is_empty() {
-                    self.note_edit.update(cx, |s, cx| s.insert(reg, window, cx));
+        self.apply_vim_action(action, window, cx);
+        cx.notify();
+    }
+
+    fn vim_text(&self, cx: &App) -> String {
+        self.note_edit.read(cx).value().to_string()
+    }
+
+    fn set_vim_mode(&mut self, mode: VimMode, cx: &mut Context<Self>) {
+        self.state.update(cx, |s, _| {
+            s.vim_mode = mode;
+            s.vim_pending.clear();
+        });
+        if mode != VimMode::Visual {
+            self.vim_anchor = None;
+        }
+    }
+
+    /// Record the last change so `.` can replay it.
+    fn record_change(&mut self, change: RepeatableChange) {
+        self.vim_last_change = Some(change);
+    }
+
+    /// Select `anchor..cursor` after a Visual-mode motion.
+    fn sync_visual_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(anchor) = self.vim_anchor else {
+            return;
+        };
+        let cursor = self.note_edit.read(cx).cursor();
+        let (start, end) = if anchor <= cursor {
+            (anchor, cursor)
+        } else {
+            (cursor, anchor)
+        };
+        self.note_edit
+            .update(cx, |s, cx| s.set_selected_range(start..end, cx));
+    }
+
+    /// Run a Vim motion `count` times through the textarea's own actions.
+    fn vim_move(
+        &mut self,
+        kind: MoveKind,
+        count: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let count = count.max(1);
+        let half_page = |this: &Self, cx: &App| -> usize {
+            this.note_edit
+                .read(cx)
+                .visible_row_range()
+                .map(|r| (r.len() / 2).max(1))
+                .unwrap_or(10)
+        };
+        match kind {
+            MoveKind::Left | MoveKind::Right | MoveKind::Up | MoveKind::Down => {
+                for _ in 0..count {
+                    match kind {
+                        MoveKind::Left => {
+                            window.dispatch_action(Box::new(MoveLeft), cx);
+                        }
+                        MoveKind::Right => {
+                            window.dispatch_action(Box::new(MoveRight), cx);
+                        }
+                        MoveKind::Up => {
+                            window.dispatch_action(Box::new(MoveUp), cx);
+                        }
+                        _ => {
+                            window.dispatch_action(Box::new(MoveDown), cx);
+                        }
+                    }
                 }
             }
+            MoveKind::WordForward | MoveKind::WordBackward => {
+                let text = self.vim_text(cx);
+                let cursor = self.note_edit.read(cx).cursor();
+                let to = if kind == MoveKind::WordForward {
+                    vim::word_forward_offset(&text, cursor, count)
+                } else {
+                    vim::word_backward_offset(&text, cursor, count)
+                };
+                self.note_edit
+                    .update(cx, |s, cx| s.set_selected_range(to..to, cx));
+            }
+            MoveKind::LineStart => {
+                window.dispatch_action(Box::new(MoveToStartOfLine), cx);
+            }
+            MoveKind::LineEnd => {
+                window.dispatch_action(Box::new(MoveToEndOfLine), cx);
+            }
+            MoveKind::DocStart => {
+                window.dispatch_action(Box::new(MoveToStart), cx);
+            }
+            MoveKind::DocEnd => {
+                window.dispatch_action(Box::new(MoveToEnd), cx);
+            }
+            MoveKind::PageDown => {
+                for _ in 0..count {
+                    window.dispatch_action(Box::new(MovePageDown), cx);
+                }
+            }
+            MoveKind::PageUp => {
+                for _ in 0..count {
+                    window.dispatch_action(Box::new(MovePageUp), cx);
+                }
+            }
+            MoveKind::HalfPageDown => {
+                let lines = half_page(self, cx);
+                for _ in 0..lines {
+                    window.dispatch_action(Box::new(MoveDown), cx);
+                }
+            }
+            MoveKind::HalfPageUp => {
+                let lines = half_page(self, cx);
+                for _ in 0..lines {
+                    window.dispatch_action(Box::new(MoveUp), cx);
+                }
+            }
+        }
+    }
+
+    /// Delete `range`, storing it in the register and recording the change.
+    /// Dispatching `Delete` keeps undo and the change/autosave path intact.
+    fn vim_delete_range(
+        &mut self,
+        range: std::ops::Range<usize>,
+        linewise: bool,
+        change: RepeatableChange,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if range.start >= range.end {
+            return;
+        }
+        let text = self.vim_text(cx);
+        let Some(slice) = text.get(range.clone()) else {
+            return;
+        };
+        self.vim_register = VimRegister {
+            text: if linewise {
+                slice.trim_matches('\n').to_string()
+            } else {
+                slice.to_string()
+            },
+            linewise,
+            set: true,
+        };
+        self.record_change(change);
+        self.note_edit
+            .update(cx, |s, cx| s.set_selected_range(range, cx));
+        window.dispatch_action(Box::new(Delete), cx);
+    }
+
+    /// Paste the register `count` times. Linewise text goes on its own line
+    /// (`p` below, `P` above the current one); characterwise text is inserted
+    /// after or before the cursor.
+    fn vim_paste(
+        &mut self,
+        before: bool,
+        count: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.vim_register.set {
+            return;
+        }
+        let reg = self.vim_register.clone();
+        let text = self.vim_text(cx);
+        let cursor = self.note_edit.read(cx).cursor();
+        if reg.linewise {
+            let repeat = count.max(1);
+            let block = std::iter::repeat(reg.text.as_str())
+                .take(repeat)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let (insert_at, payload) = if before {
+                (vim::line_start_offset(&text, cursor), format!("{block}\n"))
+            } else {
+                (vim::line_end_offset(&text, cursor), format!("\n{block}"))
+            };
+            self.note_edit.update(cx, |s, cx| {
+                s.set_selected_range(insert_at..insert_at, cx);
+                s.insert(payload, window, cx);
+            });
+        } else {
+            let payload = reg.text.repeat(count.max(1));
+            let at = if before {
+                cursor
+            } else {
+                let mut at = cursor;
+                if let Some(c) = text[cursor..].chars().next() {
+                    at += c.len_utf8();
+                }
+                at
+            };
+            self.note_edit.update(cx, |s, cx| {
+                s.set_selected_range(at..at, cx);
+                s.insert(payload, window, cx);
+            });
+        }
+        self.record_change(RepeatableChange::Paste { before, count });
+    }
+
+    /// Search for `query` from `from` and move the cursor to the match.
+    fn vim_search(&mut self, query: &str, backward: bool, from: usize, cx: &mut Context<Self>) {
+        let text = self.vim_text(cx);
+        let Some(pos) = vim::find_match(&text, from, query, backward) else {
+            self.state
+                .update(cx, |s, _| s.set_status(format!("未找到：{query}")));
+            return;
+        };
+        self.note_edit
+            .update(cx, |s, cx| s.set_selected_range(pos..pos, cx));
+        self.state.update(cx, |s, _| {
+            s.set_status(format!("搜索：{query}"));
+        });
+    }
+
+    /// Apply a substitute spec. When no range is given the current line is
+    /// used. Matches are replaced back-to-front so earlier offsets stay valid;
+    /// each `replace` goes through the textarea so Change/undo still fire.
+    fn vim_substitute(
+        &mut self,
+        mut spec: vim::SubSpec,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !spec.whole && spec.start.is_none() {
+            let line = self.note_edit.read(cx).cursor_position().line as usize + 1;
+            spec.start = Some(line);
+            spec.end = Some(line);
+        }
+        let text = self.vim_text(cx);
+        let mut hits = vim::substitute_matches(&text, &spec);
+        hits.reverse();
+        let count = hits.len();
+        for (range, replacement) in hits {
+            self.note_edit.update(cx, |s, cx| {
+                s.set_selected_range(range, cx);
+                s.replace(replacement, window, cx);
+            });
+        }
+        self.state.update(cx, |s, _| {
+            s.set_status(format!("替换 {count} 处"));
+        });
+    }
+
+    fn apply_vim_action(&mut self, action: VimAction, window: &mut Window, cx: &mut Context<Self>) {
+        match action {
+            VimAction::PassThrough | VimAction::Swallow | VimAction::Pending => {}
+            VimAction::ToInsert => {
+                self.vim_insert_snapshot = Some(self.vim_text(cx));
+                self.vim_anchor = None;
+                self.set_vim_mode(VimMode::Insert, cx);
+            }
+            VimAction::ToNormal => {
+                if let Some(old) = self.vim_insert_snapshot.take() {
+                    let new = self.vim_text(cx);
+                    if new != old {
+                        let prefix = common_prefix(&old, &new);
+                        let suffix = common_suffix(&old[prefix..], &new[prefix..]);
+                        let inserted = &new[prefix..new.len().saturating_sub(suffix)];
+                        if !inserted.is_empty() {
+                            self.record_change(RepeatableChange::Insert(inserted.to_string()));
+                        }
+                    }
+                }
+                self.vim_anchor = None;
+                self.set_vim_mode(VimMode::Normal, cx);
+            }
+            VimAction::ToVisual => {
+                let cursor = self.note_edit.read(cx).cursor();
+                self.vim_anchor = Some(cursor);
+                self.set_vim_mode(VimMode::Visual, cx);
+            }
+            VimAction::VisualExit => {
+                let cursor = self.note_edit.read(cx).cursor();
+                self.note_edit
+                    .update(cx, |s, cx| s.set_selected_range(cursor..cursor, cx));
+                self.vim_anchor = None;
+                self.set_vim_mode(VimMode::Normal, cx);
+            }
+            VimAction::Move { kind, count } => {
+                self.vim_move(kind, count, window, cx);
+                self.sync_visual_selection(cx);
+            }
+            VimAction::GotoLine(line) => {
+                let line = line.max(1) as u32 - 1;
+                let pos = Position::new(line, 0);
+                self.note_edit
+                    .update(cx, |s, cx| s.set_cursor_position(pos, window, cx));
+                self.sync_visual_selection(cx);
+            }
+            VimAction::DeleteChar(count) => {
+                let cursor = self.note_edit.read(cx).cursor();
+                let text = self.vim_text(cx);
+                let end = nth_char_boundary(&text, cursor, count.max(1));
+                self.vim_delete_range(
+                    cursor..end,
+                    false,
+                    RepeatableChange::DeleteChar(count.max(1)),
+                    window,
+                    cx,
+                );
+            }
+            VimAction::DeleteLines(count) => {
+                let cursor = self.note_edit.read(cx).cursor();
+                let text = self.vim_text(cx);
+                let (start, end) = vim::delete_line_range(&text, cursor, count);
+                self.vim_delete_range(
+                    start..end,
+                    true,
+                    RepeatableChange::DeleteLines(count),
+                    window,
+                    cx,
+                );
+            }
+            VimAction::YankLines(count) => {
+                let cursor = self.note_edit.read(cx).cursor();
+                let text = self.vim_text(cx);
+                self.vim_register = VimRegister {
+                    text: vim::yank_line_text(&text, cursor, count),
+                    linewise: true,
+                    set: true,
+                };
+            }
+            VimAction::DeleteWord(count) => {
+                let cursor = self.note_edit.read(cx).cursor();
+                let text = self.vim_text(cx);
+                let end = vim::word_forward_offset(&text, cursor, count);
+                self.vim_delete_range(
+                    cursor..end,
+                    false,
+                    RepeatableChange::DeleteWord(count),
+                    window,
+                    cx,
+                );
+            }
+            VimAction::DeleteToLineEnd(_) => {
+                let cursor = self.note_edit.read(cx).cursor();
+                let text = self.vim_text(cx);
+                let end = vim::line_end_offset(&text, cursor);
+                self.vim_delete_range(
+                    cursor..end,
+                    false,
+                    RepeatableChange::DeleteToLineEnd(1),
+                    window,
+                    cx,
+                );
+            }
+            VimAction::DeleteSelection => {
+                let range = self.note_edit.read(cx).selected_range();
+                let text = self.vim_text(cx);
+                if range.start < range.end && range.end <= text.len() {
+                    self.vim_register = VimRegister {
+                        text: text[range.clone()].to_string(),
+                        linewise: false,
+                        set: true,
+                    };
+                }
+                self.vim_anchor = None;
+                self.set_vim_mode(VimMode::Normal, cx);
+                if range.start < range.end {
+                    window.dispatch_action(Box::new(Delete), cx);
+                }
+            }
+            VimAction::YankSelection => {
+                let range = self.note_edit.read(cx).selected_range();
+                let text = self.vim_text(cx);
+                if range.start < range.end && range.end <= text.len() {
+                    self.vim_register = VimRegister {
+                        text: text[range.clone()].to_string(),
+                        linewise: false,
+                        set: true,
+                    };
+                }
+                let cursor = self.note_edit.read(cx).cursor();
+                self.note_edit
+                    .update(cx, |s, cx| s.set_selected_range(cursor..cursor, cx));
+                self.vim_anchor = None;
+                self.set_vim_mode(VimMode::Normal, cx);
+            }
+            VimAction::Paste { before, count } => self.vim_paste(before, count, window, cx),
             VimAction::Undo => window.dispatch_action(Box::new(Undo), cx),
             VimAction::Redo => window.dispatch_action(Box::new(Redo), cx),
             VimAction::InsertAfterCursor => {
                 window.dispatch_action(Box::new(MoveRight), cx);
-                self.state.update(cx, |s, _| s.vim_normal = false);
+                self.vim_insert_snapshot = Some(self.vim_text(cx));
+                self.set_vim_mode(VimMode::Insert, cx);
             }
             VimAction::InsertAtLineStart => {
                 window.dispatch_action(Box::new(MoveToStartOfLine), cx);
-                self.state.update(cx, |s, _| s.vim_normal = false);
+                self.vim_insert_snapshot = Some(self.vim_text(cx));
+                self.set_vim_mode(VimMode::Insert, cx);
             }
             VimAction::InsertAtLineEnd => {
                 window.dispatch_action(Box::new(MoveToEndOfLine), cx);
-                self.state.update(cx, |s, _| s.vim_normal = false);
+                self.vim_insert_snapshot = Some(self.vim_text(cx));
+                self.set_vim_mode(VimMode::Insert, cx);
             }
             VimAction::OpenLineBelow => {
                 window.dispatch_action(Box::new(MoveToEndOfLine), cx);
@@ -847,7 +1266,8 @@ impl NoteBrowser {
                     }),
                     cx,
                 );
-                self.state.update(cx, |s, _| s.vim_normal = false);
+                self.vim_insert_snapshot = Some(self.vim_text(cx));
+                self.set_vim_mode(VimMode::Insert, cx);
             }
             VimAction::OpenLineAbove => {
                 window.dispatch_action(Box::new(MoveToStartOfLine), cx);
@@ -860,13 +1280,106 @@ impl NoteBrowser {
                 );
                 window.dispatch_action(Box::new(MoveUp), cx);
                 window.dispatch_action(Box::new(MoveToEndOfLine), cx);
-                self.state.update(cx, |s, _| s.vim_normal = false);
+                self.vim_insert_snapshot = Some(self.vim_text(cx));
+                self.set_vim_mode(VimMode::Insert, cx);
             }
-            VimAction::Save => self.state.update(cx, |s, _| {
-                s.save_edit();
-            }),
+            VimAction::Save => {
+                self.state.update(cx, |s, _| {
+                    s.save_edit();
+                });
+            }
+            VimAction::FinishEdit => self.finish_edit(window, cx),
+            VimAction::Search { query, backward } => {
+                let cursor = self.note_edit.read(cx).cursor();
+                self.vim_search(&query, backward, cursor, cx);
+                self.vim_last_search = Some((query, backward));
+            }
+            VimAction::SearchNext { backward } => {
+                if let Some((query, previous_backward)) = self.vim_last_search.clone() {
+                    let direction = if backward {
+                        !previous_backward
+                    } else {
+                        previous_backward
+                    };
+                    let cursor = self.note_edit.read(cx).cursor();
+                    let from = if direction {
+                        cursor.saturating_sub(1)
+                    } else {
+                        cursor.saturating_add(1)
+                    };
+                    self.vim_search(&query, direction, from, cx);
+                }
+            }
+            VimAction::Substitute(spec) => self.vim_substitute(spec, window, cx),
+            VimAction::Repeat => {
+                if let Some(change) = self.vim_last_change.clone() {
+                    match change {
+                        RepeatableChange::DeleteChar(count) => {
+                            self.apply_vim_action(VimAction::DeleteChar(count), window, cx)
+                        }
+                        RepeatableChange::DeleteLines(count) => {
+                            self.apply_vim_action(VimAction::DeleteLines(count), window, cx)
+                        }
+                        RepeatableChange::DeleteWord(count) => {
+                            self.apply_vim_action(VimAction::DeleteWord(count), window, cx)
+                        }
+                        RepeatableChange::DeleteToLineEnd(count) => {
+                            self.apply_vim_action(VimAction::DeleteToLineEnd(count), window, cx)
+                        }
+                        RepeatableChange::Paste { before, count } => {
+                            self.apply_vim_action(VimAction::Paste { before, count }, window, cx)
+                        }
+                        RepeatableChange::Insert(text) => {
+                            let insert_at = self.note_edit.read(cx).cursor();
+                            self.note_edit.update(cx, |s, cx| {
+                                s.set_selected_range(insert_at..insert_at, cx);
+                                s.insert(text, window, cx);
+                            });
+                        }
+                    }
+                }
+            }
+            VimAction::Error(message) => {
+                self.state
+                    .update(cx, |s, _| s.set_status(format!("vim: {message}")));
+            }
         }
-        cx.notify();
+    }
+
+    /// Capture where the editor was scrolled, then leave edit mode. Called by
+    /// the toolbar button, ⌘E, `:q`, `:wq` and `ZZ`.
+    fn finish_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.state.read(cx).editing {
+            return;
+        }
+        self.capture_preview_ratio(cx);
+        self.state.update(cx, |s, _| s.end_edit());
+        self.vim_anchor = None;
+        self.vim_insert_snapshot = None;
+        self.refocus_after_editor_closed(window, cx);
+    }
+
+    /// Record the source-line ratio at the top of the editor viewport so the
+    /// tick can scroll the preview to the same place once it is laid out.
+    fn capture_preview_ratio(&mut self, cx: &mut Context<Self>) {
+        let note_id = self.state.read(cx).selected_note.clone();
+        let st = self.note_edit.read(cx);
+        let Some((caret, line_height)) = st.cursor_layout() else {
+            return;
+        };
+        let input = st.input_bounds();
+        let line_height = f32::from(line_height);
+        if line_height <= 0.0 {
+            return;
+        }
+        let total_lines = st.text().to_string().lines().count().max(1);
+        let cursor_line = st.cursor_position().line as f32;
+        let caret_top = f32::from(caret.top() - input.top());
+        let top_line = (cursor_line - caret_top / line_height).max(0.0);
+        let ratio = (top_line / (total_lines.saturating_sub(1)).max(1) as f32).clamp(0.0, 1.0);
+        self.pending_preview_ratio = Some(ratio);
+        self.preview_note = note_id;
+        self.preview_retry = 0;
     }
 
     /// Unlock the gated note from the password in `gate_input`. On failure
@@ -2306,7 +2819,8 @@ impl NoteBrowser {
         let body = state.note_body.clone();
         let editing = state.editing;
         let vim_mode = state.config.vim_mode;
-        let vim_normal = state.vim_normal;
+        let vim_state = state.vim_mode;
+        let vim_pending = state.vim_pending.clone();
         let resource_dir = state.resource_dir.clone();
 
         div()
@@ -2344,11 +2858,19 @@ impl NoteBrowser {
                             .gap_2()
                             .flex_shrink_0()
                             .when(editing && vim_mode, |el| {
+                                let badge = if vim_pending.is_empty() {
+                                    vim_state.label().to_string()
+                                } else {
+                                    vim_pending.clone()
+                                };
                                 el.child(
                                     div()
                                         .text_size(px(11.))
                                         .text_color(theme.muted_foreground)
-                                        .child(if vim_normal { "NORMAL" } else { "INSERT" }),
+                                        .when(vim_state != VimMode::Insert, |el| {
+                                            el.bg(theme.muted).px_1().rounded(px(3.))
+                                        })
+                                        .child(SharedString::from(badge)),
                                 )
                             })
                             .child(
@@ -2358,15 +2880,10 @@ impl NoteBrowser {
                                     .label(if editing { "预览" } else { "编辑" })
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         let was_editing = this.state.read(cx).editing;
-                                        this.state.update(cx, |s, _| {
-                                            if s.editing {
-                                                s.end_edit();
-                                            } else {
-                                                s.begin_edit();
-                                            }
-                                        });
                                         if was_editing {
-                                            this.refocus_after_editor_closed(window, cx);
+                                            this.finish_edit(window, cx);
+                                        } else {
+                                            this.state.update(cx, |s, _| s.begin_edit());
                                         }
                                         cx.notify();
                                     })),
@@ -2378,9 +2895,16 @@ impl NoteBrowser {
                     .id("note-editor")
                     .flex_1()
                     .min_h_0()
+                    .relative()
                     .px_4()
                     .py_3()
-                    .child(Textarea::new(&self.note_edit).h(relative(1.)));
+                    .child(Textarea::new(&self.note_edit).h(relative(1.)))
+                    .child(vim_cursor_overlay(
+                        self.note_edit.clone(),
+                        vim_state,
+                        theme.primary.opacity(0.30),
+                        theme.selection,
+                    ));
                 if vim_mode {
                     editor
                         .capture_key_down(cx.listener(Self::editor_key))
@@ -2394,6 +2918,7 @@ impl NoteBrowser {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
+                    .track_scroll(&self.preview_scroll)
                     .px_4()
                     .py_3()
                     .child(render_markdown(&body, &resource_dir))
@@ -2401,6 +2926,82 @@ impl NoteBrowser {
             })
             .into_any_element()
     }
+}
+
+/// Length of the byte prefix shared by `a` and `b`, kept on a char boundary.
+fn common_prefix(a: &str, b: &str) -> usize {
+    let (ab, bb) = (a.as_bytes(), b.as_bytes());
+    let mut i = 0;
+    while i < ab.len() && i < bb.len() && ab[i] == bb[i] {
+        i += 1;
+    }
+    while i > 0 && (!a.is_char_boundary(i) || !b.is_char_boundary(i)) {
+        i -= 1;
+    }
+    i
+}
+
+/// Length of the byte suffix shared by `a` and `b`, kept on a char boundary.
+fn common_suffix(a: &str, b: &str) -> usize {
+    let (ab, bb) = (a.as_bytes(), b.as_bytes());
+    let mut n = 0;
+    while n < ab.len() && n < bb.len() && ab[ab.len() - 1 - n] == bb[bb.len() - 1 - n] {
+        n += 1;
+    }
+    while n > 0 && (!a.is_char_boundary(a.len() - n) || !b.is_char_boundary(b.len() - n)) {
+        n -= 1;
+    }
+    n
+}
+
+/// Byte offset `count` characters after `from` (clamped to the text length).
+fn nth_char_boundary(text: &str, from: usize, count: usize) -> usize {
+    let from = from.min(text.len());
+    let mut end = from;
+    for (i, c) in text[from..].char_indices().take(count) {
+        end = from + i + c.len_utf8();
+    }
+    end.min(text.len())
+}
+
+/// Block cursor drawn over the textarea in Normal/Visual mode. gpui's native
+/// caret is always a thin bar, so this overlay supplies the mode distinction:
+/// Normal uses the theme primary tint, Visual the selection color, Insert
+/// draws nothing and keeps the native bar.
+fn vim_cursor_overlay(
+    state: Entity<TextareaState>,
+    mode: VimMode,
+    normal_color: gpui_kit::Hsla,
+    visual_color: gpui_kit::Hsla,
+) -> impl IntoElement {
+    let color = if mode == VimMode::Visual {
+        visual_color
+    } else {
+        normal_color
+    };
+    let show = mode != VimMode::Insert;
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, cx| {
+            if !show {
+                return;
+            }
+            let Some((caret, line_height)) = state.read(cx).cursor_layout() else {
+                return;
+            };
+            if line_height <= px(0.) {
+                return;
+            }
+            let origin = point(
+                caret.origin.x - bounds.origin.x,
+                caret.origin.y - bounds.origin.y,
+            );
+            let rect = Bounds::new(origin, Size::new(line_height * 0.55, line_height));
+            window.paint_quad(gpui_kit::fill(rect, color));
+        },
+    )
+    .absolute()
+    .inset_0()
 }
 
 /// One boolean setting exposed in the settings dialog.
@@ -2774,5 +3375,24 @@ mod tests {
         assert_eq!(first_family_name(b""), None);
         // ttcf header truncated before the member offset.
         assert_eq!(first_family_name(b"ttcf\x00\x01\x00\x00"), None);
+    }
+
+    #[test]
+    fn insert_diff_helpers_recover_typed_text() {
+        assert_eq!(common_prefix("abX", "abY"), 2);
+        assert_eq!(common_suffix("Xcd", "Ycd"), 2);
+        // Inserted text is what lies between the shared prefix and suffix.
+        let old = "hello world";
+        let new = "hello brave world";
+        let prefix = common_prefix(old, new);
+        let suffix = common_suffix(&old[prefix..], &new[prefix..]);
+        assert_eq!(&new[prefix..new.len() - suffix], "brave ");
+
+        // Multi-byte text never splits a character boundary.
+        assert_eq!(common_prefix("你好", "你坏"), "你".len());
+        assert_eq!(common_suffix("你好", "很好"), "好".len());
+        assert_eq!(nth_char_boundary("你好世界", 0, 2), "你好".len());
+        assert_eq!(nth_char_boundary("你好世界", "你".len(), 1), "你好".len());
+        assert_eq!(nth_char_boundary("abc", 1, 99), 3);
     }
 }
