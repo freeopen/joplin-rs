@@ -1553,6 +1553,17 @@ pub fn block_insert_offsets(text: &str, anchor: usize, cursor: usize, append: bo
     out
 }
 
+/// Apply blockwise `c`: remove the block and return the new text, the cursor
+/// at the block's top-left, and one insertion offset per affected line.
+pub fn block_change(text: &str, anchor: usize, cursor: usize) -> (String, usize, Vec<usize>) {
+    let selection = block_selection(text, anchor, cursor);
+    let (new_text, new_cursor) = block_delete(text, anchor, cursor);
+    let offsets = (selection.top_line..=selection.bottom_line)
+        .map(|line| offset_for_display_col(&new_text, line, selection.left_col))
+        .collect();
+    (new_text, new_cursor, offsets)
+}
+
 /// All matches a substitute command should replace, as absolute byte ranges
 /// with their replacement, in document order.
 pub fn substitute_matches(text: &str, spec: &SubSpec) -> Vec<(std::ops::Range<usize>, String)> {
@@ -2224,6 +2235,16 @@ mod tests {
             vec![0, 4]
         );
         assert_eq!(block_insert_offsets(text, anchor, cursor, true), vec![2, 6]);
+    }
+
+    #[test]
+    fn block_change_returns_replacement_offsets() {
+        let text = "abcdef\nabcdef\n";
+        let cursor = offset_for_display_col(text, 1, 1);
+        let (new_text, new_cursor, offsets) = block_change(text, 0, cursor);
+        assert_eq!(new_text, "cdef\ncdef\n");
+        assert_eq!(new_cursor, 0);
+        assert_eq!(offsets, vec![0, 5]);
     }
 
     #[test]

@@ -1510,23 +1510,14 @@ impl NoteBrowser {
         if mode != VimMode::VisualBlock {
             return;
         }
-        let selection = vim::block_selection(&text, anchor, cursor);
-        let first = selection.top_line;
-        let last = selection.bottom_line;
-        let left = selection.left_col;
         self.vim_register = VimRegister {
             text: vim::block_text(&text, anchor, cursor),
             linewise: false,
             blockwise: true,
             set: true,
         };
-        let (new_text, new_cursor) = vim::block_delete(&text, anchor, cursor);
+        let (new_text, new_cursor, offsets) = vim::block_change(&text, anchor, cursor);
         self.replace_document(new_text, new_cursor, window, cx);
-
-        let text = self.vim_text(cx);
-        let offsets: Vec<usize> = (first..=last)
-            .map(|line| vim::offset_for_display_col(&text, line, left))
-            .collect();
         self.begin_block_multicursor(&offsets, cx);
     }
 
