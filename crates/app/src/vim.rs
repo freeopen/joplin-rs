@@ -1741,6 +1741,50 @@ mod tests {
     }
 
     #[test]
+    fn normal_mode_is_case_sensitive() {
+        let mut p = String::new();
+        assert_eq!(norm(&mut p, "i"), ToInsert);
+        assert_eq!(norm(&mut p, "I"), InsertAtLineStart);
+        assert_eq!(norm(&mut p, "a"), InsertAfterCursor);
+        assert_eq!(norm(&mut p, "A"), InsertAtLineEnd);
+        assert_eq!(norm(&mut p, "o"), OpenLineBelow);
+        assert_eq!(norm(&mut p, "O"), OpenLineAbove);
+        assert_eq!(
+            norm(&mut p, "p"),
+            Paste {
+                before: false,
+                count: 1
+            }
+        );
+        assert_eq!(
+            norm(&mut p, "P"),
+            Paste {
+                before: true,
+                count: 1
+            }
+        );
+        assert_eq!(norm(&mut p, "v"), ToVisual);
+        assert_eq!(norm(&mut p, "V"), ToVisualLine);
+        assert_eq!(norm(&mut p, "g"), Pending);
+        assert_eq!(
+            norm(&mut p, "g"),
+            Move {
+                kind: MoveKind::DocStart,
+                count: 1
+            }
+        );
+        assert_eq!(
+            norm(&mut p, "G"),
+            Move {
+                kind: MoveKind::DocEnd,
+                count: 1
+            }
+        );
+        assert_eq!(translate(VimMode::Normal, &mut p, "v", true), ToVisualBlock);
+        assert_eq!(translate(VimMode::Normal, &mut p, "q", true), ToVisualBlock);
+    }
+
+    #[test]
     fn page_motions() {
         let mut p = String::new();
         assert_eq!(

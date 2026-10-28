@@ -3660,7 +3660,11 @@ fn vim_cursor_overlay(
             let state = state.read(cx);
             for range in &block_ranges {
                 if let Some(block) = state.range_to_bounds(range) {
-                    let width = if block.size.width > px(0.) {
+                    let width = if mode == VimMode::VisualLine {
+                        // Vim's linewise highlight covers the whole row, not
+                        // only the glyphs on it.
+                        (state.input_bounds().right() - block.origin.x).max(block.size.width)
+                    } else if block.size.width > px(0.) {
                         block.size.width
                     } else {
                         block.size.height * 0.55
@@ -3693,6 +3697,17 @@ fn vim_cursor_overlay(
                 }
             };
             let width = caret_cell_width(&state, cursor, base.size.height);
+            // A full line-height block looks like it spans two rows on an
+            // empty line. Use the native caret height, centered in the cell.
+            let caret_height = state
+                .cursor_layout()
+                .map(|(caret, _)| caret.size.height)
+                .unwrap_or(base.size.height);
+            let top = base.origin.y + (base.size.height - caret_height) / 2.;
+            let base = Bounds::new(
+                point(base.origin.x, top),
+                Size::new(base.size.width, caret_height),
+            );
             let rect = block_caret_bounds(base, scroll_y, width);
             window.paint_quad(gpui_kit::fill(rect, caret_color));
         },
