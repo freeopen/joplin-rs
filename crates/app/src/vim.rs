@@ -6,14 +6,15 @@
 //! textarea and performs the action (dispatching gpui movement actions,
 //! editing the rope, saving, ...).
 //!
-//! Supported: Normal/Insert/Visual/Visual Block modes, motions `h j k l w b 0 $ gg G`,
+//! Supported: Normal/Insert/Visual/Visual Line/Visual Block modes, motions
+//! `h j k l w b 0 $ gg G`,
 //! `Ctrl-f/b/d/u`, counts (`3j`, `12G`, `2dd`, `3x`, `d2w`), operators `x dd
 //! yy dw d$`, `p P`, `u`/`Ctrl-r`, `i a I A o O`, `.`, `/word ?word n N`,
 //! `:w :q :wq :x`, `ZZ` and `:%s/old/new/g` / `:n1,n2s/old/new/g` /
-//! `:s/old/new[/g]`. Visual Block (`Ctrl-v`) supports rectangular `d`/`y`/`p`
-//! with display-width columns (CJK = 2). Text objects, macros, named
-//! registers, marks, `f/t`, `J`, `>>/<<`, and visual line mode are out of
-//! scope.
+//! `:s/old/new[/g]`. Visual modes support `d y c > < ~ o`, `gv`, text objects
+//! `iw aw ip ap`, `:'<,'>s`, `:'<,'>sort[!]`, and block `I A c O` (display-width
+//! columns, CJK = 2). Macros, named registers, marks, `f/t`, `J`, and `>>/<<`
+//! are out of scope.
 
 use unicode_width::UnicodeWidthChar;
 
@@ -24,6 +25,7 @@ pub enum VimMode {
     Normal,
     Insert,
     Visual,
+    VisualLine,
     VisualBlock,
 }
 
@@ -34,8 +36,19 @@ impl VimMode {
             VimMode::Normal => "NORMAL",
             VimMode::Insert => "INSERT",
             VimMode::Visual => "VISUAL",
+            VimMode::VisualLine => "V-LINE",
             VimMode::VisualBlock => "V-BLOCK",
         }
+    }
+}
+
+impl VimMode {
+    /// True for `v`, `V` and `Ctrl-v`.
+    pub fn is_visual(self) -> bool {
+        matches!(
+            self,
+            VimMode::Visual | VimMode::VisualLine | VimMode::VisualBlock
+        )
     }
 }
 
@@ -58,6 +71,13 @@ pub enum MoveKind {
     HalfPageUp,
 }
 
+/// Visual-mode text objects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextObjectKind {
+    Word,
+    Paragraph,
+}
+
 /// Parsed `:s` command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubSpec {
@@ -72,6 +92,8 @@ pub struct SubSpec {
     pub replacement: String,
     /// `g` flag: replace every occurrence per line, not just the first.
     pub global: bool,
+    /// `:'<,'>s` prefix: the range comes from the active visual selection.
+    pub selection_range: bool,
 }
 
 /// What the view should do with one translated keystroke.
@@ -87,6 +109,8 @@ pub enum VimAction {
     ToNormal,
     /// Start Visual mode (`v`).
     ToVisual,
+    /// Start linewise Visual mode (`V`).
+    ToVisualLine,
     /// Start blockwise Visual mode (`Ctrl-v`).
     ToVisualBlock,
     /// Leave Visual mode and collapse the selection (`Esc` / `v`).
@@ -108,14 +132,40 @@ pub enum VimAction {
     DeleteWord(usize),
     /// `d$` - delete to the end of the line.
     DeleteToLineEnd(usize),
-    /// Visual-mode `d`.
+    /// Visual-mode `d` (char, line or block).
     DeleteSelection,
-    /// Blockwise Visual-mode `d`.
-    DeleteBlock,
-    /// Visual-mode `y`.
+    /// Visual-mode `y` (char, line or block).
     YankSelection,
-    /// Blockwise Visual-mode `y`.
-    YankBlock,
+    /// Visual-mode `c`: delete the selection and enter Insert.
+    ChangeSelection,
+    /// Visual-mode `>` / `<`.
+    IndentSelection {
+        increase: bool,
+        count: usize,
+    },
+    /// Visual-mode `~`.
+    ToggleCaseSelection,
+    /// Visual-mode `o` (char/line) or block corner swap.
+    ToggleVisualEnd,
+    /// Blockwise `O`: other corner on the same line.
+    ToggleBlockCorner,
+    /// Blockwise `I` / `A`: multi-cursor insert at each selected line.
+    BlockInsert {
+        append: bool,
+    },
+    /// Blockwise `c`: delete the block, then multi-cursor insert.
+    BlockChange,
+    /// Visual text object (`iw`, `ip`, `aw`, `ap`).
+    SelectTextObject {
+        kind: TextObjectKind,
+        around: bool,
+    },
+    /// `gv`: restore the last visual selection.
+    ReselectVisual,
+    /// `:'<,'>sort` / `:'<,'>sort!`.
+    SortSelection {
+        descending: bool,
+    },
     /// `p` / `P`, repeated `count` times.
     Paste {
         before: bool,
@@ -307,7 +357,7 @@ pub fn translate(mode: VimMode, pending: &mut String, key: &str, ctrl: bool) -> 
                 kind: MoveKind::HalfPageUp,
                 count: 1,
             },
-            "v" => match mode {
+            "v" | "q" => match mode {
                 VimMode::VisualBlock => VisualExit,
                 _ => ToVisualBlock,
             },
@@ -317,7 +367,7 @@ pub fn translate(mode: VimMode, pending: &mut String, key: &str, ctrl: bool) -> 
 
     if key == "escape" {
         pending.clear();
-        return if matches!(mode, VimMode::Visual | VimMode::VisualBlock) {
+        return if mode.is_visual() {
             VisualExit
         } else {
             Swallow
@@ -328,6 +378,30 @@ pub fn translate(mode: VimMode, pending: &mut String, key: &str, ctrl: bool) -> 
         pending.clear();
         return Swallow;
     };
+
+    // Visual text objects: `i`/`a` followed by `w` or `p`.
+    if mode.is_visual() {
+        if pending == "i" || pending == "a" {
+            let around = pending == "a";
+            pending.clear();
+            return match ch {
+                'w' => SelectTextObject {
+                    kind: TextObjectKind::Word,
+                    around,
+                },
+                'p' => SelectTextObject {
+                    kind: TextObjectKind::Paragraph,
+                    around,
+                },
+                _ => Swallow,
+            };
+        }
+        if ch == 'i' || ch == 'a' {
+            pending.clear();
+            pending.push(ch);
+            return Pending;
+        }
+    }
 
     // `g` prefix: `gg` + optional count; any other follower cancels.
     if pending.ends_with('g') {
@@ -344,6 +418,8 @@ pub fn translate(mode: VimMode, pending: &mut String, key: &str, ctrl: bool) -> 
                     count: 1,
                 }
             }
+        } else if ch == 'v' {
+            ReselectVisual
         } else {
             Swallow
         };
@@ -493,6 +569,26 @@ pub fn translate(mode: VimMode, pending: &mut String, key: &str, ctrl: bool) -> 
                 ToVisual
             }
         }
+        'V' => {
+            pending.clear();
+            if mode == VimMode::VisualLine {
+                VisualExit
+            } else {
+                ToVisualLine
+            }
+        }
+        '>' | '<' | '~' => {
+            let count = pending_count(pending);
+            pending.clear();
+            if ch == '~' {
+                ToggleCaseSelection
+            } else {
+                IndentSelection {
+                    increase: ch == '>',
+                    count,
+                }
+            }
+        }
         'n' => {
             pending.clear();
             SearchNext { backward: false }
@@ -512,7 +608,11 @@ pub fn translate(mode: VimMode, pending: &mut String, key: &str, ctrl: bool) -> 
         }
         ':' => {
             pending.clear();
-            pending.push(':');
+            if mode.is_visual() {
+                pending.push_str(":'<,'>");
+            } else {
+                pending.push(':');
+            }
             Pending
         }
         _ => {
@@ -521,28 +621,56 @@ pub fn translate(mode: VimMode, pending: &mut String, key: &str, ctrl: bool) -> 
         }
     };
     // Visual modes edit the selection instead of a motion target.
-    let block = mode == VimMode::VisualBlock;
-    if mode != VimMode::Visual && !block {
+    if !mode.is_visual() {
         return action;
     }
+    let block = mode == VimMode::VisualBlock;
     match ch {
         'd' => {
             pending.clear();
-            if block {
-                VimAction::DeleteBlock
-            } else {
-                VimAction::DeleteSelection
-            }
+            VimAction::DeleteSelection
         }
         'y' => {
             pending.clear();
+            VimAction::YankSelection
+        }
+        'c' => {
+            pending.clear();
             if block {
-                VimAction::YankBlock
+                VimAction::BlockChange
             } else {
-                VimAction::YankSelection
+                VimAction::ChangeSelection
             }
         }
-        'i' | 'a' | 'I' | 'A' | 'o' | 'O' | 'p' | 'P' | 'x' | 'c' => VimAction::Swallow,
+        'o' => {
+            pending.clear();
+            VimAction::ToggleVisualEnd
+        }
+        'O' => {
+            pending.clear();
+            if block {
+                VimAction::ToggleBlockCorner
+            } else {
+                VimAction::Swallow
+            }
+        }
+        'I' => {
+            pending.clear();
+            if block {
+                VimAction::BlockInsert { append: false }
+            } else {
+                VimAction::Swallow
+            }
+        }
+        'A' => {
+            pending.clear();
+            if block {
+                VimAction::BlockInsert { append: true }
+            } else {
+                VimAction::Swallow
+            }
+        }
+        'p' | 'P' | 'x' => VimAction::Swallow,
         _ => action,
     }
 }
@@ -550,15 +678,24 @@ pub fn translate(mode: VimMode, pending: &mut String, key: &str, ctrl: bool) -> 
 /// Parse a complete `:...` command line.
 pub fn parse_command(cmd: &str) -> VimAction {
     let body = cmd.trim_start_matches(':').trim();
+    let (selection_range, body) = match body.strip_prefix("'<,'>") {
+        Some(rest) => (true, rest.trim()),
+        None => (false, body),
+    };
     match body {
         "" => return VimAction::Swallow,
         "w" | "w!" => return VimAction::Save,
         "q" | "wq" | "wq!" | "x" => return VimAction::FinishEdit,
+        "sort" => return VimAction::SortSelection { descending: false },
+        "sort!" => return VimAction::SortSelection { descending: true },
         _ => {}
     }
     if body.starts_with('s') || body.contains('s') {
         match parse_substitute(body) {
-            Ok(spec) => VimAction::Substitute(spec),
+            Ok(mut spec) => {
+                spec.selection_range = selection_range;
+                VimAction::Substitute(spec)
+            }
             Err(msg) => VimAction::Error(msg),
         }
     } else {
@@ -626,6 +763,7 @@ pub fn parse_substitute(body: &str) -> Result<SubSpec, String> {
         pattern,
         replacement,
         global: flags == "g",
+        selection_range: false,
     })
 }
 
@@ -1062,6 +1200,359 @@ pub fn block_move(text: &str, cursor: usize, kind: MoveKind, count: usize) -> us
     }
 }
 
+// ---- Visual selection ranges --------------------------------------------
+
+/// Indentation unit used by visual `>` / `<`.
+pub const INDENT: &str = "    ";
+
+fn next_char_boundary(text: &str, offset: usize) -> usize {
+    if offset >= text.len() {
+        return text.len();
+    }
+    let Some(c) = text[offset..].chars().next() else {
+        return text.len();
+    };
+    offset + c.len_utf8()
+}
+
+/// Inclusive charwise operation range (Vim includes the cursor character).
+pub fn charwise_range(text: &str, anchor: usize, cursor: usize) -> std::ops::Range<usize> {
+    let start = anchor.min(cursor).min(text.len());
+    let end = next_char_boundary(text, anchor.max(cursor).min(text.len()));
+    start..end
+}
+
+/// Per-line highlight ranges for a charwise selection.
+pub fn charwise_ranges(text: &str, anchor: usize, cursor: usize) -> Vec<std::ops::Range<usize>> {
+    let range = charwise_range(text, anchor, cursor);
+    let (first, _) = offset_to_line_display_col(text, range.start);
+    let (last, _) = offset_to_line_display_col(text, range.end.saturating_sub(1));
+    let starts = line_starts(text);
+    let mut out = Vec::new();
+    for line in first..=last {
+        let Some(&line_start) = starts.get(line) else {
+            break;
+        };
+        let line_end = line_end_offset(text, line_start);
+        let start = range.start.max(line_start);
+        let end = range.end.min(line_end);
+        if start < end {
+            out.push(start..end);
+        }
+    }
+    out
+}
+
+/// Whole-line operation range, including the final newline when present.
+pub fn linewise_range(text: &str, anchor: usize, cursor: usize) -> std::ops::Range<usize> {
+    let (first, _) = offset_to_line_display_col(text, anchor);
+    let (last, _) = offset_to_line_display_col(text, cursor);
+    let starts = line_starts(text);
+    let start = starts.get(first.min(last)).copied().unwrap_or(0);
+    let last_line_start = starts.get(first.max(last)).copied().unwrap_or(text.len());
+    let last_end = line_end_offset(text, last_line_start);
+    let end = if last_end < text.len() {
+        last_end + 1
+    } else {
+        text.len()
+    };
+    start..end
+}
+
+/// Per-line highlight ranges for a linewise selection.
+pub fn linewise_ranges(text: &str, anchor: usize, cursor: usize) -> Vec<std::ops::Range<usize>> {
+    let (first, _) = offset_to_line_display_col(text, anchor);
+    let (last, _) = offset_to_line_display_col(text, cursor);
+    let starts = line_starts(text);
+    let mut out = Vec::new();
+    for line in first.min(last)..=first.max(last) {
+        let Some(&start) = starts.get(line) else {
+            break;
+        };
+        let end = line_end_offset(text, start);
+        if start < end {
+            out.push(start..end);
+        } else {
+            // Keep empty lines in the selection; the overlay paints a small
+            // marker for a zero-width range.
+            out.push(start..start);
+        }
+    }
+    out
+}
+
+/// Highlight ranges for the active visual mode.
+pub fn visual_ranges(
+    mode: VimMode,
+    text: &str,
+    anchor: usize,
+    cursor: usize,
+) -> Vec<std::ops::Range<usize>> {
+    match mode {
+        VimMode::Visual => charwise_ranges(text, anchor, cursor),
+        VimMode::VisualLine => linewise_ranges(text, anchor, cursor),
+        VimMode::VisualBlock => block_ranges(text, anchor, cursor),
+        _ => Vec::new(),
+    }
+}
+
+// ---- Text objects --------------------------------------------------------
+
+fn char_class(c: char) -> u8 {
+    if c.is_alphanumeric() || c == '_' {
+        0
+    } else if c.is_whitespace() {
+        1
+    } else {
+        2
+    }
+}
+
+/// `iw`: word/punctuation/whitespace run under the cursor, within one line.
+pub fn inner_word_range(text: &str, cursor: usize) -> std::ops::Range<usize> {
+    let line_start = line_start_offset(text, cursor);
+    let line_end = line_end_offset(text, cursor);
+    let mut at = cursor.min(line_end);
+    if at >= line_end && at > line_start {
+        at = prev_char(text, at).0;
+    }
+    let Some(ch) = text[at..line_end].chars().next() else {
+        return at..at;
+    };
+    let class = char_class(ch);
+    let mut start = at;
+    while start > line_start {
+        let (previous, c) = prev_char(text, start);
+        if char_class(c) == class {
+            start = previous;
+        } else {
+            break;
+        }
+    }
+    let mut end = at + ch.len_utf8();
+    while end < line_end {
+        let Some(c) = text[end..line_end].chars().next() else {
+            break;
+        };
+        if char_class(c) == class {
+            end += c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    start..end
+}
+
+/// `aw`: inner word plus trailing whitespace, falling back to leading.
+pub fn word_object_range(text: &str, cursor: usize, around: bool) -> std::ops::Range<usize> {
+    let inner = inner_word_range(text, cursor);
+    if !around || inner.is_empty() {
+        return inner;
+    }
+    let line_start = line_start_offset(text, inner.start);
+    let line_end = line_end_offset(text, inner.start);
+    let mut end = inner.end;
+    while end < line_end {
+        let Some(c) = text[end..line_end].chars().next() else {
+            break;
+        };
+        if c.is_whitespace() {
+            end += c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if end > inner.end {
+        return inner.start..end;
+    }
+    let mut start = inner.start;
+    while start > line_start {
+        let (previous, c) = prev_char(text, start);
+        if c.is_whitespace() {
+            start = previous;
+        } else {
+            break;
+        }
+    }
+    start..inner.end
+}
+
+fn line_is_blank(text: &str, line: usize) -> bool {
+    let starts = line_starts(text);
+    let Some(&start) = starts.get(line) else {
+        return true;
+    };
+    text[start..line_end_offset(text, start)].trim().is_empty()
+}
+
+/// `ip`: contiguous non-blank paragraph around the cursor, or the contiguous
+/// blank-line block when the cursor sits on a blank line.
+pub fn paragraph_range(text: &str, cursor: usize) -> std::ops::Range<usize> {
+    let (line, _) = offset_to_line_display_col(text, cursor);
+    let starts = line_starts(text);
+    let total = starts.len();
+    if total == 0 {
+        return 0..0;
+    }
+    let blank = line_is_blank(text, line);
+    let mut first = line;
+    while first > 0 && line_is_blank(text, first - 1) == blank {
+        first -= 1;
+    }
+    let mut last = line;
+    while last + 1 < total && line_is_blank(text, last + 1) == blank {
+        last += 1;
+    }
+    let start = starts[first];
+    let end = line_end_offset(text, starts[last]);
+    start..end
+}
+
+/// `ap`: paragraph plus one following blank line (or one preceding when no
+/// following blank line exists).
+pub fn paragraph_object_range(text: &str, cursor: usize, around: bool) -> std::ops::Range<usize> {
+    let inner = paragraph_range(text, cursor);
+    if !around || inner.is_empty() {
+        return inner;
+    }
+    let starts = line_starts(text);
+    let (last, _) = offset_to_line_display_col(text, inner.end.saturating_sub(1));
+    if last + 1 < starts.len() && line_is_blank(text, last + 1) {
+        let end = line_end_offset(text, starts[last + 1]);
+        return inner.start..end;
+    }
+    let (first, _) = offset_to_line_display_col(text, inner.start);
+    if first > 0 && line_is_blank(text, first - 1) {
+        return starts[first - 1]..inner.end;
+    }
+    inner
+}
+
+// ---- Visual operators ----------------------------------------------------
+
+fn split_ending(line: &str) -> (&str, &str) {
+    if let Some(content) = line.strip_suffix("\r\n") {
+        (content, "\r\n")
+    } else if let Some(content) = line.strip_suffix('\n') {
+        (content, "\n")
+    } else {
+        (line, "")
+    }
+}
+
+/// Add or remove `levels` indentation units on lines `first..=last`.
+pub fn indent_lines(
+    text: &str,
+    first: usize,
+    last: usize,
+    increase: bool,
+    levels: usize,
+) -> String {
+    let levels = levels.max(1);
+    let mut out = String::with_capacity(text.len() + levels * first.max(last) * 4);
+    for (line, part) in text.split_inclusive('\n').enumerate() {
+        if line < first || line > last {
+            out.push_str(part);
+            continue;
+        }
+        let (content, ending) = split_ending(part);
+        if increase {
+            for _ in 0..levels {
+                out.push_str(INDENT);
+            }
+            out.push_str(content);
+        } else {
+            let mut rest = content;
+            for _ in 0..levels {
+                if let Some(stripped) = rest.strip_prefix(INDENT) {
+                    rest = stripped;
+                } else if let Some(stripped) = rest.strip_prefix('\t') {
+                    rest = stripped;
+                } else {
+                    let spaces = rest.chars().take_while(|c| *c == ' ').count().min(4);
+                    rest = &rest[spaces..];
+                }
+            }
+            out.push_str(rest);
+        }
+        out.push_str(ending);
+    }
+    out
+}
+
+fn toggle_case_str(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_lowercase() {
+            out.extend(c.to_uppercase());
+        } else if c.is_uppercase() {
+            out.extend(c.to_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Toggle case in each range, back-to-front so offsets stay valid.
+pub fn toggle_case_ranges(text: &str, ranges: &[std::ops::Range<usize>]) -> String {
+    let mut out = text.to_string();
+    for range in ranges.iter().rev() {
+        if range.start >= range.end || range.end > out.len() {
+            continue;
+        }
+        let replacement = toggle_case_str(&out[range.clone()]);
+        out.replace_range(range.clone(), &replacement);
+    }
+    out
+}
+
+/// Stable sort of lines `first..=last`, preserving the document's newlines.
+pub fn sort_line_range(text: &str, first: usize, last: usize, descending: bool) -> String {
+    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut parts: Vec<String> = text
+        .split('\n')
+        .map(|part| part.strip_suffix('\r').unwrap_or(part).to_string())
+        .collect();
+    let last = last.min(parts.len().saturating_sub(1));
+    if first > last {
+        return text.to_string();
+    }
+    let mut slice: Vec<String> = parts[first..=last].to_vec();
+    slice.sort();
+    if descending {
+        slice.reverse();
+    }
+    parts.splice(first..=last, slice);
+    parts.join(newline)
+}
+
+/// Per-line insertion offsets for blockwise `I` (append=false) / `A`.
+pub fn block_insert_offsets(text: &str, anchor: usize, cursor: usize, append: bool) -> Vec<usize> {
+    let selection = block_selection(text, anchor, cursor);
+    let starts = line_starts(text);
+    let ranges = block_ranges(text, anchor, cursor);
+    let mut out = Vec::new();
+    for line in selection.top_line..=selection.bottom_line {
+        let Some(&start) = starts.get(line) else {
+            break;
+        };
+        let end = line_end_offset(text, start);
+        let offset = if append {
+            ranges
+                .iter()
+                .filter(|range| range.start >= start && range.end <= end)
+                .map(|range| range.end)
+                .max()
+                .unwrap_or(end)
+        } else {
+            offset_for_display_col(text, line, selection.left_col)
+        };
+        out.push(offset);
+    }
+    out
+}
+
 /// All matches a substitute command should replace, as absolute byte ranges
 /// with their replacement, in document order.
 pub fn substitute_matches(text: &str, spec: &SubSpec) -> Vec<(std::ops::Range<usize>, String)> {
@@ -1359,6 +1850,7 @@ mod tests {
                 pattern: "a".into(),
                 replacement: "b".into(),
                 global: true,
+                selection_range: false,
             })
         );
         // Unknown command reports an error instead of vanishing.
@@ -1427,6 +1919,7 @@ mod tests {
             pattern: "a".into(),
             replacement: "x".into(),
             global: false,
+            selection_range: false,
         };
         let hits = substitute_matches(text, &spec);
         assert_eq!(hits.len(), 2);
@@ -1474,13 +1967,13 @@ mod tests {
         );
         assert_eq!(
             translate(VimMode::VisualBlock, &mut p, "d", false),
-            DeleteBlock
+            DeleteSelection
         );
         assert_eq!(
             translate(VimMode::VisualBlock, &mut p, "y", false),
-            YankBlock
+            YankSelection
         );
-        assert_eq!(translate(VimMode::VisualBlock, &mut p, "i", false), Swallow);
+        assert_eq!(translate(VimMode::VisualBlock, &mut p, "i", false), Pending);
     }
 
     #[test]
@@ -1563,5 +2056,194 @@ mod tests {
         let short = "abc\n\nxyz\n";
         let cursor = offset_for_display_col(short, 2, 1);
         assert_eq!(block_text(short, 0, cursor), "ab\n\nxy");
+    }
+
+    #[test]
+    fn charwise_range_includes_cursor_and_supports_reverse() {
+        let text = "one two\nthree\n";
+        assert_eq!(charwise_range(text, 0, 0), 0..1);
+        assert_eq!(charwise_range(text, 0, 2), 0..3);
+        assert_eq!(charwise_range(text, 6, 2), 2..7);
+        assert_eq!(charwise_ranges(text, 0, 11), vec![0..7, 8..12]);
+        assert_eq!(charwise_ranges(text, 11, 0), vec![0..7, 8..12]);
+    }
+
+    #[test]
+    fn linewise_range_covers_whole_lines() {
+        let text = "one two\nthree\nfour";
+        assert_eq!(linewise_range(text, 2, 9), 0..14);
+        assert_eq!(linewise_ranges(text, 2, 9), vec![0..7, 8..13]);
+        assert_eq!(linewise_range(text, 9, 2), 0..14);
+    }
+
+    #[test]
+    fn indent_and_case_helpers() {
+        let text = "a\nb\nc\n";
+        assert_eq!(indent_lines(text, 0, 1, true, 1), "    a\n    b\nc\n");
+        assert_eq!(indent_lines("    a\n\tb\nc", 0, 1, false, 1), "a\nb\nc");
+        assert_eq!(indent_lines(text, 0, 0, true, 2), "        a\nb\nc\n");
+        assert_eq!(
+            toggle_case_ranges("one TWO\nThree", &[0..3, 4..7]),
+            "ONE two\nThree"
+        );
+        assert_eq!(toggle_case_ranges("中文Ab", &[0.."中文Ab".len()]), "中文aB");
+    }
+
+    #[test]
+    fn text_object_ranges() {
+        let text = "one two\n\npara line\nnext";
+        assert_eq!(inner_word_range(text, 1), 0..3);
+        assert_eq!(inner_word_range(text, 4), 4..7);
+        assert_eq!(word_object_range(text, 0, true), 0..4);
+        assert_eq!(inner_word_range(text, 0), 0..3);
+        // Paragraph around "para line": lines 2..=3.
+        let start = text.find("para").unwrap();
+        assert_eq!(paragraph_range(text, start), start..text.len());
+        let first = paragraph_range("a\nb\n\nc", 0);
+        assert_eq!(first, 0..3);
+        assert_eq!(paragraph_object_range("a\nb\n\nc", 0, true), 0..4);
+    }
+
+    #[test]
+    fn sort_selected_lines() {
+        let text = "b\na\nc\n";
+        assert_eq!(sort_line_range(text, 0, 1, false), "a\nb\nc\n");
+        assert_eq!(sort_line_range(text, 0, 1, true), "b\na\nc\n");
+        assert_eq!(sort_line_range(text, 0, 2, true), "c\nb\na\n");
+    }
+
+    #[test]
+    fn visual_mode_keys_and_range_commands() {
+        let mut p = String::new();
+        assert_eq!(norm(&mut p, "V"), ToVisualLine);
+        assert_eq!(
+            translate(VimMode::VisualLine, &mut p, "V", false),
+            VisualExit
+        );
+        assert_eq!(translate(VimMode::VisualLine, &mut p, "v", false), ToVisual);
+        assert_eq!(translate(VimMode::Visual, &mut p, "V", false), ToVisualLine);
+
+        let mut p = String::new();
+        assert_eq!(visual(&mut p, "c"), ChangeSelection);
+        assert_eq!(
+            visual(&mut p, ">"),
+            IndentSelection {
+                increase: true,
+                count: 1
+            }
+        );
+        assert_eq!(
+            visual(&mut p, "<"),
+            IndentSelection {
+                increase: false,
+                count: 1
+            }
+        );
+        assert_eq!(visual(&mut p, "~"), ToggleCaseSelection);
+        assert_eq!(visual(&mut p, "o"), ToggleVisualEnd);
+        assert_eq!(visual(&mut p, "i"), Pending);
+        assert_eq!(
+            visual(&mut p, "w"),
+            SelectTextObject {
+                kind: TextObjectKind::Word,
+                around: false
+            }
+        );
+        assert_eq!(visual(&mut p, "a"), Pending);
+        assert_eq!(
+            visual(&mut p, "p"),
+            SelectTextObject {
+                kind: TextObjectKind::Paragraph,
+                around: true
+            }
+        );
+
+        let mut p = String::new();
+        assert_eq!(norm(&mut p, "g"), Pending);
+        assert_eq!(norm(&mut p, "v"), ReselectVisual);
+
+        let mut p = String::new();
+        assert_eq!(norm(&mut p, "3"), Swallow);
+        assert_eq!(
+            visual(&mut p, ">"),
+            IndentSelection {
+                increase: true,
+                count: 3
+            }
+        );
+
+        let mut p = String::new();
+        assert_eq!(visual(&mut p, ":"), Pending);
+        assert_eq!(p, ":'<,'>");
+        for k in ["s", "/", "a", "/", "b", "/"] {
+            assert_eq!(visual(&mut p, k), Pending);
+        }
+        assert_eq!(
+            visual(&mut p, "enter"),
+            Substitute(SubSpec {
+                start: None,
+                end: None,
+                whole: false,
+                pattern: "a".into(),
+                replacement: "b".into(),
+                global: false,
+                selection_range: true,
+            })
+        );
+        assert_eq!(p, "");
+    }
+
+    #[test]
+    fn block_specific_keys() {
+        let mut p = String::new();
+        assert_eq!(
+            translate(VimMode::VisualBlock, &mut p, "I", false),
+            BlockInsert { append: false }
+        );
+        assert_eq!(
+            translate(VimMode::VisualBlock, &mut p, "A", false),
+            BlockInsert { append: true }
+        );
+        assert_eq!(
+            translate(VimMode::VisualBlock, &mut p, "O", false),
+            ToggleBlockCorner
+        );
+        assert_eq!(
+            translate(VimMode::VisualBlock, &mut p, "c", false),
+            BlockChange
+        );
+    }
+
+    #[test]
+    fn block_insert_offsets_cover_each_line() {
+        let text = "abc\ndef\n";
+        let anchor = 0;
+        let cursor = offset_for_display_col(text, 1, 1);
+        assert_eq!(
+            block_insert_offsets(text, anchor, cursor, false),
+            vec![0, 4]
+        );
+        assert_eq!(block_insert_offsets(text, anchor, cursor, true), vec![2, 6]);
+    }
+
+    #[test]
+    fn selection_range_commands_parse() {
+        let action = parse_command(":'<,'>s/a/b/g");
+        match action {
+            Substitute(spec) => {
+                assert!(spec.selection_range);
+                assert_eq!(spec.pattern, "a");
+                assert!(spec.global);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(
+            parse_command(":'<,'>sort"),
+            SortSelection { descending: false }
+        );
+        assert_eq!(
+            parse_command(":'<,'>sort!"),
+            SortSelection { descending: true }
+        );
     }
 }

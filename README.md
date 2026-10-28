@@ -99,19 +99,31 @@ Global shortcuts work immediately after launch (the root view takes focus on
 startup).
 
 **Vim editing** is on by default (`vim_mode`); the note editor starts in
-NORMAL mode with a mode badge in the header (NORMAL/INSERT/VISUAL/V-BLOCK,
-plus the pending command such as `:w` or `/word`). NORMAL, VISUAL and V-BLOCK
-show exactly one block cursor; INSERT keeps the native thin caret.
+NORMAL mode with a mode badge in the header
+(NORMAL/INSERT/VISUAL/V-LINE/V-BLOCK, plus the pending command such as `:w`
+or `/word`). NORMAL, VISUAL, V-LINE and V-BLOCK show exactly one block cursor;
+INSERT keeps the native thin caret.
 
 Supported: `Esc`, `i a I A o O`, `h j k l w b 0 $ gg G`, counts (`3j`, `12G`,
 `2dd`, `3x`, `d2w`), `Ctrl-f/b/d/u` page and half-page motions, `x dd yy dw d$`,
-`p P`, `u`/`Ctrl-r`, `.`, `v` with `d`/`y`, `Ctrl-v` rectangular block
-selection with `h/j/k/l`, `d`, `y` and `p` (display-width columns: CJK counts
-as 2, Tab as 4), `/word ?word n N`, `:w :q :wq :x`, `ZZ`, and substitutions
-(`:%s/old/new/g`, `:2,5s/old/new/g`, `:s/old/new[/g]`). It can be turned off
-in Settings. Macros, named registers, marks, `f/t`, `J`, `>>/<<`, visual line
-mode, mouse block selection, and text objects remain out of scope; `j`/`k`
-move by visual row when soft wrap is active.
+`p P`, `u`/`Ctrl-r`, `.`, `/word ?word n N`, `:w :q :wq :x`, `ZZ`, and
+substitutions (`:%s/old/new/g`, `:2,5s/old/new/g`, `:s/old/new[/g]`).
+
+Visual modes: `v` (character, includes the cursor character), `V` (line), and
+`Ctrl-v` (block; `Ctrl-q` also works where Ctrl-v is paste). All three support
+`d`, `y`, `c`, `>`, `<`, `~`, `o` (swap endpoint; block corner in V-BLOCK),
+`gv` (restore the last selection), and `iw`/`aw`/`ip`/`ap` text objects.
+`V-BLOCK` additionally supports `O` (other corner), `I` (insert at the block's
+left edge on every line), `A` (append at the right edge) and `c` (change the
+block), using native multi-cursor editing. Block columns use display width
+(CJK = 2, Tab = 4). `>`/`<` indent by four spaces (`3>` applies three levels);
+the codebase has no global indent setting. Visual `:` pre-fills `:'<,'>`:
+`:'<,'>s/old/new/g`, `:'<,'>sort`, and `:'<,'>sort!` (descending) only touch
+the selected lines.
+
+It can be turned off in Settings. Macros, named registers, marks, `f/t`, `J`,
+`>>/<<`, mouse block selection, and visual `p` replacement remain out of
+scope; `j`/`k` move by visual row when soft wrap is active.
 
 **Settings** (`Cmd+,` / toolbar) mirror the CLI config surface — WebDAV
 URL/username, WebDAV and E2EE passwords (stored encrypted at rest exactly
