@@ -60,7 +60,9 @@ joplin-rs is a from-scratch Rust client built for exactly this situation:
   appears while a query is applied), in-note find (`Cmd+F`, `Cmd+Shift+F` to
   replace), a note-list right-click menu (new / delete / protect / move),
   Markdown rendering (GFM tables/task lists/code blocks, text selection) with
-  decrypted resource images, Markdown **editing** with autosave (3s after
+  decrypted resource images and one preview line per source line (single
+  Markdown newlines render as breaks; code blocks and tables are untouched),
+  Markdown **editing** with autosave (3s after
   typing, and immediately on blur or when switching notes) toggled with
   `Cmd+E`, create/delete notes and create/rename/delete notebooks (a notebook
   can only be deleted once its notes are), two-way sync with live status,
@@ -97,16 +99,18 @@ Global shortcuts work immediately after launch (the root view takes focus on
 startup).
 
 **Vim editing** is on by default (`vim_mode`); the note editor starts in
-NORMAL mode with a mode badge in the header (NORMAL/INSERT/VISUAL, plus the
-pending command such as `:w` or `/word`). NORMAL and VISUAL draw a block cursor
-over the native thin caret, so the mode is visible without reading the badge.
+NORMAL mode with a mode badge in the header (NORMAL/INSERT/VISUAL/V-BLOCK,
+plus the pending command such as `:w` or `/word`). NORMAL, VISUAL and V-BLOCK
+show exactly one block cursor; INSERT keeps the native thin caret.
 
 Supported: `Esc`, `i a I A o O`, `h j k l w b 0 $ gg G`, counts (`3j`, `12G`,
 `2dd`, `3x`, `d2w`), `Ctrl-f/b/d/u` page and half-page motions, `x dd yy dw d$`,
-`p P`, `u`/`Ctrl-r`, `.`, `v` with `d`/`y`, `/word ?word n N`, `:w :q :wq :x`,
-`ZZ`, and substitutions (`:%s/old/new/g`, `:2,5s/old/new/g`, `:s/old/new[/g]`).
-It can be turned off in Settings. Macros, named registers, marks, `f/t`, `J`,
-`>>/<<`, visual line/block modes, and text objects remain out of scope; `j`/`k`
+`p P`, `u`/`Ctrl-r`, `.`, `v` with `d`/`y`, `Ctrl-v` rectangular block
+selection with `h/j/k/l`, `d`, `y` and `p` (display-width columns: CJK counts
+as 2, Tab as 4), `/word ?word n N`, `:w :q :wq :x`, `ZZ`, and substitutions
+(`:%s/old/new/g`, `:2,5s/old/new/g`, `:s/old/new[/g]`). It can be turned off
+in Settings. Macros, named registers, marks, `f/t`, `J`, `>>/<<`, visual line
+mode, mouse block selection, and text objects remain out of scope; `j`/`k`
 move by visual row when soft wrap is active.
 
 **Settings** (`Cmd+,` / toolbar) mirror the CLI config surface — WebDAV

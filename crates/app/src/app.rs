@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use crate::preview_markdown;
 use crate::read_password::{hash_password, verify_password};
 use crate::vim::VimMode;
 
@@ -778,7 +779,10 @@ impl AppState {
                     body = body.replace(&format!(":/{rid}"), &path.to_string_lossy());
                 }
             }
-            self.note_body = body;
+            // The text view collapses CommonMark soft breaks; the preview is
+            // expected to show one line per source line, so convert them to
+            // hard breaks once, when the note is loaded.
+            self.note_body = preview_markdown::with_hard_breaks(&body);
             self.selected_note = Some(id.to_string());
             self.record_recent_note(id, &note);
         }

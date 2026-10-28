@@ -6,12 +6,16 @@
 //! textarea and performs the action (dispatching gpui movement actions,
 //! editing the rope, saving, ...).
 //!
-//! Supported: Normal/Insert/Visual modes, motions `h j k l w b 0 $ gg G`,
+//! Supported: Normal/Insert/Visual/Visual Block modes, motions `h j k l w b 0 $ gg G`,
 //! `Ctrl-f/b/d/u`, counts (`3j`, `12G`, `2dd`, `3x`, `d2w`), operators `x dd
 //! yy dw d$`, `p P`, `u`/`Ctrl-r`, `i a I A o O`, `.`, `/word ?word n N`,
 //! `:w :q :wq :x`, `ZZ` and `:%s/old/new/g` / `:n1,n2s/old/new/g` /
-//! `:s/old/new[/g]`. Text objects, macros, named registers, marks, `f/t`, `J`,
-//! `>>/<<`, and visual line/block modes are out of scope.
+//! `:s/old/new[/g]`. Visual Block (`Ctrl-v`) supports rectangular `d`/`y`/`p`
+//! with display-width columns (CJK = 2). Text objects, macros, named
+//! registers, marks, `f/t`, `J`, `>>/<<`, and visual line mode are out of
+//! scope.
+
+use unicode_width::UnicodeWidthChar;
 
 /// Editor mode. Insert passes keys straight through; Normal and Visual
 /// consume them.
@@ -20,6 +24,7 @@ pub enum VimMode {
     Normal,
     Insert,
     Visual,
+    VisualBlock,
 }
 
 impl VimMode {
@@ -29,6 +34,7 @@ impl VimMode {
             VimMode::Normal => "NORMAL",
             VimMode::Insert => "INSERT",
             VimMode::Visual => "VISUAL",
+            VimMode::VisualBlock => "V-BLOCK",
         }
     }
 }
@@ -81,6 +87,8 @@ pub enum VimAction {
     ToNormal,
     /// Start Visual mode (`v`).
     ToVisual,
+    /// Start blockwise Visual mode (`Ctrl-v`).
+    ToVisualBlock,
     /// Leave Visual mode and collapse the selection (`Esc` / `v`).
     VisualExit,
     /// A motion repeated `count` times.
@@ -102,8 +110,12 @@ pub enum VimAction {
     DeleteToLineEnd(usize),
     /// Visual-mode `d`.
     DeleteSelection,
+    /// Blockwise Visual-mode `d`.
+    DeleteBlock,
     /// Visual-mode `y`.
     YankSelection,
+    /// Blockwise Visual-mode `y`.
+    YankBlock,
     /// `p` / `P`, repeated `count` times.
     Paste {
         before: bool,
@@ -295,13 +307,17 @@ pub fn translate(mode: VimMode, pending: &mut String, key: &str, ctrl: bool) -> 
                 kind: MoveKind::HalfPageUp,
                 count: 1,
             },
+            "v" => match mode {
+                VimMode::VisualBlock => VisualExit,
+                _ => ToVisualBlock,
+            },
             _ => Swallow,
         };
     }
 
     if key == "escape" {
         pending.clear();
-        return if mode == VimMode::Visual {
+        return if matches!(mode, VimMode::Visual | VimMode::VisualBlock) {
             VisualExit
         } else {
             Swallow
@@ -504,20 +520,29 @@ pub fn translate(mode: VimMode, pending: &mut String, key: &str, ctrl: bool) -> 
             Swallow
         }
     };
-    // Visual mode edits the selection instead of a motion target.
-    if mode != VimMode::Visual {
+    // Visual modes edit the selection instead of a motion target.
+    let block = mode == VimMode::VisualBlock;
+    if mode != VimMode::Visual && !block {
         return action;
     }
     match ch {
         'd' => {
             pending.clear();
-            VimAction::DeleteSelection
+            if block {
+                VimAction::DeleteBlock
+            } else {
+                VimAction::DeleteSelection
+            }
         }
         'y' => {
             pending.clear();
-            VimAction::YankSelection
+            if block {
+                VimAction::YankBlock
+            } else {
+                VimAction::YankSelection
+            }
         }
-        'i' | 'a' | 'I' | 'A' | 'o' | 'O' | 'p' | 'P' | 'x' => VimAction::Swallow,
+        'i' | 'a' | 'I' | 'A' | 'o' | 'O' | 'p' | 'P' | 'x' | 'c' => VimAction::Swallow,
         _ => action,
     }
 }
@@ -796,6 +821,245 @@ pub fn line_starts(text: &str) -> Vec<usize> {
         }
     }
     starts
+}
+
+// ---- Visual Block (display columns) -------------------------------------
+
+/// Tabs occupy four display cells, matching the configured Vim tabstop.
+pub const TAB_WIDTH: usize = 4;
+
+/// One character's width in display cells. CJK characters count as 2.
+pub fn char_display_width(c: char) -> usize {
+    if c == '\t' {
+        TAB_WIDTH
+    } else {
+        UnicodeWidthChar::width(c).unwrap_or(0)
+    }
+}
+
+fn str_display_width(text: &str) -> usize {
+    text.chars().map(char_display_width).sum()
+}
+
+/// `(line index, display column)` of a byte offset.
+pub fn offset_to_line_display_col(text: &str, offset: usize) -> (usize, usize) {
+    let offset = text
+        .get(..offset.min(text.len()))
+        .map(|s| s.len())
+        .unwrap_or(0);
+    let line = text[..offset].bytes().filter(|&b| b == b'\n').count();
+    let start = line_start_offset(text, offset);
+    (line, str_display_width(&text[start..offset]))
+}
+
+/// First byte offset on `line` whose display column is at least `target`.
+///
+/// A target that lands inside a wide character snaps to that character's
+/// start, so selection and deletion never split a CJK glyph.
+pub fn offset_for_display_col(text: &str, line: usize, target: usize) -> usize {
+    let starts = line_starts(text);
+    let Some(&start) = starts.get(line) else {
+        return text.len();
+    };
+    let end = line_end_offset(text, start);
+    start + str_offset_for_display_col(&text[start..end], target)
+}
+
+/// First byte offset in `text` whose display column is at least `target`.
+fn str_offset_for_display_col(text: &str, target: usize) -> usize {
+    let mut col = 0;
+    for (i, c) in text.char_indices() {
+        if col >= target {
+            return i;
+        }
+        let width = char_display_width(c);
+        if width > 0 && col + width > target {
+            return i;
+        }
+        col += width;
+    }
+    text.len()
+}
+
+/// Inclusive display-column rectangle between two cursor offsets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockSelection {
+    pub top_line: usize,
+    pub left_col: usize,
+    pub bottom_line: usize,
+    /// Display column where the last selected cell starts.
+    pub right_col: usize,
+}
+
+/// Rectangle covered by a blockwise selection from `anchor` to `cursor`.
+pub fn block_selection(text: &str, anchor: usize, cursor: usize) -> BlockSelection {
+    let (a_line, a_col) = offset_to_line_display_col(text, anchor);
+    let (c_line, c_col) = offset_to_line_display_col(text, cursor);
+    BlockSelection {
+        top_line: a_line.min(c_line),
+        left_col: a_col.min(c_col),
+        bottom_line: a_line.max(c_line),
+        right_col: a_col.max(c_col),
+    }
+}
+
+/// Per-line byte ranges covered by the block.
+///
+/// Characters are included when their display cells overlap
+/// `[left_col, right_col]`; a wide character that starts before `left_col`
+/// but extends into the block is selected whole.
+pub fn block_ranges(text: &str, anchor: usize, cursor: usize) -> Vec<std::ops::Range<usize>> {
+    let selection = block_selection(text, anchor, cursor);
+    let starts = line_starts(text);
+    let mut ranges = Vec::new();
+    for line in selection.top_line..=selection.bottom_line {
+        let Some(&start) = starts.get(line) else {
+            break;
+        };
+        let end = line_end_offset(text, start);
+        let mut col = 0;
+        let mut run: Option<(usize, usize)> = None;
+        for (i, c) in text[start..end].char_indices() {
+            let width = char_display_width(c);
+            let overlaps = col + width > selection.left_col && col <= selection.right_col;
+            let at = start + i;
+            if overlaps {
+                match &mut run {
+                    Some((_, run_end)) if *run_end == at => *run_end = at + c.len_utf8(),
+                    Some((run_start, run_end)) => {
+                        ranges.push(*run_start..*run_end);
+                        run = Some((at, at + c.len_utf8()));
+                    }
+                    None => run = Some((at, at + c.len_utf8())),
+                }
+            } else if let Some((run_start, run_end)) = run.take() {
+                ranges.push(run_start..run_end);
+            }
+            col += width;
+        }
+        if let Some((run_start, run_end)) = run {
+            ranges.push(run_start..run_end);
+        }
+    }
+    ranges
+}
+
+/// Text of a blockwise selection, one line per selected source line.
+pub fn block_text(text: &str, anchor: usize, cursor: usize) -> String {
+    let selection = block_selection(text, anchor, cursor);
+    let starts = line_starts(text);
+    let ranges = block_ranges(text, anchor, cursor);
+    let mut lines = Vec::new();
+    for line in selection.top_line..=selection.bottom_line {
+        let Some(&start) = starts.get(line) else {
+            break;
+        };
+        let end = line_end_offset(text, start);
+        let line_text = ranges
+            .iter()
+            .filter(|range| range.start >= start && range.end <= end)
+            .filter_map(|range| text.get(range.clone()))
+            .collect::<String>();
+        lines.push(line_text);
+    }
+    lines.join("\n")
+}
+
+/// Remove the block and return `(new text, cursor at the block's top-left)`.
+pub fn block_delete(text: &str, anchor: usize, cursor: usize) -> (String, usize) {
+    let selection = block_selection(text, anchor, cursor);
+    let top_left = offset_for_display_col(text, selection.top_line, selection.left_col);
+    let mut ranges = block_ranges(text, anchor, cursor);
+    ranges.sort_by_key(|range| range.start);
+    let mut out = text.to_string();
+    for range in ranges.into_iter().rev() {
+        if range.end <= out.len() {
+            out.replace_range(range, "");
+        }
+    }
+    let cursor = top_left.min(out.len());
+    (out, cursor)
+}
+
+/// Insert a rectangular block at `cursor`, repeating each line `count` times.
+///
+/// Returns `(new text, cursor at the start of the inserted block)`.
+pub fn block_insert(text: &str, cursor: usize, lines: &[String], count: usize) -> (String, usize) {
+    if lines.is_empty() {
+        return (text.to_string(), cursor);
+    }
+    let count = count.max(1);
+    let (line, col) = offset_to_line_display_col(text, cursor);
+    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut parts: Vec<String> = text
+        .split('\n')
+        .map(|part| part.strip_suffix('\r').unwrap_or(part).to_string())
+        .collect();
+    while parts.len() < line + lines.len() {
+        parts.push(String::new());
+    }
+    for (i, block_line) in lines.iter().enumerate() {
+        let part = &mut parts[line + i];
+        let width = str_display_width(part);
+        let at = if col > width {
+            part.push_str(&" ".repeat(col - width));
+            part.len()
+        } else {
+            str_offset_for_display_col(part, col)
+        };
+        part.insert_str(at, &block_line.repeat(count));
+    }
+    let out = parts.join(newline);
+    // `split('\n')` keeps the final empty part for a trailing newline; the
+    // join already reproduces it.
+    let mut cursor_at = 0;
+    for part in parts.iter().take(line) {
+        cursor_at += part.len() + newline.len();
+    }
+    cursor_at += str_offset_for_display_col(&parts[line], col);
+    cursor_at = cursor_at.min(out.len());
+    (out, cursor_at)
+}
+
+/// Move the cursor inside a blockwise selection. `h/l` stay on the current
+/// line; `j/k` move by logical line while keeping the display column.
+pub fn block_move(text: &str, cursor: usize, kind: MoveKind, count: usize) -> usize {
+    let count = count.max(1);
+    let (line, col) = offset_to_line_display_col(text, cursor);
+    let starts = line_starts(text);
+    match kind {
+        MoveKind::Left => {
+            let start = line_start_offset(text, cursor);
+            let mut at = cursor;
+            for _ in 0..count {
+                if at <= start {
+                    break;
+                }
+                at = prev_char(text, at).0;
+            }
+            at
+        }
+        MoveKind::Right => {
+            let end = line_end_offset(text, cursor);
+            let mut at = cursor;
+            for _ in 0..count {
+                let Some(c) = text[at..end].chars().next() else {
+                    break;
+                };
+                at += c.len_utf8();
+            }
+            at
+        }
+        MoveKind::Up => {
+            let target = line.saturating_sub(count);
+            offset_for_display_col(text, target, col)
+        }
+        MoveKind::Down => {
+            let target = (line + count).min(starts.len().saturating_sub(1));
+            offset_for_display_col(text, target, col)
+        }
+        _ => cursor,
+    }
 }
 
 /// All matches a substitute command should replace, as absolute byte ranges
@@ -1185,5 +1449,119 @@ mod tests {
         let hits = substitute_matches(text, &ranged);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, 5..6);
+    }
+
+    #[test]
+    fn ctrl_v_enters_and_leaves_block_mode() {
+        let mut p = String::new();
+        assert_eq!(translate(VimMode::Normal, &mut p, "v", true), ToVisualBlock);
+        assert_eq!(translate(VimMode::Visual, &mut p, "v", true), ToVisualBlock);
+        assert_eq!(
+            translate(VimMode::VisualBlock, &mut p, "v", true),
+            VisualExit
+        );
+        assert_eq!(
+            translate(VimMode::VisualBlock, &mut p, "v", false),
+            ToVisual
+        );
+        assert_eq!(
+            translate(VimMode::VisualBlock, &mut p, "escape", false),
+            VisualExit
+        );
+        assert_eq!(
+            translate(VimMode::VisualBlock, &mut p, "h", false),
+            move_(MoveKind::Left, 1)
+        );
+        assert_eq!(
+            translate(VimMode::VisualBlock, &mut p, "d", false),
+            DeleteBlock
+        );
+        assert_eq!(
+            translate(VimMode::VisualBlock, &mut p, "y", false),
+            YankBlock
+        );
+        assert_eq!(translate(VimMode::VisualBlock, &mut p, "i", false), Swallow);
+    }
+
+    #[test]
+    fn display_width_counts_cjk_as_two_cells() {
+        assert_eq!(char_display_width('a'), 1);
+        assert_eq!(char_display_width('中'), 2);
+        assert_eq!(char_display_width('\t'), TAB_WIDTH);
+        let text = "a中b";
+        assert_eq!(offset_to_line_display_col(text, 0), (0, 0));
+        assert_eq!(offset_to_line_display_col(text, 1), (0, 1));
+        assert_eq!(offset_to_line_display_col(text, 4), (0, 3));
+        // Inside a wide character snaps to its start.
+        assert_eq!(offset_for_display_col(text, 0, 2), 1);
+        assert_eq!(offset_for_display_col(text, 0, 3), 4);
+    }
+
+    #[test]
+    fn block_ranges_respect_display_columns() {
+        let text = "abcdef\n中文xy\nab\n";
+        assert_eq!(
+            block_selection(text, 0, 10),
+            BlockSelection {
+                top_line: 0,
+                left_col: 0,
+                bottom_line: 1,
+                right_col: 2,
+            }
+        );
+        assert_eq!(block_ranges(text, 0, 10), vec![0..3, 7..13]);
+        assert_eq!(block_text(text, 0, 10), "abc\n中文");
+
+        // Extending to the third line keeps the two-line block's columns.
+        let cursor = offset_for_display_col(text, 2, 2);
+        assert_eq!(block_ranges(text, 0, cursor), vec![0..3, 7..13, 16..18]);
+        assert_eq!(block_text(text, 0, cursor), "abc\n中文\nab");
+    }
+
+    #[test]
+    fn block_delete_removes_rectangle() {
+        let text = "abcdef\n中文xy\nab\n";
+        let (out, cursor) = block_delete(text, 0, 10);
+        assert_eq!(out, "def\nxy\nab\n");
+        assert_eq!(cursor, 0);
+    }
+
+    #[test]
+    fn block_insert_pastes_by_display_column() {
+        let lines = vec!["X".to_string(), "Y".to_string()];
+        let (out, cursor) = block_insert("abcdef\n中文xy\nab\n", 0, &lines, 1);
+        assert_eq!(out, "Xabcdef\nY中文xy\nab\n");
+        assert_eq!(cursor, 0);
+
+        let lines = vec!["中".to_string(), "文".to_string()];
+        let (out, cursor) = block_insert("a\nb", 2, &lines, 1);
+        assert_eq!(out, "a\n中b\n文");
+        assert_eq!(cursor, 2);
+    }
+
+    #[test]
+    fn block_move_stays_in_line_and_keeps_column() {
+        let text = "abc\n中文xy\nz";
+        assert_eq!(block_move(text, 0, MoveKind::Right, 2), 2);
+        assert_eq!(block_move(text, 0, MoveKind::Left, 1), 0);
+        assert_eq!(block_move(text, 0, MoveKind::Down, 1), 4);
+        assert_eq!(block_move(text, 4, MoveKind::Right, 1), 7);
+        assert_eq!(block_move(text, 4, MoveKind::Left, 1), 4);
+        assert_eq!(block_move(text, 4, MoveKind::Down, 1), 13);
+        assert_eq!(block_move(text, 14, MoveKind::Down, 1), 14);
+    }
+
+    #[test]
+    fn block_selection_is_symmetric_and_keeps_empty_lines() {
+        let text = "abcdef\nx\n中文\n";
+        let cursor = offset_for_display_col(text, 2, 2);
+        let anchor = 0;
+        assert_eq!(block_text(text, cursor, anchor), "abc\nx\n中文");
+        assert_eq!(block_delete(text, cursor, anchor).0, "def\n\n\n");
+
+        // A line shorter than the rectangle contributes an empty row.
+        let short = "abc\n\nxyz\n";
+        let cursor = offset_for_display_col(short, 2, 1);
+        assert_eq!(block_text(short, 0, cursor), "ab\n\nxy");
     }
 }

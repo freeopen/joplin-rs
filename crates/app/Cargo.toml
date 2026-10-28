@@ -22,6 +22,8 @@ pbkdf2 = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 base64 = { workspace = true }
+# East Asian display width for Visual Block columns (CJK = 2 cells).
+unicode-width = "0.2"
 # GPUI Kit: one dependency for gpui 0.3.9 (gpui-pre family), gpui-base and
 # gpui-component (Input/Dialog/TextView), plus default assets. Its desktop
 # platform dependency enables runtime_shaders, so a machine without Xcode's

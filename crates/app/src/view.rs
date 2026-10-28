@@ -166,6 +166,8 @@ fn install_menus(cx: &mut App) {
 struct VimRegister {
     text: String,
     linewise: bool,
+    /// Rectangular yank: one string per selected line, pasted by column.
+    blockwise: bool,
     /// Whether anything was yanked/deleted yet (an empty register can still
     /// hold an empty line, which pastes as a newline).
     set: bool,
@@ -227,6 +229,12 @@ pub struct NoteBrowser {
     vim_register: VimRegister,
     /// Visual-mode selection anchor (byte offset).
     vim_anchor: Option<usize>,
+    /// Blockwise Visual-mode anchor (byte offset). Kept apart from
+    /// `vim_anchor` because a block has no linear native selection.
+    vim_block_anchor: Option<usize>,
+    /// Desired display column while moving vertically in V-BLOCK. Kept when
+    /// the cursor lands on a shorter line so moving back restores it.
+    vim_block_col: Option<usize>,
     /// Last `/` or `?` search: query and direction.
     vim_last_search: Option<(String, bool)>,
     /// Last change replayed by `.`.
@@ -609,6 +617,8 @@ impl NoteBrowser {
             notes_focus: cx.focus_handle(),
             vim_register: VimRegister::default(),
             vim_anchor: None,
+            vim_block_anchor: None,
+            vim_block_col: None,
             vim_last_search: None,
             vim_last_change: None,
             vim_insert_snapshot: None,
@@ -873,6 +883,10 @@ impl NoteBrowser {
         if mode != VimMode::Visual {
             self.vim_anchor = None;
         }
+        if mode != VimMode::VisualBlock {
+            self.vim_block_anchor = None;
+            self.vim_block_col = None;
+        }
     }
 
     /// Record the last change so `.` can replay it.
@@ -1002,6 +1016,7 @@ impl NoteBrowser {
                 slice.to_string()
             },
             linewise,
+            blockwise: false,
             set: true,
         };
         self.record_change(change);
@@ -1026,6 +1041,12 @@ impl NoteBrowser {
         let reg = self.vim_register.clone();
         let text = self.vim_text(cx);
         let cursor = self.note_edit.read(cx).cursor();
+        if reg.blockwise {
+            let lines: Vec<String> = reg.text.split('\n').map(str::to_string).collect();
+            let (new_text, new_cursor) = vim::block_insert(&text, cursor, &lines, count);
+            self.replace_document(new_text, new_cursor, window, cx);
+            return;
+        }
         if reg.linewise {
             let repeat = count.max(1);
             let block = std::iter::repeat(reg.text.as_str())
@@ -1058,6 +1079,25 @@ impl NoteBrowser {
             });
         }
         self.record_change(RepeatableChange::Paste { before, count });
+    }
+
+    /// Replace the whole document in one edit. Used by block operations so
+    /// undo, Change events, dirty tracking and autosave stay on the normal
+    /// path while cursor/scroll are restored afterwards.
+    fn replace_document(
+        &mut self,
+        new_text: String,
+        cursor: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.note_edit.update(cx, |s, cx| {
+            let len = s.text().len();
+            s.set_selected_range(0..len, cx);
+            s.replace(new_text, window, cx);
+            let cursor = cursor.min(s.text().len());
+            s.set_selected_range(cursor..cursor, cx);
+        });
     }
 
     /// Search for `query` from `from` and move the cursor to the match.
@@ -1132,6 +1172,15 @@ impl NoteBrowser {
                 self.vim_anchor = Some(cursor);
                 self.set_vim_mode(VimMode::Visual, cx);
             }
+            VimAction::ToVisualBlock => {
+                let cursor = self.note_edit.read(cx).cursor();
+                self.vim_block_anchor = Some(cursor);
+                let text = self.vim_text(cx);
+                self.vim_block_col = Some(vim::offset_to_line_display_col(&text, cursor).1);
+                self.note_edit
+                    .update(cx, |s, cx| s.set_selected_range(cursor..cursor, cx));
+                self.set_vim_mode(VimMode::VisualBlock, cx);
+            }
             VimAction::VisualExit => {
                 let cursor = self.note_edit.read(cx).cursor();
                 self.note_edit
@@ -1140,8 +1189,41 @@ impl NoteBrowser {
                 self.set_vim_mode(VimMode::Normal, cx);
             }
             VimAction::Move { kind, count } => {
-                self.vim_move(kind, count, window, cx);
-                self.sync_visual_selection(cx);
+                if self.state.read(cx).vim_mode == VimMode::VisualBlock {
+                    let cursor = self.note_edit.read(cx).cursor();
+                    let text = self.vim_text(cx);
+                    if matches!(
+                        kind,
+                        MoveKind::Left | MoveKind::Right | MoveKind::Up | MoveKind::Down
+                    ) {
+                        let to = match kind {
+                            MoveKind::Up | MoveKind::Down => {
+                                let (line, col) = vim::offset_to_line_display_col(&text, cursor);
+                                let preferred = self.vim_block_col.unwrap_or(col);
+                                let lines = vim::line_starts(&text).len();
+                                let target = if kind == MoveKind::Up {
+                                    line.saturating_sub(count.max(1))
+                                } else {
+                                    (line + count.max(1)).min(lines.saturating_sub(1))
+                                };
+                                vim::offset_for_display_col(&text, target, preferred)
+                            }
+                            _ => vim::block_move(&text, cursor, kind, count),
+                        };
+                        if matches!(kind, MoveKind::Left | MoveKind::Right) {
+                            self.vim_block_col = Some(vim::offset_to_line_display_col(&text, to).1);
+                        }
+                        self.note_edit
+                            .update(cx, |s, cx| s.set_selected_range(to..to, cx));
+                    } else {
+                        self.vim_move(kind, count, window, cx);
+                        let at = self.note_edit.read(cx).cursor();
+                        self.vim_block_col = Some(vim::offset_to_line_display_col(&text, at).1);
+                    }
+                } else {
+                    self.vim_move(kind, count, window, cx);
+                    self.sync_visual_selection(cx);
+                }
             }
             VimAction::GotoLine(line) => {
                 let line = line.max(1) as u32 - 1;
@@ -1180,6 +1262,7 @@ impl NoteBrowser {
                 self.vim_register = VimRegister {
                     text: vim::yank_line_text(&text, cursor, count),
                     linewise: true,
+                    blockwise: false,
                     set: true,
                 };
             }
@@ -1214,6 +1297,7 @@ impl NoteBrowser {
                     self.vim_register = VimRegister {
                         text: text[range.clone()].to_string(),
                         linewise: false,
+                        blockwise: false,
                         set: true,
                     };
                 }
@@ -1230,6 +1314,7 @@ impl NoteBrowser {
                     self.vim_register = VimRegister {
                         text: text[range.clone()].to_string(),
                         linewise: false,
+                        blockwise: false,
                         set: true,
                     };
                 }
@@ -1237,6 +1322,41 @@ impl NoteBrowser {
                 self.note_edit
                     .update(cx, |s, cx| s.set_selected_range(cursor..cursor, cx));
                 self.vim_anchor = None;
+                self.set_vim_mode(VimMode::Normal, cx);
+            }
+            VimAction::DeleteBlock => {
+                let Some(anchor) = self.vim_block_anchor else {
+                    return;
+                };
+                let cursor = self.note_edit.read(cx).cursor();
+                let text = self.vim_text(cx);
+                self.vim_register = VimRegister {
+                    text: vim::block_text(&text, anchor, cursor),
+                    linewise: false,
+                    blockwise: true,
+                    set: true,
+                };
+                let (new_text, new_cursor) = vim::block_delete(&text, anchor, cursor);
+                self.replace_document(new_text, new_cursor, window, cx);
+                self.set_vim_mode(VimMode::Normal, cx);
+            }
+            VimAction::YankBlock => {
+                let Some(anchor) = self.vim_block_anchor else {
+                    return;
+                };
+                let cursor = self.note_edit.read(cx).cursor();
+                let text = self.vim_text(cx);
+                self.vim_register = VimRegister {
+                    text: vim::block_text(&text, anchor, cursor),
+                    linewise: false,
+                    blockwise: true,
+                    set: true,
+                };
+                let selection = vim::block_selection(&text, anchor, cursor);
+                let top_left =
+                    vim::offset_for_display_col(&text, selection.top_line, selection.left_col);
+                self.note_edit
+                    .update(cx, |s, cx| s.set_selected_range(top_left..top_left, cx));
                 self.set_vim_mode(VimMode::Normal, cx);
             }
             VimAction::Paste { before, count } => self.vim_paste(before, count, window, cx),
@@ -1374,7 +1494,10 @@ impl NoteBrowser {
         }
         let total_lines = st.text().to_string().lines().count().max(1);
         let cursor_line = st.cursor_position().line as f32;
-        let caret_top = f32::from(caret.top() - input.top());
+        // `cursor_layout()` is in content space and excludes the vertical
+        // scroll offset that paint applies to the native caret.
+        let scroll_y = st.scroll_offset().y;
+        let caret_top = f32::from(caret.top() + scroll_y - input.top());
         let top_line = (cursor_line - caret_top / line_height).max(0.0);
         let ratio = (top_line / (total_lines.saturating_sub(1)).max(1) as f32).clamp(0.0, 1.0);
         self.pending_preview_ratio = Some(ratio);
@@ -2891,19 +3014,33 @@ impl NoteBrowser {
                     ),
             )
             .child(if editing {
+                let block_ranges = if vim_state == VimMode::VisualBlock {
+                    let st = self.note_edit.read(cx);
+                    self.vim_block_anchor
+                        .map(|anchor| {
+                            vim::block_ranges(&st.text().to_string(), anchor, st.cursor())
+                        })
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
                 let editor = div()
                     .id("note-editor")
                     .flex_1()
                     .min_h_0()
                     .relative()
+                    // Display-column block math matches the editor's pixel
+                    // advances only in a monospace face.
+                    .font_family(theme.mono_font_family.clone())
                     .px_4()
                     .py_3()
                     .child(Textarea::new(&self.note_edit).h(relative(1.)))
                     .child(vim_cursor_overlay(
                         self.note_edit.clone(),
                         vim_state,
-                        theme.primary.opacity(0.30),
-                        theme.selection,
+                        theme.caret.opacity(0.4),
+                        theme.selection.opacity(0.35),
+                        block_ranges,
                     ));
                 if vim_mode {
                     editor
@@ -2964,40 +3101,79 @@ fn nth_char_boundary(text: &str, from: usize, count: usize) -> usize {
     end.min(text.len())
 }
 
-/// Block cursor drawn over the textarea in Normal/Visual mode. gpui's native
-/// caret is always a thin bar, so this overlay supplies the mode distinction:
-/// Normal uses the theme primary tint, Visual the selection color, Insert
-/// draws nothing and keeps the native bar.
+/// Place a cursor/selection rectangle in window coordinates.
+///
+/// `caret` is in window coordinates and is returned unchanged except for the
+/// optional vertical scroll offset. `paint_quad` expects window coordinates,
+/// so callers must not subtract the canvas origin.
+fn block_caret_bounds(
+    caret: Bounds<gpui_kit::Pixels>,
+    scroll_y: gpui_kit::Pixels,
+    width: gpui_kit::Pixels,
+) -> Bounds<gpui_kit::Pixels> {
+    Bounds::new(
+        point(caret.origin.x, caret.origin.y + scroll_y),
+        Size::new(width, caret.size.height),
+    )
+}
+
+/// Mode cursor plus Visual Block selection rectangles.
+///
+/// gpui's native caret is always a thin bar, so the overlay paints a
+/// translucent block over the laid-out character cell. The cell bounds are
+/// taken from the text layout (not the caret geometry), so the block follows
+/// the glyph grid and vertical scrolling exactly. Normal/Visual/V-BLOCK show
+/// the block; Insert leaves the native caret alone.
 fn vim_cursor_overlay(
     state: Entity<TextareaState>,
     mode: VimMode,
-    normal_color: gpui_kit::Hsla,
-    visual_color: gpui_kit::Hsla,
+    caret_color: gpui_kit::Hsla,
+    block_color: gpui_kit::Hsla,
+    block_ranges: Vec<std::ops::Range<usize>>,
 ) -> impl IntoElement {
-    let color = if mode == VimMode::Visual {
-        visual_color
-    } else {
-        normal_color
-    };
     let show = mode != VimMode::Insert;
     canvas(
         |_, _, _| (),
-        move |bounds, _, window, cx| {
+        move |_bounds, _, window, cx| {
+            let state = state.read(cx);
+            for range in &block_ranges {
+                if let Some(block) = state.range_to_bounds(range) {
+                    let rect = block_caret_bounds(block, px(0.), block.size.width);
+                    window.paint_quad(gpui_kit::fill(rect, block_color));
+                }
+            }
             if !show {
                 return;
             }
-            let Some((caret, line_height)) = state.read(cx).cursor_layout() else {
-                return;
+            let cursor = state.cursor();
+            let text = state.text();
+            let next = text
+                .slice(cursor..text.len())
+                .chars()
+                .next()
+                .map(|c| cursor + c.len_utf8())
+                .unwrap_or(cursor);
+            // The laid-out cell is already in paint coordinates (including
+            // vertical scroll) and matches the glyph grid, unlike the caret
+            // geometry which excludes the vertical scroll offset.
+            let (base, scroll_y, width) = match state.range_to_bounds(&(cursor..next)) {
+                Some(cell) => {
+                    let width = if cell.size.width > px(0.) {
+                        cell.size.width
+                    } else {
+                        cell.size.height * 0.55
+                    };
+                    (cell, px(0.), width)
+                }
+                None => {
+                    let Some((caret, line_height)) = state.cursor_layout() else {
+                        return;
+                    };
+                    (caret, state.scroll_offset().y, line_height * 0.55)
+                }
             };
-            if line_height <= px(0.) {
-                return;
-            }
-            let origin = point(
-                caret.origin.x - bounds.origin.x,
-                caret.origin.y - bounds.origin.y,
-            );
-            let rect = Bounds::new(origin, Size::new(line_height * 0.55, line_height));
-            window.paint_quad(gpui_kit::fill(rect, color));
+            let rect = block_caret_bounds(base, scroll_y, width);
+            window.paint_quad(gpui_kit::fill(rect, caret_color));
         },
     )
     .absolute()
@@ -3394,5 +3570,13 @@ mod tests {
         assert_eq!(nth_char_boundary("你好世界", 0, 2), "你好".len());
         assert_eq!(nth_char_boundary("你好世界", "你".len(), 1), "你好".len());
         assert_eq!(nth_char_boundary("abc", 1, 99), 3);
+    }
+
+    #[test]
+    fn block_caret_bounds_adds_vertical_scroll_and_keeps_height() {
+        let caret = Bounds::new(point(px(10.), px(20.)), Size::new(px(2.), px(18.)));
+        let rect = block_caret_bounds(caret, px(7.), px(11.));
+        assert_eq!(rect.origin, point(px(10.), px(27.)));
+        assert_eq!(rect.size, Size::new(px(11.), px(18.)));
     }
 }

@@ -6,6 +6,7 @@
 
 mod app;
 mod jobs;
+mod preview_markdown;
 mod read_password;
 mod view;
 mod vim;
