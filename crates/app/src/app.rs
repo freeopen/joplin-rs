@@ -682,6 +682,7 @@ impl AppState {
         };
         self.end_edit();
         self.request_open_note(&id);
+        self.sync_cursors_to_selection();
     }
 
     /// Open a scope's most recently opened note, falling back to the newest

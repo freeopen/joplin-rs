@@ -79,8 +79,11 @@ recently opened note; falls back to the newest note) and syncs on launch.
 
 | Action | macOS | Linux/Windows |
 | --- | --- | --- |
-| Toggle notebooks panel | `Cmd+B` | `Ctrl+B` |
-| Toggle notes panel | `Cmd+Option+B` | `Ctrl+Alt+B` |
+| Toggle notes panel (focus when shown) | `Cmd+B` | `Ctrl+B` |
+| Toggle notebooks panel (focus when shown) | `Cmd+Option+B` | `Ctrl+Alt+B` |
+| Focus notebooks list | `Cmd+1` | `Ctrl+1` |
+| Focus notes list | `Cmd+2` | `Ctrl+2` |
+| Focus note body | `Cmd+3` | `Ctrl+3` |
 | Quit (syncs pending changes first) | `Cmd+Q` | `Ctrl+Q` |
 | Find in current note | `Cmd+F` | `Ctrl+F` |
 | Search all notes | `Cmd+Option+F` | `Ctrl+Alt+F` |
@@ -88,8 +91,13 @@ recently opened note; falls back to the newest note) and syncs on launch.
 | Settings | `Cmd+,` | `Ctrl+,` |
 | Sync | `Cmd+R` | `Ctrl+R` |
 
-When a list panel has focus, `j`/`k` move the highlight and `Enter` selects
-(notebooks are sorted by name, notes by most-recent update).
+Showing a panel with its shortcut also focuses it; hiding a focused panel moves
+focus back to the note body. With a list focused, `j`/`k` move a single
+highlighted row. In the notebooks list `j`/`k` immediately switch notebook,
+refresh the notes list and open that notebook's most recent note; `Enter` moves
+focus to the notes list. In the notes list `Enter` opens the note and focuses
+the body. In preview mode `j`/`k` scroll the body by half a viewport; in edit
+mode they move the cursor.
 
 Right-click a note in the Notes column for **New / Delete note / Protect this
 note / Move**; protecting a note (or removing its lock) uses the reading

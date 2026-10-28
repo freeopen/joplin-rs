@@ -52,6 +52,9 @@ gpui_kit::actions!(
         OpenSettings,
         ToggleNotebooks,
         ToggleNotes,
+        FocusNotebooks,
+        FocusNotes,
+        FocusBody,
         FindInNote,
         GlobalSearch,
         ToggleEdit,
@@ -69,8 +72,11 @@ fn register(cx: &mut App) {
     #[cfg(target_os = "macos")]
     let bindings = [
         KeyBinding::new("cmd-r", Sync, None),
-        KeyBinding::new("cmd-b", ToggleNotebooks, None),
-        KeyBinding::new("cmd-alt-b", ToggleNotes, None),
+        KeyBinding::new("cmd-b", ToggleNotes, None),
+        KeyBinding::new("cmd-alt-b", ToggleNotebooks, None),
+        KeyBinding::new("cmd-1", FocusNotebooks, None),
+        KeyBinding::new("cmd-2", FocusNotes, None),
+        KeyBinding::new("cmd-3", FocusBody, None),
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-f", FindInNote, None),
         KeyBinding::new("cmd-e", ToggleEdit, None),
@@ -80,8 +86,11 @@ fn register(cx: &mut App) {
     #[cfg(not(target_os = "macos"))]
     let bindings = [
         KeyBinding::new("ctrl-r", Sync, None),
-        KeyBinding::new("ctrl-b", ToggleNotebooks, None),
-        KeyBinding::new("ctrl-alt-b", ToggleNotes, None),
+        KeyBinding::new("ctrl-b", ToggleNotes, None),
+        KeyBinding::new("ctrl-alt-b", ToggleNotebooks, None),
+        KeyBinding::new("ctrl-1", FocusNotebooks, None),
+        KeyBinding::new("ctrl-2", FocusNotes, None),
+        KeyBinding::new("ctrl-3", FocusBody, None),
         KeyBinding::new("ctrl-q", Quit, None),
         KeyBinding::new("ctrl-f", FindInNote, None),
         KeyBinding::new("ctrl-e", ToggleEdit, None),
@@ -233,6 +242,8 @@ pub struct NoteBrowser {
     /// Focus handles for the two list panels (j/k/Enter navigation).
     notebooks_focus: FocusHandle,
     notes_focus: FocusHandle,
+    /// Focus handle for the note body in preview/reading mode.
+    body_focus: FocusHandle,
     /// Vim register (linewise or characterwise).
     vim_register: VimRegister,
     /// Visual-mode selection anchor (byte offset).
@@ -645,6 +656,7 @@ impl NoteBrowser {
             gate_epoch_seen: 0,
             notebooks_focus: cx.focus_handle(),
             notes_focus: cx.focus_handle(),
+            body_focus: cx.focus_handle(),
             vim_register: VimRegister::default(),
             vim_anchor: None,
             vim_block_anchor: None,
@@ -721,15 +733,97 @@ impl NoteBrowser {
         true
     }
 
-    fn toggle_notebooks(&mut self, _: &ToggleNotebooks, _: &mut Window, cx: &mut Context<Self>) {
-        self.state
-            .update(cx, |s, _| s.show_notebooks = !s.show_notebooks);
+    fn toggle_notebooks(
+        &mut self,
+        _: &ToggleNotebooks,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let showing = self.state.read(cx).show_notebooks;
+        self.state.update(cx, |s, _| s.show_notebooks = !showing);
+        if showing {
+            if self.notebooks_focus.is_focused(window) {
+                self.focus_body_focus(window, cx);
+            }
+        } else {
+            self.state.update(cx, |s, _| s.sync_cursors_to_selection());
+            window.focus(&self.notebooks_focus, cx);
+        }
         cx.notify();
     }
 
-    fn toggle_notes(&mut self, _: &ToggleNotes, _: &mut Window, cx: &mut Context<Self>) {
-        self.state.update(cx, |s, _| s.show_notes = !s.show_notes);
+    fn toggle_notes(&mut self, _: &ToggleNotes, window: &mut Window, cx: &mut Context<Self>) {
+        let showing = self.state.read(cx).show_notes;
+        self.state.update(cx, |s, _| s.show_notes = !showing);
+        if showing {
+            if self.notes_focus.is_focused(window) {
+                self.focus_body_focus(window, cx);
+            }
+        } else {
+            self.state.update(cx, |s, _| s.sync_cursors_to_selection());
+            window.focus(&self.notes_focus, cx);
+        }
         cx.notify();
+    }
+
+    fn focus_notebooks(&mut self, _: &FocusNotebooks, window: &mut Window, cx: &mut Context<Self>) {
+        self.state.update(cx, |s, _| {
+            s.show_notebooks = true;
+            s.sync_cursors_to_selection();
+        });
+        window.focus(&self.notebooks_focus, cx);
+        cx.notify();
+    }
+
+    fn focus_notes(&mut self, _: &FocusNotes, window: &mut Window, cx: &mut Context<Self>) {
+        self.state.update(cx, |s, _| {
+            s.show_notes = true;
+            s.sync_cursors_to_selection();
+        });
+        window.focus(&self.notes_focus, cx);
+        cx.notify();
+    }
+
+    fn focus_body(&mut self, _: &FocusBody, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_body_focus(window, cx);
+        cx.notify();
+    }
+
+    /// Focus the body: the editor while editing, otherwise the preview.
+    fn focus_body_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.state.read(cx).editing {
+            self.focus_note_editor(window, cx);
+        } else {
+            window.focus(&self.body_focus, cx);
+        }
+    }
+
+    /// `j`/`k` scroll the preview by half its viewport height. Markdown line
+    /// heights vary, so half a viewport is the stable approximation.
+    fn body_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        match event.keystroke.key.as_str() {
+            "j" => self.scroll_preview(true),
+            "k" => self.scroll_preview(false),
+            _ => return,
+        }
+        cx.notify();
+    }
+
+    fn scroll_preview(&mut self, down: bool) {
+        let viewport = self.preview_scroll.bounds().size.height;
+        let step = if viewport > px(0.) {
+            viewport * 0.5
+        } else {
+            px(200.)
+        };
+        let max = -self.preview_scroll.max_offset().y.abs();
+        let current = self.preview_scroll.offset().y;
+        let next = if down {
+            (current - step).max(max)
+        } else {
+            (current + step).min(px(0.))
+        };
+        self.preview_scroll.set_offset(point(px(0.), next));
     }
 
     /// Toggle edit/preview for the open note (⌘E / ⌃E). `begin_edit` guards on
@@ -846,21 +940,34 @@ impl NoteBrowser {
 
     // ---- list panel keyboard navigation (j/k/Enter) ----------------------
 
-    fn notebooks_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn notebooks_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event.keystroke.key.as_str() {
-            "j" => self.state.update(cx, |s, _| s.move_folder_cursor(1)),
-            "k" => self.state.update(cx, |s, _| s.move_folder_cursor(-1)),
-            "enter" => self.state.update(cx, |s, _| s.select_folder_at_cursor()),
+            "j" | "k" => {
+                let delta = if event.keystroke.key == "j" { 1 } else { -1 };
+                self.state.update(cx, |s, _| {
+                    s.move_folder_cursor(delta);
+                    // Match mouse selection: switch notebook, reload the
+                    // note list, and open that notebook's recent note.
+                    s.select_folder_at_cursor();
+                });
+            }
+            "enter" => {
+                self.state.update(cx, |s, _| s.select_folder_at_cursor());
+                window.focus(&self.notes_focus, cx);
+            }
             _ => return,
         }
         cx.notify();
     }
 
-    fn notes_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn notes_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event.keystroke.key.as_str() {
             "j" => self.state.update(cx, |s, _| s.move_note_cursor(1)),
             "k" => self.state.update(cx, |s, _| s.move_note_cursor(-1)),
-            "enter" => self.state.update(cx, |s, _| s.open_note_at_cursor()),
+            "enter" => {
+                self.state.update(cx, |s, _| s.open_note_at_cursor());
+                self.focus_body_focus(window, cx);
+            }
             _ => return,
         }
         cx.notify();
@@ -2672,6 +2779,9 @@ impl Render for NoteBrowser {
             .on_action(cx.listener(Self::show_about))
             .on_action(cx.listener(Self::toggle_notebooks))
             .on_action(cx.listener(Self::toggle_notes))
+            .on_action(cx.listener(Self::focus_notebooks))
+            .on_action(cx.listener(Self::focus_notes))
+            .on_action(cx.listener(Self::focus_body))
             .on_action(cx.listener(Self::toggle_edit))
             .on_action(cx.listener(Self::global_search))
             .on_action(cx.listener(Self::find_in_note))
@@ -2879,7 +2989,7 @@ impl NoteBrowser {
                     .px_3()
                     .py_1()
                     .cursor_pointer()
-                    .when(selected_folder.is_none(), |el| {
+                    .when(selected_folder.is_none() && !focused, |el| {
                         el.bg(theme.selection.opacity(0.35))
                     })
                     .when(focused && folder_cursor == 0, |el| {
@@ -2926,7 +3036,9 @@ impl NoteBrowser {
                                     .px_3()
                                     .py_1()
                                     .cursor_pointer()
-                                    .when(selected, |el| el.bg(theme.selection.opacity(0.35)))
+                                    .when(selected && !focused, |el| {
+                                        el.bg(theme.selection.opacity(0.35))
+                                    })
                                     .when(is_cursor, |el| el.bg(theme.selection.opacity(0.6)))
                                     .hover(|s| s.bg(theme.selection.opacity(0.15)))
                                     .child(SharedString::from(title))
@@ -3117,7 +3229,9 @@ impl NoteBrowser {
                                     .px_3()
                                     .py_1()
                                     .cursor_pointer()
-                                    .when(selected, |el| el.bg(theme.selection.opacity(0.35)))
+                                    .when(selected && !focused, |el| {
+                                        el.bg(theme.selection.opacity(0.35))
+                                    })
                                     .when(is_cursor, |el| el.bg(theme.selection.opacity(0.6)))
                                     .hover(|s| s.bg(theme.selection.opacity(0.15)))
                                     .flex()
@@ -3153,8 +3267,10 @@ impl NoteBrowser {
                                         let note_id = id.clone();
                                         this.state.update(cx, |s, _| {
                                             // Save any pending edit before switching.
+                                            s.note_cursor = i;
                                             s.end_edit();
                                             s.request_open_note(&note_id);
+                                            s.sync_cursors_to_selection();
                                         });
                                         // A protected note (re)locks here: drop any
                                         // password still sitting in the gate field so
@@ -3518,6 +3634,15 @@ impl NoteBrowser {
                     .min_h_0()
                     .overflow_y_scroll()
                     .track_scroll(&self.preview_scroll)
+                    .track_focus(&self.body_focus)
+                    .on_key_down(cx.listener(Self::body_key))
+                    .on_mouse_down(
+                        gpui_kit::MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            window.focus(&this.body_focus, cx);
+                            cx.notify();
+                        }),
+                    )
                     .px_4()
                     .py_3()
                     .child(render_markdown(&body, &resource_dir))
