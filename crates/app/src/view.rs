@@ -811,19 +811,13 @@ impl NoteBrowser {
 
     fn scroll_preview(&mut self, down: bool) {
         let viewport = self.preview_scroll.bounds().size.height;
-        let step = if viewport > px(0.) {
-            viewport * 0.5
-        } else {
-            px(200.)
-        };
-        let max = -self.preview_scroll.max_offset().y.abs();
-        let current = self.preview_scroll.offset().y;
-        let next = if down {
-            (current - step).max(max)
-        } else {
-            (current + step).min(px(0.))
-        };
-        self.preview_scroll.set_offset(point(px(0.), next));
+        let target = preview_scroll_target(
+            f32::from(self.preview_scroll.offset().y),
+            f32::from(self.preview_scroll.max_offset().y),
+            f32::from(viewport),
+            down,
+        );
+        self.preview_scroll.set_offset(point(px(0.), px(target)));
     }
 
     /// Toggle edit/preview for the open note (⌘E / ⌃E). `begin_edit` guards on
@@ -2946,6 +2940,7 @@ impl NoteBrowser {
         let selected_folder = state.selected_folder.clone();
         let folder_cursor = state.folder_cursor;
         let browser = cx.entity().downgrade();
+        let all_notes_bg = list_row_opacity(focused, selected_folder.is_none(), folder_cursor == 0);
 
         div()
             .id("notebooks-col")
@@ -2989,11 +2984,8 @@ impl NoteBrowser {
                     .px_3()
                     .py_1()
                     .cursor_pointer()
-                    .when(selected_folder.is_none() && !focused, |el| {
-                        el.bg(theme.selection.opacity(0.35))
-                    })
-                    .when(focused && folder_cursor == 0, |el| {
-                        el.bg(theme.selection.opacity(0.6))
+                    .when_some(all_notes_bg, |el, opacity| {
+                        el.bg(theme.selection.opacity(opacity))
                     })
                     .hover(|s| s.bg(theme.selection.opacity(0.15)))
                     .child("All notes")
@@ -3029,17 +3021,17 @@ impl NoteBrowser {
                                     .unwrap_or("")
                                     .to_string();
                                 let selected = selected_folder.as_deref() == Some(id.as_str());
-                                let is_cursor = focused && folder_cursor == i + 1;
+                                let row_bg =
+                                    list_row_opacity(focused, selected, folder_cursor == i + 1);
                                 let folder_id = id.clone();
                                 div()
                                     .id(SharedString::from(format!("folder-{id}")))
                                     .px_3()
                                     .py_1()
                                     .cursor_pointer()
-                                    .when(selected && !focused, |el| {
-                                        el.bg(theme.selection.opacity(0.35))
+                                    .when_some(row_bg, |el, opacity| {
+                                        el.bg(theme.selection.opacity(opacity))
                                     })
-                                    .when(is_cursor, |el| el.bg(theme.selection.opacity(0.6)))
                                     .hover(|s| s.bg(theme.selection.opacity(0.15)))
                                     .child(SharedString::from(title))
                                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -3219,7 +3211,7 @@ impl NoteBrowser {
                                     title
                                 };
                                 let selected = selected_note.as_deref() == Some(id.as_str());
-                                let is_cursor = focused && note_cursor == i;
+                                let row_bg = list_row_opacity(focused, selected, note_cursor == i);
                                 let tags = note_tags.get(&id).cloned().unwrap_or_default();
                                 let snippet = search_hits.get(&id).cloned();
                                 let menu_note_id = id.clone();
@@ -3229,10 +3221,9 @@ impl NoteBrowser {
                                     .px_3()
                                     .py_1()
                                     .cursor_pointer()
-                                    .when(selected && !focused, |el| {
-                                        el.bg(theme.selection.opacity(0.35))
+                                    .when_some(row_bg, |el, opacity| {
+                                        el.bg(theme.selection.opacity(opacity))
                                     })
-                                    .when(is_cursor, |el| el.bg(theme.selection.opacity(0.6)))
                                     .hover(|s| s.bg(theme.selection.opacity(0.15)))
                                     .flex()
                                     .flex_col()
@@ -3649,6 +3640,33 @@ impl NoteBrowser {
                     .into_any_element()
             })
             .into_any_element()
+    }
+}
+
+fn preview_scroll_target(current: f32, max: f32, viewport: f32, down: bool) -> f32 {
+    let step = if viewport > 0.0 {
+        viewport * 0.5
+    } else {
+        200.0
+    };
+    if down {
+        (current - step).max(-max.abs())
+    } else {
+        (current + step).min(0.0)
+    }
+}
+
+/// Background opacity for one list row.
+///
+/// A focused list shows only its keyboard cursor row; an unfocused list shows
+/// only the selected row.
+fn list_row_opacity(focused: bool, selected: bool, is_cursor: bool) -> Option<f32> {
+    if focused && is_cursor {
+        Some(0.6)
+    } else if !focused && selected {
+        Some(0.35)
+    } else {
+        None
     }
 }
 
@@ -4239,5 +4257,21 @@ mod tests {
         let rect = block_caret_bounds(caret, px(7.), px(11.));
         assert_eq!(rect.origin, point(px(10.), px(27.)));
         assert_eq!(rect.size, Size::new(px(11.), px(18.)));
+    }
+
+    #[test]
+    fn preview_scroll_uses_half_viewport_and_clamps() {
+        assert_eq!(preview_scroll_target(0.0, 500.0, 200.0, true), -100.0);
+        assert_eq!(preview_scroll_target(-100.0, 500.0, 200.0, false), 0.0);
+        assert_eq!(preview_scroll_target(-480.0, 500.0, 200.0, true), -500.0);
+        assert_eq!(preview_scroll_target(0.0, 500.0, 0.0, true), -200.0);
+    }
+
+    #[test]
+    fn focused_list_shows_only_the_cursor_row() {
+        assert_eq!(list_row_opacity(true, false, true), Some(0.6));
+        assert_eq!(list_row_opacity(true, true, false), None);
+        assert_eq!(list_row_opacity(false, true, false), Some(0.35));
+        assert_eq!(list_row_opacity(false, false, true), None);
     }
 }

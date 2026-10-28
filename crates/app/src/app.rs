@@ -2245,6 +2245,47 @@ mod tests {
     }
 
     #[test]
+    fn moving_folder_cursor_selects_folder_and_syncs_note_cursor() {
+        let mut state =
+            AppState::build(Storage::open_in_memory().unwrap(), Config::default()).unwrap();
+        let f1 = state.storage.create_folder("F1").unwrap();
+        let _f2 = state.storage.create_folder("F2").unwrap();
+        let n1 = state.storage.create_note(&f1, "A").unwrap();
+        state.refresh_lists();
+        state.sync_cursors_to_selection();
+        assert_eq!(state.folder_cursor, 0);
+
+        state.move_folder_cursor(1);
+        state.select_folder_at_cursor();
+
+        assert_eq!(state.selected_folder.as_deref(), Some(f1.as_str()));
+        assert_eq!(state.selected_note.as_deref(), Some(n1.as_str()));
+        assert_eq!(state.note_cursor, 0);
+    }
+
+    #[test]
+    fn open_note_at_cursor_keeps_note_cursor_on_the_opened_row() {
+        let mut state =
+            AppState::build(Storage::open_in_memory().unwrap(), Config::default()).unwrap();
+        let f1 = state.storage.create_folder("F1").unwrap();
+        let _n1 = state.storage.create_note(&f1, "A").unwrap();
+        let _n2 = state.storage.create_note(&f1, "B").unwrap();
+        state.select_folder(Some(f1));
+        assert_eq!(state.notes.len(), 2);
+
+        state.note_cursor = 1;
+        let expected = state.notes[1].props["id"].as_str().unwrap().to_string();
+        state.open_note_at_cursor();
+
+        assert_eq!(state.selected_note.as_deref(), Some(expected.as_str()));
+        assert_eq!(state.note_cursor, 1);
+        assert_eq!(
+            state.notes[state.note_cursor].props["id"].as_str(),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
     fn restore_last_session_restores_folder_and_recent_note() {
         let mut state =
             AppState::build(Storage::open_in_memory().unwrap(), Config::default()).unwrap();
