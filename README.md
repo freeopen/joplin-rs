@@ -82,8 +82,8 @@ recently opened note; falls back to the newest note) and syncs on launch.
 | Toggle notes panel (focus when shown) | `Cmd+B` | `Ctrl+B` |
 | Toggle notebooks panel (focus when shown) | `Cmd+Option+B` | `Ctrl+Alt+B` |
 | Focus notebooks list | `Cmd+1` | `Ctrl+1` |
-| Focus notes list | `Cmd+2` | `Ctrl+2` |
-| Focus note body | `Cmd+3` | `Ctrl+3` |
+| Focus note body | `Cmd+2` | `Ctrl+2` |
+| Focus notes list | `Cmd+3` | `Ctrl+3` |
 | Quit (syncs pending changes first) | `Cmd+Q` | `Ctrl+Q` |
 | Find in current note | `Cmd+F` | `Ctrl+F` |
 | Search all notes | `Cmd+Option+F` | `Ctrl+Alt+F` |
