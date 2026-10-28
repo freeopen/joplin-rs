@@ -741,8 +741,16 @@ impl NoteBrowser {
             self.finish_edit(window, cx);
         } else {
             self.state.update(cx, |s, _| s.begin_edit());
+            self.focus_note_editor(window, cx);
         }
         cx.notify();
+    }
+
+    /// Put keyboard focus on the note body so Vim motions work immediately
+    /// after entering edit mode.
+    fn focus_note_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let handle = self.note_edit.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
     }
 
     /// Hand focus back to the root view when the editor unmounts.
@@ -3450,6 +3458,7 @@ impl NoteBrowser {
                                             this.finish_edit(window, cx);
                                         } else {
                                             this.state.update(cx, |s, _| s.begin_edit());
+                                            this.focus_note_editor(window, cx);
                                         }
                                         cx.notify();
                                     })),
@@ -3570,6 +3579,66 @@ fn block_caret_bounds(
     )
 }
 
+/// One character-cell advance for the caret at `cursor`.
+///
+/// On an empty line the newline has no glyph, so measure the nearest printable
+/// character (preferring a single-width one). This keeps the block cursor one
+/// character wide instead of falling back to a fraction of the line height.
+fn caret_cell_width(
+    state: &TextareaState,
+    cursor: usize,
+    line_height: gpui_kit::Pixels,
+) -> gpui_kit::Pixels {
+    let text = state.text();
+    let next = text
+        .slice(cursor..text.len())
+        .chars()
+        .next()
+        .map(|c| cursor + c.len_utf8())
+        .unwrap_or(cursor);
+    if next > cursor {
+        if let Some(width) = state
+            .range_to_bounds(&(cursor..next))
+            .map(|bounds| bounds.size.width)
+            .filter(|width| *width > px(0.))
+        {
+            return width;
+        }
+    }
+    let text = text.to_string();
+    let mut nearest_single = None;
+    let mut nearest_any = None;
+    for (index, c) in text.char_indices() {
+        if c == '\n' || c == '\r' {
+            continue;
+        }
+        let distance = index.abs_diff(cursor);
+        let candidate = (index, index + c.len_utf8(), distance);
+        if nearest_any
+            .map(|(_, _, best): (usize, usize, usize)| distance < best)
+            .unwrap_or(true)
+        {
+            nearest_any = Some(candidate);
+        }
+        if vim::char_display_width(c) == 1
+            && nearest_single
+                .map(|(_, _, best): (usize, usize, usize)| distance < best)
+                .unwrap_or(true)
+        {
+            nearest_single = Some(candidate);
+        }
+    }
+    nearest_single
+        .or(nearest_any)
+        .and_then(|(start, end, _)| {
+            state
+                .range_to_bounds(&(start..end))
+                .map(|bounds| bounds.size.width)
+                .filter(|width| *width > px(0.))
+        })
+        .unwrap_or(line_height * 0.42)
+}
+
 /// Mode cursor plus Visual Block selection rectangles.
 ///
 /// gpui's native caret is always a thin bar, so the overlay paints a
@@ -3614,22 +3683,16 @@ fn vim_cursor_overlay(
             // The laid-out cell is already in paint coordinates (including
             // vertical scroll) and matches the glyph grid, unlike the caret
             // geometry which excludes the vertical scroll offset.
-            let (base, scroll_y, width) = match state.range_to_bounds(&(cursor..next)) {
-                Some(cell) => {
-                    let width = if cell.size.width > px(0.) {
-                        cell.size.width
-                    } else {
-                        cell.size.height * 0.55
-                    };
-                    (cell, px(0.), width)
-                }
+            let (base, scroll_y) = match state.range_to_bounds(&(cursor..next)) {
+                Some(cell) => (cell, px(0.)),
                 None => {
-                    let Some((caret, line_height)) = state.cursor_layout() else {
+                    let Some((caret, _line_height)) = state.cursor_layout() else {
                         return;
                     };
-                    (caret, state.scroll_offset().y, line_height * 0.55)
+                    (caret, state.scroll_offset().y)
                 }
             };
+            let width = caret_cell_width(&state, cursor, base.size.height);
             let rect = block_caret_bounds(base, scroll_y, width);
             window.paint_quad(gpui_kit::fill(rect, caret_color));
         },
