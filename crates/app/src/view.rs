@@ -2129,7 +2129,7 @@ impl NoteBrowser {
         let Some(memory) = self.edit_memory.as_ref() else {
             return;
         };
-        if self.state.read(cx).selected_note.as_deref() != Some(memory.note_id.as_str()) {
+        if !editor_memory_matches(memory, self.state.read(cx).selected_note.as_deref()) {
             return;
         }
         let memory = self.edit_memory.take().expect("checked above");
@@ -3795,6 +3795,13 @@ fn preview_offset_for_cursor(
     offset.clamp(-max_offset, 0.0)
 }
 
+/// Whether a captured editor position belongs to the note that is open now.
+/// Switching notes clears the memory, but matching by id also keeps a stale
+/// capture from ever moving the caret in a different note.
+fn editor_memory_matches(memory: &EditorMemory, selected_note: Option<&str>) -> bool {
+    selected_note == Some(memory.note_id.as_str())
+}
+
 /// Background opacity for one list row.
 ///
 /// A focused list shows only its keyboard cursor row; an unfocused list shows
@@ -4430,6 +4437,19 @@ mod tests {
             preview_offset_for_cursor(9.0, 10.0, 0.0, 500.0, 0.0),
             -500.0
         );
+    }
+
+    #[test]
+    fn edit_memory_only_applies_to_its_own_note() {
+        let memory = EditorMemory {
+            note_id: "note-a".into(),
+            line: 12,
+            column: 4,
+            scroll_y: -240.0,
+        };
+        assert!(editor_memory_matches(&memory, Some("note-a")));
+        assert!(!editor_memory_matches(&memory, Some("note-b")));
+        assert!(!editor_memory_matches(&memory, None));
     }
 
     #[test]
