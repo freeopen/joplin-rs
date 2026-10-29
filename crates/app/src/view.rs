@@ -1332,8 +1332,9 @@ impl NoteBrowser {
     fn vim_open_line(&mut self, above: bool, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.vim_text(cx);
         let cursor = self.note_edit.read(cx).cursor();
-        self.note_edit
-            .update(cx, |s, cx| insert_vim_line(s, &text, cursor, above, window, cx));
+        self.note_edit.update(cx, |s, cx| {
+            insert_vim_line(s, &text, cursor, above, window, cx)
+        });
         self.vim_insert_snapshot = Some(self.vim_text(cx));
         self.set_vim_mode(VimMode::Insert, cx);
     }
@@ -4497,9 +4498,8 @@ mod tests {
     fn vim_insert_and_line_keys_map_to_expected_offsets() {
         let text = "  one\ntwo\n   \n你好";
         let mut pending = String::new();
-        let normal = |pending: &mut String, key: &str| {
-            vim::translate(VimMode::Normal, pending, key, false)
-        };
+        let normal =
+            |pending: &mut String, key: &str| vim::translate(VimMode::Normal, pending, key, false);
 
         // `A` targets the logical line end, `I` the first non-blank.
         let a = normal(&mut pending, "A");

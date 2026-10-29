@@ -1979,7 +1979,10 @@ mod tests {
         assert_eq!(open_line_offsets(text, 5, true), (4, 4));
         // First and last lines, including a final line without a newline.
         assert_eq!(open_line_offsets(text, 0, true), (0, 0));
-        assert_eq!(open_line_offsets(text, 9, false), (text.len(), text.len() + 1));
+        assert_eq!(
+            open_line_offsets(text, 9, false),
+            (text.len(), text.len() + 1)
+        );
         // Empty middle line.
         let blank = "a\n\nb";
         assert_eq!(open_line_offsets(blank, 2, false), (2, 3));
@@ -1996,7 +1999,7 @@ mod tests {
         assert_eq!(line_last_char_offset(text, 7), 8); // 'o' in "two"
         assert_eq!(line_last_char_offset(text, 10), 12); // last space of a blank line
         assert_eq!(line_last_char_offset(text, text.len()), 17); // CJK char start
-        // A truly empty line resolves to its start.
+                                                                 // A truly empty line resolves to its start.
         assert_eq!(line_last_char_offset("a\n\nb", 2), 2);
 
         assert_eq!(first_non_blank_offset(text, 3), 2);
