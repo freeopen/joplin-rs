@@ -4546,6 +4546,20 @@ mod tests {
                 expected: "one\ntwo\n",
                 expected_cursor: 8,
             },
+            OpenCase {
+                text: "你好世界",
+                cursor: 3,
+                above: false,
+                expected: "你好世界\n",
+                expected_cursor: 13,
+            },
+            OpenCase {
+                text: "你好世界",
+                cursor: 3,
+                above: true,
+                expected: "\n你好世界",
+                expected_cursor: 0,
+            },
         ];
         for case in cases {
             window
@@ -4578,6 +4592,50 @@ mod tests {
                         s.set_selected_range(offset..offset, cx);
                         assert_eq!(s.cursor(), expected);
                     }
+                });
+            })
+            .unwrap();
+
+        // `A` appends after the last character; `I` inserts at the first
+        // non-blank. Typing goes through the textarea, not just the caret.
+        window
+            .update(cx, |_root, window, cx| {
+                textarea.update(cx, |s, cx| {
+                    s.set_value(text, window, cx);
+                    let at = vim::line_end_offset(text, 4);
+                    s.set_selected_range(at..at, cx);
+                    s.insert("!", window, cx);
+                    assert_eq!(s.value().to_string(), "  hello!\nworld");
+
+                    s.set_value(text, window, cx);
+                    let at = vim::first_non_blank_offset(text, 4);
+                    s.set_selected_range(at..at, cx);
+                    s.insert(">", window, cx);
+                    assert_eq!(s.value().to_string(), "  >hello\nworld");
+                });
+            })
+            .unwrap();
+
+        // The newline is inserted as one atomic edit, so a single Undo
+        // removes the whole opened line.
+        window
+            .update(cx, |_root, window, cx| {
+                textarea.update(cx, |s, cx| {
+                    s.set_value("hello", window, cx);
+                    s.set_selected_range(0..0, cx);
+                    insert_vim_line(s, "hello", 0, false, window, cx);
+                    assert_eq!(s.value().to_string(), "hello\n");
+                    s.focus_handle(cx).focus(window, cx);
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.dispatch_action(window.into(), Undo);
+        cx.run_until_parked();
+        window
+            .update(cx, |_root, _window, cx| {
+                textarea.update(cx, |s, _cx| {
+                    assert_eq!(s.value().to_string(), "hello");
                 });
             })
             .unwrap();
