@@ -2007,6 +2007,50 @@ mod tests {
     }
 
     #[test]
+    fn line_offsets_hold_for_every_cursor_boundary() {
+        let texts = ["", "a", "a\n", "a\nb", "a\n\nb\n", "  one\n\t\n你好\n"];
+        for text in texts {
+            let lines = line_starts(text).len();
+            for cursor in 0..=text.len() {
+                if !text.is_char_boundary(cursor) {
+                    continue;
+                }
+                let start = line_start_offset(text, cursor);
+                let end = line_end_offset(text, cursor);
+                assert!(start <= cursor && cursor <= end, "{text:?}@{cursor}");
+
+                let last = line_last_char_offset(text, cursor);
+                assert!(text.is_char_boundary(last));
+                assert!((start..=end).contains(&last), "{text:?}@{cursor}");
+                if end > start {
+                    assert_eq!(text[last..end].chars().count(), 1, "{text:?}@{cursor}");
+                } else {
+                    assert_eq!(last, start);
+                }
+
+                let first = first_non_blank_offset(text, cursor);
+                assert!(text.is_char_boundary(first));
+                assert!((start..=end).contains(&first));
+                assert!(text[start..first].chars().all(char::is_whitespace));
+                if first < end {
+                    assert!(!text[first..].chars().next().unwrap().is_whitespace());
+                }
+
+                // `o` inserts at the line end; `O` at the line start. Either
+                // way the caret lands on the new empty line and exactly one
+                // line is added for every cursor position.
+                for above in [false, true] {
+                    let (at, after) = open_line_offsets(text, cursor, above);
+                    let mut opened = text.to_string();
+                    opened.insert(at, '\n');
+                    assert_eq!(line_start_offset(&opened, after), after);
+                    assert_eq!(line_starts(&opened).len(), lines + 1);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn word_offsets() {
         let text = "foo bar  baz";
         assert_eq!(word_forward_offset(text, 0, 1), 4);
