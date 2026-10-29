@@ -341,6 +341,25 @@ fn insert_vim_line(
     state.set_selected_range(after..after, cx);
 }
 
+/// Caret target for `I` / `A`. Kept separate from the action match so the
+/// key-to-offset wiring is unit-testable without a NoteBrowser.
+fn vim_insert_entry_at(text: &str, cursor: usize, action: &VimAction) -> Option<usize> {
+    match action {
+        VimAction::InsertAtLineStart => Some(vim::first_non_blank_offset(text, cursor)),
+        VimAction::InsertAtLineEnd => Some(vim::line_end_offset(text, cursor)),
+        _ => None,
+    }
+}
+
+/// Caret target for `0` / `$`.
+fn vim_line_move_at(text: &str, cursor: usize, kind: MoveKind) -> Option<usize> {
+    match kind {
+        MoveKind::LineStart => Some(vim::line_start_offset(text, cursor)),
+        MoveKind::LineEnd => Some(vim::line_last_char_offset(text, cursor)),
+        _ => None,
+    }
+}
+
 impl NoteBrowser {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let state = cx.new(|_| AppState::new().expect("open storage"));
@@ -1258,19 +1277,13 @@ impl NoteBrowser {
                 self.note_edit
                     .update(cx, |s, cx| s.set_selected_range(to..to, cx));
             }
-            MoveKind::LineStart => {
+            MoveKind::LineStart | MoveKind::LineEnd => {
                 let text = self.vim_text(cx);
                 let cursor = self.note_edit.read(cx).cursor();
-                let at = vim::line_start_offset(&text, cursor);
-                self.note_edit
-                    .update(cx, |s, cx| s.set_selected_range(at..at, cx));
-            }
-            MoveKind::LineEnd => {
-                let text = self.vim_text(cx);
-                let cursor = self.note_edit.read(cx).cursor();
-                let at = vim::line_last_char_offset(&text, cursor);
-                self.note_edit
-                    .update(cx, |s, cx| s.set_selected_range(at..at, cx));
+                if let Some(at) = vim_line_move_at(&text, cursor, kind) {
+                    self.note_edit
+                        .update(cx, |s, cx| s.set_selected_range(at..at, cx));
+                }
             }
             MoveKind::DocStart => {
                 window.dispatch_action(Box::new(MoveToStart), cx);
@@ -2020,17 +2033,12 @@ impl NoteBrowser {
                 self.vim_insert_snapshot = Some(self.vim_text(cx));
                 self.set_vim_mode(VimMode::Insert, cx);
             }
-            VimAction::InsertAtLineStart => {
+            action @ (VimAction::InsertAtLineStart | VimAction::InsertAtLineEnd) => {
                 let text = self.vim_text(cx);
                 let cursor = self.note_edit.read(cx).cursor();
-                let at = vim::first_non_blank_offset(&text, cursor);
-                self.vim_insert_at(at, cx);
-            }
-            VimAction::InsertAtLineEnd => {
-                let text = self.vim_text(cx);
-                let cursor = self.note_edit.read(cx).cursor();
-                let at = vim::line_end_offset(&text, cursor);
-                self.vim_insert_at(at, cx);
+                if let Some(at) = vim_insert_entry_at(&text, cursor, &action) {
+                    self.vim_insert_at(at, cx);
+                }
             }
             VimAction::OpenLineBelow => self.vim_open_line(false, window, cx),
             VimAction::OpenLineAbove => self.vim_open_line(true, window, cx),
@@ -4485,8 +4493,37 @@ mod tests {
         assert_eq!(list_row_opacity(false, false, true), None);
     }
 
-    #[gpui_kit::test]
-    fn vim_line_edits_drive_the_real_textarea(cx: &mut gpui_kit::TestAppContext) {
+    #[test]
+    fn vim_insert_and_line_keys_map_to_expected_offsets() {
+        let text = "  one\ntwo\n   \n你好";
+        let mut pending = String::new();
+        let normal = |pending: &mut String, key: &str| {
+            vim::translate(VimMode::Normal, pending, key, false)
+        };
+
+        // `A` targets the logical line end, `I` the first non-blank.
+        let a = normal(&mut pending, "A");
+        assert_eq!(vim_insert_entry_at(text, 7, &a), Some(9));
+        let i = normal(&mut pending, "I");
+        assert_eq!(vim_insert_entry_at(text, 3, &i), Some(2));
+        assert_eq!(vim_insert_entry_at(text, 10, &i), Some(13));
+        assert_eq!(vim_insert_entry_at(text, 3, &VimAction::Swallow), None);
+
+        // `0` / `$` target the logical start and the last character.
+        let VimAction::Move { kind, .. } = normal(&mut pending, "0") else {
+            panic!("0 should be a line-start motion");
+        };
+        assert_eq!(vim_line_move_at(text, 7, kind), Some(6));
+        let VimAction::Move { kind, .. } = normal(&mut pending, "$") else {
+            panic!("$ should be a line-end motion");
+        };
+        assert_eq!(vim_line_move_at(text, 7, kind), Some(8));
+        assert_eq!(vim_line_move_at(text, text.len(), kind), Some(17));
+        assert_eq!(vim_line_move_at(text, 7, MoveKind::Down), None);
+    }
+
+    #[gpui::test]
+    fn vim_line_edits_drive_the_real_textarea(cx: &mut gpui::TestAppContext) {
         struct Root(Entity<TextareaState>);
         impl Render for Root {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
