@@ -324,6 +324,23 @@ impl Focusable for NoteBrowser {
     }
 }
 
+/// `o` / `O` text edit. Kept as a free function so view tests can drive the
+/// exact same TextareaState sequence without building a whole NoteBrowser.
+fn insert_vim_line(
+    state: &mut TextareaState,
+    text: &str,
+    cursor: usize,
+    above: bool,
+    window: &mut Window,
+    cx: &mut Context<TextareaState>,
+) {
+    let (at, after) = vim::open_line_offsets(text, cursor, above);
+    state.set_selected_range(at..at, cx);
+    state.insert("\n", window, cx);
+    let after = after.min(state.text().len());
+    state.set_selected_range(after..after, cx);
+}
+
 impl NoteBrowser {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let state = cx.new(|_| AppState::new().expect("open storage"));
@@ -1302,13 +1319,8 @@ impl NoteBrowser {
     fn vim_open_line(&mut self, above: bool, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.vim_text(cx);
         let cursor = self.note_edit.read(cx).cursor();
-        let (at, after) = vim::open_line_offsets(&text, cursor, above);
-        self.note_edit.update(cx, |s, cx| {
-            s.set_selected_range(at..at, cx);
-            s.insert("\n", window, cx);
-            let after = after.min(s.text().len());
-            s.set_selected_range(after..after, cx);
-        });
+        self.note_edit
+            .update(cx, |s, cx| insert_vim_line(s, &text, cursor, above, window, cx));
         self.vim_insert_snapshot = Some(self.vim_text(cx));
         self.set_vim_mode(VimMode::Insert, cx);
     }
@@ -4471,5 +4483,103 @@ mod tests {
         assert_eq!(list_row_opacity(true, true, false), None);
         assert_eq!(list_row_opacity(false, true, false), Some(0.35));
         assert_eq!(list_row_opacity(false, false, true), None);
+    }
+
+    #[gpui_kit::test]
+    fn vim_line_edits_drive_the_real_textarea(cx: &mut gpui_kit::TestAppContext) {
+        struct Root(Entity<TextareaState>);
+        impl Render for Root {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().child(self.0.clone())
+            }
+        }
+
+        let mut state = None;
+        let window = cx.add_window(|window, cx| {
+            gpui_kit::init(cx);
+            let textarea = cx.new(|cx| TextareaState::new(window, cx));
+            state = Some(textarea.clone());
+            Root(textarea)
+        });
+        let textarea = state.expect("textarea state");
+
+        struct OpenCase {
+            text: &'static str,
+            cursor: usize,
+            above: bool,
+            expected: &'static str,
+            expected_cursor: usize,
+        }
+        let cases = [
+            OpenCase {
+                text: "hello world",
+                cursor: 5,
+                above: false,
+                expected: "hello world\n",
+                expected_cursor: 12,
+            },
+            OpenCase {
+                text: "hello world",
+                cursor: 5,
+                above: true,
+                expected: "\nhello world",
+                expected_cursor: 0,
+            },
+            OpenCase {
+                text: "one\ntwo\nthree",
+                cursor: 5,
+                above: false,
+                expected: "one\ntwo\n\nthree",
+                expected_cursor: 8,
+            },
+            OpenCase {
+                text: "one\ntwo\nthree",
+                cursor: 5,
+                above: true,
+                expected: "one\n\ntwo\nthree",
+                expected_cursor: 4,
+            },
+            OpenCase {
+                text: "one\ntwo",
+                cursor: 5,
+                above: false,
+                expected: "one\ntwo\n",
+                expected_cursor: 8,
+            },
+        ];
+        for case in cases {
+            window
+                .update(cx, |_root, window, cx| {
+                    textarea.update(cx, |s, cx| {
+                        s.set_value(case.text, window, cx);
+                        s.set_selected_range(case.cursor..case.cursor, cx);
+                        insert_vim_line(s, case.text, case.cursor, case.above, window, cx);
+                        assert_eq!(s.value().to_string(), case.expected);
+                        assert_eq!(s.cursor(), case.expected_cursor);
+                    });
+                })
+                .unwrap();
+        }
+
+        // `I`, `A`, `0`, `$` only move the caret; verify the offsets the
+        // action layer uses land where expected in a real textarea.
+        let text = "  hello\nworld";
+        window
+            .update(cx, |_root, window, cx| {
+                textarea.update(cx, |s, cx| {
+                    s.set_value(text, window, cx);
+                    let checks = [
+                        (vim::first_non_blank_offset(text, 4), 2),
+                        (vim::line_end_offset(text, 4), 7),
+                        (vim::line_start_offset(text, 4), 0),
+                        (vim::line_last_char_offset(text, 4), 6),
+                    ];
+                    for (offset, expected) in checks {
+                        s.set_selected_range(offset..offset, cx);
+                        assert_eq!(s.cursor(), expected);
+                    }
+                });
+            })
+            .unwrap();
     }
 }

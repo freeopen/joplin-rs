@@ -42,3 +42,8 @@ objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSImage", "NSMe
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Headless GPUI windows for view-level tests (`#[gpui::test]`). Depend on the
+# engine directly: gpui-kit's own test-support feature pulls the optional
+# gpui-fast stack, whose pinned unicode-properties version conflicts with the
+# locked gpui-pre one.
+gpui = { package = "gpui-pre", version = "=0.3.9", features = ["test-support"] }
