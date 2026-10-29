@@ -202,6 +202,27 @@ struct VisualSnapshot {
     cursor: usize,
 }
 
+/// Cursor and scroll position captured when edit mode is left, so returning
+/// to edit puts the caret back where the user left it.
+#[derive(Debug, Clone)]
+struct EditorMemory {
+    note_id: String,
+    line: u32,
+    column: u32,
+    scroll_y: f32,
+}
+
+/// Source-line anchor used to place the preview at the line the caret was on.
+/// Markdown cannot be anchored per source line, so the line ratio is an
+/// approximation; `screen_fraction` keeps the caret at the same vertical
+/// position inside the viewport.
+#[derive(Debug, Clone)]
+struct PreviewAnchor {
+    cursor_line: f32,
+    total_lines: f32,
+    screen_fraction: f32,
+}
+
 /// The root view; owns the framework-agnostic state as an entity sibling.
 pub struct NoteBrowser {
     state: Entity<AppState>,
@@ -271,14 +292,21 @@ pub struct NoteBrowser {
     /// Preview scroll handle (`#note-body-scroll`), used to restore the scroll
     /// position after leaving edit mode.
     preview_scroll: ScrollHandle,
-    /// Ratio (0..=1) of the source line the preview should scroll to, set by
-    /// [`Self::capture_preview_ratio`] and applied by the tick once the
+    /// Cursor line anchor the preview should scroll to, set by
+    /// [`Self::capture_preview_anchor`] and applied by the tick once the
     /// preview has been laid out.
-    pending_preview_ratio: Option<f32>,
+    pending_preview_anchor: Option<PreviewAnchor>,
     /// Note id the preview scroll belongs to; switching notes resets it.
     preview_note: Option<String>,
     /// Ticks spent waiting for the preview layout before giving up.
     preview_retry: u32,
+    /// Caret position captured when edit mode was left; consumed when edit
+    /// mode starts again for the same note.
+    edit_memory: Option<EditorMemory>,
+    /// The preview element mounts one frame after edit mode ends. Focus is
+    /// requested immediately and retried once from the tick if the mount race
+    /// lost the focus.
+    pending_body_focus: bool,
     /// Settings dialog input fields.
     set_url: Entity<InputState>,
     set_user: Entity<InputState>,
@@ -559,6 +587,9 @@ impl NoteBrowser {
                                 .update(cx, |i, cx| i.set_value(title, window, cx));
                             this.note_edit
                                 .update(cx, |i, cx| i.set_value(body, window, cx));
+                            // `set_value` collapses the caret to 0..0; put it
+                            // back where the user left edit mode.
+                            this.restore_editor_position(window, cx);
                         }
                         // A protected note (re)locked: clear the gate field so
                         // the re-opened gate never shows the last password.
@@ -591,21 +622,44 @@ impl NoteBrowser {
                         let note_id = this.state.read(cx).selected_note.clone();
                         if note_id != this.preview_note {
                             this.preview_note = note_id;
-                            this.pending_preview_ratio = None;
+                            this.pending_preview_anchor = None;
                             this.preview_retry = 0;
+                            this.edit_memory = None;
                             this.preview_scroll.set_offset(point(px(0.), px(0.)));
                         }
-                        if let Some(ratio) = this.pending_preview_ratio {
+                        // The preview was just mounted; focus may have been
+                        // lost while the editor element unmounted. Retry once
+                        // (the editor gets focus back if editing resumed).
+                        if this.pending_body_focus {
+                            this.pending_body_focus = false;
+                            let can_focus_body = !this.state.read(cx).editing
+                                && matches!(this.state.read(cx).dialog, AppDialog::None);
+                            if can_focus_body && !this.body_focus.is_focused(window) {
+                                window.focus(&this.body_focus, cx);
+                            }
+                        }
+                        if let Some(anchor) = this.pending_preview_anchor.clone() {
                             if !this.state.read(cx).editing {
                                 let max = this.preview_scroll.max_offset();
-                                if max.y > px(0.) {
-                                    this.preview_scroll
-                                        .set_offset(point(px(0.), -max.y * ratio));
-                                    this.pending_preview_ratio = None;
+                                let viewport = this.preview_scroll.bounds().size.height;
+                                if max.y > px(0.) && viewport > px(0.) {
+                                    let offset = preview_offset_for_cursor(
+                                        anchor.cursor_line,
+                                        anchor.total_lines,
+                                        anchor.screen_fraction,
+                                        f32::from(max.y),
+                                        f32::from(viewport),
+                                    );
+                                    this.preview_scroll.set_offset(point(px(0.), px(offset)));
+                                    this.pending_preview_anchor = None;
+                                } else if viewport > px(0.) {
+                                    // Laid out and the document fits: there is
+                                    // nothing to scroll to.
+                                    this.pending_preview_anchor = None;
                                 } else {
                                     this.preview_retry = this.preview_retry.saturating_add(1);
                                     if this.preview_retry > 20 {
-                                        this.pending_preview_ratio = None;
+                                        this.pending_preview_anchor = None;
                                     }
                                 }
                             }
@@ -668,9 +722,11 @@ impl NoteBrowser {
             vim_last_change: None,
             vim_insert_snapshot: None,
             preview_scroll: ScrollHandle::new(),
-            pending_preview_ratio: None,
+            pending_preview_anchor: None,
             preview_note: None,
             preview_retry: 0,
+            edit_memory: None,
+            pending_body_focus: false,
             set_url,
             set_user,
             set_pw,
@@ -806,6 +862,9 @@ impl NoteBrowser {
             "k" => self.scroll_preview(false),
             _ => return,
         }
+        // The user took over scrolling; do not let the pending edit->preview
+        // anchor snap the view back on the next tick.
+        self.pending_preview_anchor = None;
         cx.notify();
     }
 
@@ -841,15 +900,26 @@ impl NoteBrowser {
         window.focus(&handle, cx);
     }
 
-    /// Hand focus back to the root view when the editor unmounts.
+    /// Restore keyboard focus after the editor unmounts.
     ///
     /// Leaving edit mode drops the textarea (and the in-editor find panel)
     /// from the element tree while they may hold focus. A focused element that
     /// disappears takes the key-dispatch path with it, so every shortcut goes
-    /// dead until the user clicks something (repro: ⌘F then ⌘E). Focusing the
-    /// root restores the "NoteBrowser" key context the bindings dispatch from.
+    /// dead until the user clicks something (repro: ⌘F then ⌘E). Focus the
+    /// preview body instead of the root so `j`/`k` work immediately; the tick
+    /// retries once if the preview element was not mounted yet.
     fn refocus_after_editor_closed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        window.focus(&self.focus, cx);
+        self.pending_body_focus = true;
+        self.focus_body_focus(window, cx);
+        // The preview element is created on the next render. Repeat the focus
+        // request then (the tick still verifies and retries if needed).
+        cx.on_next_frame(window, |this, window, cx| {
+            let can_focus_body = !this.state.read(cx).editing
+                && matches!(this.state.read(cx).dialog, AppDialog::None);
+            if can_focus_body {
+                window.focus(&this.body_focus, cx);
+            }
+        });
     }
 
     /// Open the global search dialog (⌘⌥F): type a query, Enter runs it.
@@ -877,6 +947,7 @@ impl NoteBrowser {
             self.note_edit
                 .update(cx, |i, cx| i.set_value(body, window, cx));
             self.edit_epoch_seen = self.state.read(cx).edit_epoch;
+            self.restore_editor_position(window, cx);
             // The editor element is only rendered on the next frame; defer the
             // focus + Search dispatch to the tick, otherwise the action is
             // dropped and the find panel never opens on the first ⌘F.
@@ -2022,7 +2093,8 @@ impl NoteBrowser {
         if !self.state.read(cx).editing {
             return;
         }
-        self.capture_preview_ratio(cx);
+        self.capture_editor_memory(cx);
+        self.capture_preview_anchor(cx);
         self.state.update(cx, |s, _| s.end_edit());
         self.vim_anchor = None;
         self.vim_insert_snapshot = None;
@@ -2031,17 +2103,58 @@ impl NoteBrowser {
         self.refocus_after_editor_closed(window, cx);
     }
 
-    /// Record the source-line ratio at the top of the editor viewport so the
-    /// tick can scroll the preview to the same place once it is laid out.
-    fn capture_preview_ratio(&mut self, cx: &mut Context<Self>) {
-        let note_id = self.state.read(cx).selected_note.clone();
+    /// Record the caret and editor scroll offset so the next edit session for
+    /// this note can continue where this one stopped.
+    fn capture_editor_memory(&mut self, cx: &mut Context<Self>) {
+        let Some(note_id) = self.state.read(cx).selected_note.clone() else {
+            return;
+        };
+        let st = self.note_edit.read(cx);
+        let position = st.cursor_position();
+        self.edit_memory = Some(EditorMemory {
+            note_id,
+            line: position.line,
+            column: position.character,
+            scroll_y: f32::from(st.scroll_offset().y),
+        });
+    }
+
+    /// Put the caret (and the editor viewport) back to the captured position.
+    /// Called after the editor fields are seeded from `edit_body`, because
+    /// `set_value` resets the selection to `0..0` and scrolls to the start.
+    fn restore_editor_position(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.state.read(cx).editing {
+            return;
+        }
+        let Some(memory) = self.edit_memory.as_ref() else {
+            return;
+        };
+        if self.state.read(cx).selected_note.as_deref() != Some(memory.note_id.as_str()) {
+            return;
+        }
+        let memory = self.edit_memory.take().expect("checked above");
+        self.note_edit.update(cx, |state, cx| {
+            let position = Position::new(memory.line, memory.column);
+            state.set_cursor_position(position, window, cx);
+            state.set_scroll_offset(point(px(0.), px(memory.scroll_y)), cx);
+        });
+        self.focus_note_editor(window, cx);
+    }
+
+    /// Record the caret's source line and its relative screen position so the
+    /// tick can scroll the preview near the same place once it is laid out.
+    fn capture_preview_anchor(&mut self, cx: &mut Context<Self>) {
+        let Some(note_id) = self.state.read(cx).selected_note.clone() else {
+            return;
+        };
         let st = self.note_edit.read(cx);
         let Some((caret, line_height)) = st.cursor_layout() else {
             return;
         };
         let input = st.input_bounds();
         let line_height = f32::from(line_height);
-        if line_height <= 0.0 {
+        let viewport = f32::from(input.size.height);
+        if line_height <= 0.0 || viewport <= 0.0 {
             return;
         }
         let total_lines = st.text().to_string().lines().count().max(1);
@@ -2050,10 +2163,13 @@ impl NoteBrowser {
         // scroll offset that paint applies to the native caret.
         let scroll_y = st.scroll_offset().y;
         let caret_top = f32::from(caret.top() + scroll_y - input.top());
-        let top_line = (cursor_line - caret_top / line_height).max(0.0);
-        let ratio = (top_line / (total_lines.saturating_sub(1)).max(1) as f32).clamp(0.0, 1.0);
-        self.pending_preview_ratio = Some(ratio);
-        self.preview_note = note_id;
+        let screen_fraction = (caret_top / viewport).clamp(0.0, 1.0);
+        self.pending_preview_anchor = Some(PreviewAnchor {
+            cursor_line,
+            total_lines: total_lines as f32,
+            screen_fraction,
+        });
+        self.preview_note = Some(note_id);
         self.preview_retry = 0;
     }
 
@@ -3656,6 +3772,29 @@ fn preview_scroll_target(current: f32, max: f32, viewport: f32, down: bool) -> f
     }
 }
 
+/// Scroll offset that places the caret's source line at the same relative
+/// vertical position it had in the editor.
+///
+/// The preview cannot report per-source-line heights, so the line index is
+/// mapped onto the preview's scrollable content by ratio. `screen_fraction` is
+/// where the caret sat in the editor viewport (0 = top, 1 = bottom).
+fn preview_offset_for_cursor(
+    cursor_line: f32,
+    total_lines: f32,
+    screen_fraction: f32,
+    max_offset: f32,
+    viewport: f32,
+) -> f32 {
+    if max_offset <= 0.0 {
+        return 0.0;
+    }
+    let content = max_offset + viewport.max(0.0);
+    let line_ratio = (cursor_line / (total_lines - 1.0).max(1.0)).clamp(0.0, 1.0);
+    let screen_fraction = screen_fraction.clamp(0.0, 1.0);
+    let offset = -(content * line_ratio - viewport * screen_fraction);
+    offset.clamp(-max_offset, 0.0)
+}
+
 /// Background opacity for one list row.
 ///
 /// A focused list shows only its keyboard cursor row; an unfocused list shows
@@ -4265,6 +4404,32 @@ mod tests {
         assert_eq!(preview_scroll_target(-100.0, 500.0, 200.0, false), 0.0);
         assert_eq!(preview_scroll_target(-480.0, 500.0, 200.0, true), -500.0);
         assert_eq!(preview_scroll_target(0.0, 500.0, 0.0, true), -200.0);
+    }
+
+    #[test]
+    fn preview_offset_keeps_the_cursor_line_at_its_screen_fraction() {
+        // First line at the top: no scroll. Last line at the bottom: full scroll.
+        assert_eq!(preview_offset_for_cursor(0.0, 10.0, 0.0, 500.0, 200.0), 0.0);
+        assert_eq!(
+            preview_offset_for_cursor(9.0, 10.0, 1.0, 500.0, 200.0),
+            -500.0
+        );
+        // Middle line at the middle of the viewport: content 700 -> 350 - 100.
+        assert_eq!(
+            preview_offset_for_cursor(4.5, 10.0, 0.5, 500.0, 200.0),
+            -250.0
+        );
+        // A document that fits does not scroll.
+        assert_eq!(preview_offset_for_cursor(5.0, 10.0, 0.5, 0.0, 200.0), 0.0);
+        // A single-line document never divides by zero or scrolls.
+        assert_eq!(preview_offset_for_cursor(0.0, 1.0, 0.0, 500.0, 200.0), 0.0);
+        // Target above the content start clamps to the top.
+        assert_eq!(preview_offset_for_cursor(0.0, 10.0, 1.0, 500.0, 200.0), 0.0);
+        // Viewport zero still maps the line ratio onto the content.
+        assert_eq!(
+            preview_offset_for_cursor(9.0, 10.0, 0.0, 500.0, 0.0),
+            -500.0
+        );
     }
 
     #[test]
