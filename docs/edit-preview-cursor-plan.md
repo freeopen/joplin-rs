@@ -127,4 +127,4 @@ fn preview_offset_for_cursor(
 - 预览切换后直接按 `j`/`k`，页面立即按半屏滚动，无需先点击正文。
 - 再切回“编辑”，光标和编辑器滚动位置恢复到离开时的行。
 - 在文档末尾用 `G` 定位后重复上述流程：预览落到文档末尾附近，按 `k` 滚动后再切回编辑，仍回到末尾光标和原滚动位置。
-- 单测 `cargo test -p joplin-rs-app` 84 项通过，`cargo check`、`cargo build -p joplin-rs-app` 通过。
+- 单测 `cargo test -p joplin-rs-app` 85 项通过（含光标行定位换算、编辑记忆按笔记匹配），`cargo check`、`cargo build -p joplin-rs-app` 通过。
