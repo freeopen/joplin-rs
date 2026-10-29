@@ -25,9 +25,9 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants},
     dialog::{DialogAction, DialogFooter},
     input::{
-        Copy, Cut, Delete, Enter, Input, InputEvent, InputState, MoveDown, MoveLeft, MovePageDown,
-        MovePageUp, MoveRight, MoveToEnd, MoveToEndOfLine, MoveToStart, MoveToStartOfLine, MoveUp,
-        Paste, Position, Redo, Search, SelectAll, Textarea, TextareaState, Undo,
+        Copy, Cut, Delete, Input, InputEvent, InputState, MoveDown, MoveLeft, MovePageDown,
+        MovePageUp, MoveRight, MoveToEnd, MoveToStart, MoveUp, Paste, Position, Redo, Search,
+        SelectAll, Textarea, TextareaState, Undo,
     },
     menu::{ContextMenuExt, PopupMenuItem},
     scroll::Scrollbar,
@@ -1242,10 +1242,18 @@ impl NoteBrowser {
                     .update(cx, |s, cx| s.set_selected_range(to..to, cx));
             }
             MoveKind::LineStart => {
-                window.dispatch_action(Box::new(MoveToStartOfLine), cx);
+                let text = self.vim_text(cx);
+                let cursor = self.note_edit.read(cx).cursor();
+                let at = vim::line_start_offset(&text, cursor);
+                self.note_edit
+                    .update(cx, |s, cx| s.set_selected_range(at..at, cx));
             }
             MoveKind::LineEnd => {
-                window.dispatch_action(Box::new(MoveToEndOfLine), cx);
+                let text = self.vim_text(cx);
+                let cursor = self.note_edit.read(cx).cursor();
+                let at = vim::line_last_char_offset(&text, cursor);
+                self.note_edit
+                    .update(cx, |s, cx| s.set_selected_range(at..at, cx));
             }
             MoveKind::DocStart => {
                 window.dispatch_action(Box::new(MoveToStart), cx);
@@ -1276,6 +1284,33 @@ impl NoteBrowser {
                 }
             }
         }
+    }
+
+    /// Place the caret at an absolute offset and enter Insert, snapshotting
+    /// the text so `.` can record what was typed. Used by `I` and `A`, which
+    /// must not depend on gpui line-movement actions (the textarea does not
+    /// bind `MoveToStartOfLine` / `MoveToEndOfLine`).
+    fn vim_insert_at(&mut self, at: usize, cx: &mut Context<Self>) {
+        self.note_edit
+            .update(cx, |s, cx| s.set_selected_range(at..at, cx));
+        self.vim_insert_snapshot = Some(self.vim_text(cx));
+        self.set_vim_mode(VimMode::Insert, cx);
+    }
+
+    /// `o` / `O`: insert a newline at the line boundary, move the caret onto
+    /// the new empty line, then enter Insert.
+    fn vim_open_line(&mut self, above: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.vim_text(cx);
+        let cursor = self.note_edit.read(cx).cursor();
+        let (at, after) = vim::open_line_offsets(&text, cursor, above);
+        self.note_edit.update(cx, |s, cx| {
+            s.set_selected_range(at..at, cx);
+            s.insert("\n", window, cx);
+            let after = after.min(s.text().len());
+            s.set_selected_range(after..after, cx);
+        });
+        self.vim_insert_snapshot = Some(self.vim_text(cx));
+        self.set_vim_mode(VimMode::Insert, cx);
     }
 
     /// Delete `range`, storing it in the register and recording the change.
@@ -1974,41 +2009,19 @@ impl NoteBrowser {
                 self.set_vim_mode(VimMode::Insert, cx);
             }
             VimAction::InsertAtLineStart => {
-                window.dispatch_action(Box::new(MoveToStartOfLine), cx);
-                self.vim_insert_snapshot = Some(self.vim_text(cx));
-                self.set_vim_mode(VimMode::Insert, cx);
+                let text = self.vim_text(cx);
+                let cursor = self.note_edit.read(cx).cursor();
+                let at = vim::first_non_blank_offset(&text, cursor);
+                self.vim_insert_at(at, cx);
             }
             VimAction::InsertAtLineEnd => {
-                window.dispatch_action(Box::new(MoveToEndOfLine), cx);
-                self.vim_insert_snapshot = Some(self.vim_text(cx));
-                self.set_vim_mode(VimMode::Insert, cx);
+                let text = self.vim_text(cx);
+                let cursor = self.note_edit.read(cx).cursor();
+                let at = vim::line_end_offset(&text, cursor);
+                self.vim_insert_at(at, cx);
             }
-            VimAction::OpenLineBelow => {
-                window.dispatch_action(Box::new(MoveToEndOfLine), cx);
-                window.dispatch_action(
-                    Box::new(Enter {
-                        secondary: false,
-                        shift: false,
-                    }),
-                    cx,
-                );
-                self.vim_insert_snapshot = Some(self.vim_text(cx));
-                self.set_vim_mode(VimMode::Insert, cx);
-            }
-            VimAction::OpenLineAbove => {
-                window.dispatch_action(Box::new(MoveToStartOfLine), cx);
-                window.dispatch_action(
-                    Box::new(Enter {
-                        secondary: false,
-                        shift: false,
-                    }),
-                    cx,
-                );
-                window.dispatch_action(Box::new(MoveUp), cx);
-                window.dispatch_action(Box::new(MoveToEndOfLine), cx);
-                self.vim_insert_snapshot = Some(self.vim_text(cx));
-                self.set_vim_mode(VimMode::Insert, cx);
-            }
+            VimAction::OpenLineBelow => self.vim_open_line(false, window, cx),
+            VimAction::OpenLineAbove => self.vim_open_line(true, window, cx),
             VimAction::Save => {
                 self.state.update(cx, |s, _| {
                     s.save_edit();

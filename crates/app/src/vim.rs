@@ -812,6 +812,42 @@ pub fn line_end_offset(text: &str, cursor: usize) -> usize {
         .unwrap_or(text.len())
 }
 
+/// Byte offsets for `o` / `O`: where the newline is inserted and where the
+/// caret lands once it has been inserted. `above` selects `O`.
+pub fn open_line_offsets(text: &str, cursor: usize, above: bool) -> (usize, usize) {
+    if above {
+        let at = line_start_offset(text, cursor);
+        (at, at)
+    } else {
+        let at = line_end_offset(text, cursor);
+        (at, at + 1)
+    }
+}
+
+/// Byte offset of the last character on the line containing `cursor`.
+/// Empty lines resolve to their start, matching Normal-mode `$`.
+pub fn line_last_char_offset(text: &str, cursor: usize) -> usize {
+    let start = line_start_offset(text, cursor);
+    let end = line_end_offset(text, cursor);
+    text[start..end]
+        .char_indices()
+        .next_back()
+        .map(|(i, _)| start + i)
+        .unwrap_or(start)
+}
+
+/// Byte offset of the first non-whitespace character on the line containing
+/// `cursor` (Vim `I`). A blank line resolves to its end.
+pub fn first_non_blank_offset(text: &str, cursor: usize) -> usize {
+    let start = line_start_offset(text, cursor);
+    let end = line_end_offset(text, cursor);
+    text[start..end]
+        .char_indices()
+        .find(|(_, c)| !c.is_whitespace())
+        .map(|(i, _)| start + i)
+        .unwrap_or(end)
+}
+
 /// Byte range deleted by `dd` / `2dd`: whole lines, including their trailing
 /// newlines. For the final line without a trailing newline, the preceding
 /// newline is included so no blank line is left behind, but nothing more.
@@ -1933,6 +1969,41 @@ mod tests {
         assert_eq!(yank_line_text(text, 4, 1), "two");
         assert_eq!(yank_line_text(text, 0, 2), "one\ntwo");
         assert_eq!(line_starts(text), vec![0, 4, 8]);
+    }
+
+    #[test]
+    fn open_line_offsets_are_line_relative() {
+        // `o` inserts at the end of the current line, `O` at its start.
+        let text = "one\ntwo\nthree";
+        assert_eq!(open_line_offsets(text, 5, false), (7, 8));
+        assert_eq!(open_line_offsets(text, 5, true), (4, 4));
+        // First and last lines, including a final line without a newline.
+        assert_eq!(open_line_offsets(text, 0, true), (0, 0));
+        assert_eq!(open_line_offsets(text, 9, false), (text.len(), text.len() + 1));
+        // Empty middle line.
+        let blank = "a\n\nb";
+        assert_eq!(open_line_offsets(blank, 2, false), (2, 3));
+        assert_eq!(open_line_offsets(blank, 2, true), (2, 2));
+        // Empty document still opens one new line.
+        assert_eq!(open_line_offsets("", 0, false), (0, 1));
+        assert_eq!(open_line_offsets("", 0, true), (0, 0));
+    }
+
+    #[test]
+    fn line_last_char_and_first_non_blank() {
+        let text = "  one\ntwo\n   \n你好";
+        assert_eq!(line_last_char_offset(text, 3), 4); // 'e' in "  one"
+        assert_eq!(line_last_char_offset(text, 7), 8); // 'o' in "two"
+        assert_eq!(line_last_char_offset(text, 10), 12); // last space of a blank line
+        assert_eq!(line_last_char_offset(text, text.len()), 17); // CJK char start
+        // A truly empty line resolves to its start.
+        assert_eq!(line_last_char_offset("a\n\nb", 2), 2);
+
+        assert_eq!(first_non_blank_offset(text, 3), 2);
+        assert_eq!(first_non_blank_offset(text, 7), 6);
+        assert_eq!(first_non_blank_offset(text, 10), 13); // blank line -> line end
+        assert_eq!(first_non_blank_offset(text, text.len()), 14);
+        assert_eq!(first_non_blank_offset("", 0), 0);
     }
 
     #[test]
