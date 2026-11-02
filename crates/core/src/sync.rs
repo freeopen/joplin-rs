@@ -166,10 +166,14 @@ impl<'a> SyncEngine<'a> {
         progress: &mut dyn FnMut(&str),
     ) -> Result<()> {
         let pending = self.storage.pending_deletes()?;
-        if pending.is_empty() {
+        let pending_blobs = self.storage.pending_blob_deletes()?;
+        if pending.is_empty() && pending_blobs.is_empty() {
             return Ok(());
         }
-        progress(&format!("deleting {} remote item(s)", pending.len()));
+        progress(&format!(
+            "deleting {} remote item(s)",
+            pending.len() + pending_blobs.len()
+        ));
         for id in pending {
             let path = items::system_path(&id);
             match self.client.delete(&path).await {
@@ -183,7 +187,6 @@ impl<'a> SyncEngine<'a> {
 
         // Resource blobs are deleted separately so a failure retries on the
         // next sync instead of being forgotten with the metadata record.
-        let pending_blobs = self.storage.pending_blob_deletes()?;
         for id in pending_blobs {
             let path = format!(".resource/{id}");
             match self.client.delete(&path).await {
