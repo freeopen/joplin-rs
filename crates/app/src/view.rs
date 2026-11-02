@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
+use gpui_kit::base::input::CursorShape;
 use gpui_kit::component::{
     button::{Button, ButtonVariants},
     dialog::{DialogAction, DialogFooter},
@@ -606,6 +607,9 @@ impl NoteBrowser {
                         this.state.update(cx, |s, _| jobs::auto_decrypt(s));
                         // Debounced autosave (3s after the last change).
                         this.state.update(cx, |s, _| s.autosave_tick());
+                        // Safety net for edit/new-note paths that enter Vim
+                        // mode without going through set_vim_mode.
+                        this.sync_vim_cursor_shape(cx);
                         // A command/search Enter arrives as InputEvent, not a
                         // capture-phase key; commit it here where the window
                         // is available.
@@ -925,6 +929,7 @@ impl NoteBrowser {
             self.finish_edit(window, cx);
         } else {
             self.state.update(cx, |s, _| s.begin_edit());
+            self.sync_vim_cursor_shape(cx);
             self.focus_note_editor(window, cx);
         }
         cx.notify();
@@ -975,6 +980,7 @@ impl NoteBrowser {
         }
         if !self.state.read(cx).editing {
             self.state.update(cx, |s, _| s.begin_edit());
+            self.sync_vim_cursor_shape(cx);
             let (title, body) = {
                 let s = self.state.read(cx);
                 (s.edit_title.clone(), s.edit_body.clone())
@@ -1245,6 +1251,19 @@ impl NoteBrowser {
             self.vim_block_insert_start = None;
         }
         self.sync_vim_enter_mode(cx);
+        self.sync_vim_cursor_shape(cx);
+    }
+
+    /// Keep the native input caret in sync with the Vim mode. Normal and
+    /// Visual modes use the block cursor painted by gpui-base; Insert uses
+    /// the normal thin bar.
+    fn sync_vim_cursor_shape(&mut self, cx: &mut Context<Self>) {
+        let shape = {
+            let state = self.state.read(cx);
+            vim_cursor_shape(state.editing, state.config.vim_mode, state.vim_mode)
+        };
+        self.note_edit
+            .update(cx, |state, _| state.set_cursor_shape(shape));
     }
 
     /// Remember the active visual selection for `gv`.
@@ -2186,6 +2205,7 @@ impl NoteBrowser {
         self.capture_editor_memory(cx);
         self.capture_preview_anchor(cx);
         self.state.update(cx, |s, _| s.end_edit());
+        self.sync_vim_cursor_shape(cx);
         self.vim_anchor = None;
         self.vim_insert_snapshot = None;
         self.note_edit
@@ -3358,6 +3378,7 @@ impl NoteBrowser {
                                 .disabled(!has_folder)
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.state.update(cx, |s, _| s.new_note());
+                                    this.sync_vim_cursor_shape(cx);
                                     cx.notify();
                                 })),
                         ),
@@ -3540,6 +3561,7 @@ impl NoteBrowser {
                                                                         s.new_note_in(&parent_id);
                                                                     }
                                                                 });
+                                                                view.sync_vim_cursor_shape(cx);
                                                                 cx.notify();
                                                             })
                                                             .ok();
@@ -3851,6 +3873,7 @@ impl NoteBrowser {
                                             this.finish_edit(window, cx);
                                         } else {
                                             this.state.update(cx, |s, _| s.begin_edit());
+                                            this.sync_vim_cursor_shape(cx);
                                             this.focus_note_editor(window, cx);
                                         }
                                         cx.notify();
@@ -3879,24 +3902,41 @@ impl NoteBrowser {
                 } else {
                     Vec::new()
                 };
+                let editor_background = theme
+                    .highlight_theme
+                    .style
+                    .editor_background
+                    .unwrap_or_else(|| theme.input_background());
                 let editor = div()
                     .id("note-editor")
                     .flex_1()
                     .min_h_0()
                     .relative()
+                    .bg(editor_background)
+                    .border_1()
+                    .border_color(theme.border)
+                    .rounded(theme.radius)
                     // Display-column block math matches the editor's pixel
                     // advances only in a monospace face.
                     .font_family(theme.mono_font_family.clone())
                     .px_4()
                     .py_3()
-                    .child(Textarea::new(&self.note_edit).h(relative(1.)))
-                    .child(vim_cursor_overlay(
-                        self.note_edit.clone(),
-                        vim_state,
-                        theme.caret.opacity(0.4),
-                        theme.selection.opacity(0.35),
-                        selection_ranges,
-                    ));
+                    .when(
+                        vim_state.is_visual() && !selection_ranges.is_empty(),
+                        |el| {
+                            el.child(vim_selection_overlay(
+                                self.note_edit.clone(),
+                                vim_state,
+                                theme.selection.opacity(0.35),
+                                selection_ranges,
+                            ))
+                        },
+                    )
+                    .child(
+                        Textarea::new(&self.note_edit)
+                            .h(relative(1.))
+                            .appearance(false),
+                    );
                 if vim_mode {
                     editor
                         .capture_key_down(cx.listener(Self::editor_key))
@@ -3939,6 +3979,15 @@ fn preview_scroll_target(current: f32, max: f32, viewport: f32, down: bool) -> f
         (current - step).max(-max.abs())
     } else {
         (current + step).min(0.0)
+    }
+}
+
+/// Which native caret shape the editor should use for a Vim state.
+fn vim_cursor_shape(editing: bool, vim_enabled: bool, mode: VimMode) -> CursorShape {
+    if editing && vim_enabled && mode != VimMode::Insert {
+        CursorShape::Block
+    } else {
+        CursorShape::Bar
     }
 }
 
@@ -4022,97 +4071,17 @@ fn nth_char_boundary(text: &str, from: usize, count: usize) -> usize {
     end.min(text.len())
 }
 
-/// Place a cursor/selection rectangle in window coordinates.
+/// Visual-mode selection rectangles.
 ///
-/// `caret` is in window coordinates and is returned unchanged except for the
-/// optional vertical scroll offset. `paint_quad` expects window coordinates,
-/// so callers must not subtract the canvas origin.
-fn block_caret_bounds(
-    caret: Bounds<gpui_kit::Pixels>,
-    scroll_y: gpui_kit::Pixels,
-    width: gpui_kit::Pixels,
-) -> Bounds<gpui_kit::Pixels> {
-    Bounds::new(
-        point(caret.origin.x, caret.origin.y + scroll_y),
-        Size::new(width, caret.size.height),
-    )
-}
-
-/// One character-cell advance for the caret at `cursor`.
-///
-/// On an empty line the newline has no glyph, so measure the nearest printable
-/// character (preferring a single-width one). This keeps the block cursor one
-/// character wide instead of falling back to a fraction of the line height.
-fn caret_cell_width(
-    state: &TextareaState,
-    cursor: usize,
-    line_height: gpui_kit::Pixels,
-) -> gpui_kit::Pixels {
-    let text = state.text();
-    let next = text
-        .slice(cursor..text.len())
-        .chars()
-        .next()
-        .map(|c| cursor + c.len_utf8())
-        .unwrap_or(cursor);
-    if next > cursor {
-        if let Some(width) = state
-            .range_to_bounds(&(cursor..next))
-            .map(|bounds| bounds.size.width)
-            .filter(|width| *width > px(0.))
-        {
-            return width;
-        }
-    }
-    let text = text.to_string();
-    let mut nearest_single = None;
-    let mut nearest_any = None;
-    for (index, c) in text.char_indices() {
-        if c == '\n' || c == '\r' {
-            continue;
-        }
-        let distance = index.abs_diff(cursor);
-        let candidate = (index, index + c.len_utf8(), distance);
-        if nearest_any
-            .map(|(_, _, best): (usize, usize, usize)| distance < best)
-            .unwrap_or(true)
-        {
-            nearest_any = Some(candidate);
-        }
-        if vim::char_display_width(c) == 1
-            && nearest_single
-                .map(|(_, _, best): (usize, usize, usize)| distance < best)
-                .unwrap_or(true)
-        {
-            nearest_single = Some(candidate);
-        }
-    }
-    nearest_single
-        .or(nearest_any)
-        .and_then(|(start, end, _)| {
-            state
-                .range_to_bounds(&(start..end))
-                .map(|bounds| bounds.size.width)
-                .filter(|width| *width > px(0.))
-        })
-        .unwrap_or(line_height * 0.42)
-}
-
-/// Mode cursor plus Visual Block selection rectangles.
-///
-/// gpui's native caret is always a thin bar, so the overlay paints a
-/// translucent block over the laid-out character cell. The cell bounds are
-/// taken from the text layout (not the caret geometry), so the block follows
-/// the glyph grid and vertical scrolling exactly. Normal/Visual/V-BLOCK show
-/// the block; Insert leaves the native caret alone.
-fn vim_cursor_overlay(
+/// The Vim selection is not kept in the textarea's native selection (that is
+/// collapsed so motions can use the caret), so this layer paints the ranges
+/// behind the text. The cursor itself is painted natively by gpui-base.
+fn vim_selection_overlay(
     state: Entity<TextareaState>,
     mode: VimMode,
-    caret_color: gpui_kit::Hsla,
     block_color: gpui_kit::Hsla,
     block_ranges: Vec<std::ops::Range<usize>>,
 ) -> impl IntoElement {
-    let show = mode != VimMode::Insert;
     canvas(
         |_, _, _| (),
         move |_bounds, _, window, cx| {
@@ -4128,47 +4097,10 @@ fn vim_cursor_overlay(
                     } else {
                         block.size.height * 0.55
                     };
-                    let rect = block_caret_bounds(block, px(0.), width);
+                    let rect = Bounds::new(block.origin, Size::new(width, block.size.height));
                     window.paint_quad(gpui_kit::fill(rect, block_color));
                 }
             }
-            if !show {
-                return;
-            }
-            let cursor = state.cursor();
-            let text = state.text();
-            let next = text
-                .slice(cursor..text.len())
-                .chars()
-                .next()
-                .map(|c| cursor + c.len_utf8())
-                .unwrap_or(cursor);
-            // The laid-out cell is already in paint coordinates (including
-            // vertical scroll) and matches the glyph grid, unlike the caret
-            // geometry which excludes the vertical scroll offset.
-            let (base, scroll_y) = match state.range_to_bounds(&(cursor..next)) {
-                Some(cell) => (cell, px(0.)),
-                None => {
-                    let Some((caret, _line_height)) = state.cursor_layout() else {
-                        return;
-                    };
-                    (caret, state.scroll_offset().y)
-                }
-            };
-            let width = caret_cell_width(&state, cursor, base.size.height);
-            // A full line-height block looks like it spans two rows on an
-            // empty line. Use the native caret height, centered in the cell.
-            let caret_height = state
-                .cursor_layout()
-                .map(|(caret, _)| caret.size.height)
-                .unwrap_or(base.size.height);
-            let top = base.origin.y + (base.size.height - caret_height) / 2.;
-            let base = Bounds::new(
-                point(base.origin.x, top),
-                Size::new(base.size.width, caret_height),
-            );
-            let rect = block_caret_bounds(base, scroll_y, width);
-            window.paint_quad(gpui_kit::fill(rect, caret_color));
         },
     )
     .absolute()
@@ -4568,11 +4500,35 @@ mod tests {
     }
 
     #[test]
-    fn block_caret_bounds_adds_vertical_scroll_and_keeps_height() {
-        let caret = Bounds::new(point(px(10.), px(20.)), Size::new(px(2.), px(18.)));
-        let rect = block_caret_bounds(caret, px(7.), px(11.));
-        assert_eq!(rect.origin, point(px(10.), px(27.)));
-        assert_eq!(rect.size, Size::new(px(11.), px(18.)));
+    fn vim_cursor_shape_tracks_mode_and_editing() {
+        assert_eq!(
+            vim_cursor_shape(false, true, VimMode::Normal),
+            CursorShape::Bar
+        );
+        assert_eq!(
+            vim_cursor_shape(true, false, VimMode::Normal),
+            CursorShape::Bar
+        );
+        assert_eq!(
+            vim_cursor_shape(true, true, VimMode::Insert),
+            CursorShape::Bar
+        );
+        assert_eq!(
+            vim_cursor_shape(true, true, VimMode::Normal),
+            CursorShape::Block
+        );
+        assert_eq!(
+            vim_cursor_shape(true, true, VimMode::Visual),
+            CursorShape::Block
+        );
+        assert_eq!(
+            vim_cursor_shape(true, true, VimMode::VisualLine),
+            CursorShape::Block
+        );
+        assert_eq!(
+            vim_cursor_shape(true, true, VimMode::VisualBlock),
+            CursorShape::Block
+        );
     }
 
     #[test]
@@ -4656,6 +4612,49 @@ mod tests {
         assert_eq!(vim_line_move_at(text, 7, kind), Some(8));
         assert_eq!(vim_line_move_at(text, text.len(), kind), Some(17));
         assert_eq!(vim_line_move_at(text, 7, MoveKind::Down), None);
+    }
+
+    #[gpui::test]
+    fn native_block_cursor_renders_without_panicking(cx: &mut gpui::TestAppContext) {
+        struct Root(Entity<TextareaState>);
+        impl Render for Root {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .text_size(px(16.))
+                    .child(Textarea::new(&self.0).h(relative(1.)).appearance(false))
+            }
+        }
+
+        let mut state = None;
+        let window = cx.add_window(|window, cx| {
+            gpui_kit::init(cx);
+            let textarea = cx.new(|cx| {
+                let mut state = TextareaState::new(window, cx);
+                state.set_value("hello 中文\nworld", window, cx);
+                state.set_cursor_shape(CursorShape::Block);
+                state
+            });
+            state = Some(textarea.clone());
+            Root(textarea)
+        });
+        let textarea = state.expect("textarea state");
+        assert_eq!(
+            textarea.read_with(cx, |state, _| state.cursor_shape()),
+            CursorShape::Block
+        );
+
+        cx.update_window(window.into(), |_, window, cx| {
+            textarea.update(cx, |state, cx| state.focus(window, cx));
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+
+        textarea.update(cx, |state, _| state.set_cursor_shape(CursorShape::Bar));
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
     }
 
     #[gpui::test]

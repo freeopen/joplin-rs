@@ -120,7 +120,9 @@ startup).
 NORMAL mode with a mode badge in the header
 (NORMAL/INSERT/VISUAL/V-LINE/V-BLOCK, plus the pending command such as `:w`
 or `/word`). NORMAL, VISUAL, V-LINE and V-BLOCK show exactly one block cursor;
-INSERT keeps the native thin caret.
+INSERT keeps the native thin caret. The block is painted by the vendored
+gpui-base caret path, blinks with the native caret timer, and inverts the
+character underneath (cursor color block, editor-background glyph).
 
 Supported: `Esc`, `i a I A o O`, `h j k l w b 0 $ gg G`, counts (`3j`, `12G`,
 `2dd`, `3x`, `d2w`), `Ctrl-f/b/d/u` page and half-page motions, `x dd yy dw d$`,

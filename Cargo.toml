@@ -42,3 +42,6 @@ axum = "0.8"
 tower = "0.5"
 http-body-util = "0.1"
 tempfile = "3"
+
+[patch.crates-io]
+gpui-base = { path = "vendor/gpui-base" }
