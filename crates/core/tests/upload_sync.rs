@@ -590,6 +590,167 @@ async fn e2ee_conflict_auto_merges_and_reencrypts() {
     assert_eq!(seen.body, "REMOTE first line\n\nLOCAL paragraph");
 }
 
+const ATTACHMENT_BYTES: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0xFF, 0xFE, 0x00, 0x01,
+];
+
+#[tokio::test]
+async fn upload_attachment_roundtrip_plaintext() {
+    let mut initial = HashMap::new();
+    initial.insert("info.json".to_string(), br#"{"version":3}"#.to_vec());
+    let (url, files) = spawn_fake_dav(initial).await;
+    let client = WebDavClient::new(&url, "user", "pass").unwrap();
+    let storage = Storage::open_in_memory().unwrap();
+    let engine = SyncEngine::new(&client, &storage);
+
+    let folder = storage.create_folder("Notebook A").unwrap();
+    let note = storage.create_note(&folder, "With attachment").unwrap();
+    let resource = storage
+        .create_resource("pixel.png", "image/png", "pixel.png", ATTACHMENT_BYTES)
+        .unwrap();
+    let rid = resource.props["id"].as_str().unwrap().to_string();
+    storage
+        .update_note(
+            &note,
+            "With attachment",
+            &format!("Here:\n\n![pixel.png](:/{rid})\n"),
+        )
+        .unwrap();
+
+    let outcome = engine.sync(None, &mut |_| {}).await.unwrap();
+    assert_eq!(outcome.resources_uploaded, 1, "{outcome:?}");
+    assert!(outcome.errors.is_empty(), "{outcome:?}");
+
+    let meta = remote_text(&files, &items::system_path(&rid)).unwrap();
+    assert!(meta.contains("mime: image/png"), "{meta}");
+    assert!(meta.contains("filename: pixel.png"), "{meta}");
+    assert!(meta.contains("encryption_blob_encrypted: 0"), "{meta}");
+    assert!(
+        meta.contains(&format!("size: {}", ATTACHMENT_BYTES.len())),
+        "{meta}"
+    );
+    let remote_blob = files
+        .lock()
+        .unwrap()
+        .get(&format!(".resource/{rid}"))
+        .cloned()
+        .expect("resource blob uploaded");
+    assert_eq!(remote_blob, ATTACHMENT_BYTES);
+
+    // A second client downloads both the note and the attachment.
+    let s2 = Storage::open_in_memory().unwrap();
+    let e2 = SyncEngine::new(&client, &s2);
+    e2.sync(None, &mut |_| {}).await.unwrap();
+    let seen = s2.note(&note).unwrap().unwrap();
+    assert!(seen.body.contains(&format!(":/{rid}")), "{}", seen.body);
+    assert_eq!(s2.resource_blob(&rid).unwrap().unwrap(), ATTACHMENT_BYTES);
+
+    // Already-uploaded blobs are not uploaded again on a no-op sync.
+    let outcome = engine.sync(None, &mut |_| {}).await.unwrap();
+    assert_eq!(outcome.resources_uploaded, 0, "{outcome:?}");
+}
+
+#[tokio::test]
+async fn upload_attachment_roundtrip_e2ee() {
+    let vault_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../fixtures/test_vault.json"
+    );
+    #[derive(serde::Deserialize)]
+    struct Vault {
+        info_json: String,
+        items: HashMap<String, String>,
+        password: String,
+    }
+    let vault: Vault = serde_json::from_str(
+        &std::fs::read_to_string(vault_path).expect("run tools/generate_fixtures.js"),
+    )
+    .unwrap();
+    let mut initial: HashMap<String, Vec<u8>> = HashMap::new();
+    initial.insert("info.json".into(), vault.info_json.clone().into_bytes());
+    for (path, content) in &vault.items {
+        initial.insert(path.clone(), content.as_bytes().to_vec());
+    }
+    let (url, files) = spawn_fake_dav(initial).await;
+    let client = WebDavClient::new(&url, "user", "pass").unwrap();
+    let storage = Storage::open_in_memory().unwrap();
+    let engine = SyncEngine::new(&client, &storage);
+    engine
+        .sync(Some(&vault.password), &mut |_| {})
+        .await
+        .unwrap();
+
+    let note = "11111111111111111111111111111111";
+    let resource = storage
+        .create_resource("pixel.png", "image/png", "pixel.png", ATTACHMENT_BYTES)
+        .unwrap();
+    let rid = resource.props["id"].as_str().unwrap().to_string();
+    storage
+        .update_note(
+            note,
+            "First note",
+            &format!("Image:\n\n![pixel.png](:/{rid})\n"),
+        )
+        .unwrap();
+
+    let outcome = engine
+        .sync(Some(&vault.password), &mut |_| {})
+        .await
+        .unwrap();
+    assert_eq!(outcome.resources_uploaded, 1, "{outcome:?}");
+    assert!(outcome.errors.is_empty(), "{outcome:?}");
+
+    let remote_blob = files
+        .lock()
+        .unwrap()
+        .get(&format!(".resource/{rid}"))
+        .cloned()
+        .unwrap();
+    assert!(
+        remote_blob.starts_with(b"JED01"),
+        "blob must be FileV1 encrypted"
+    );
+    assert_ne!(remote_blob, ATTACHMENT_BYTES);
+
+    let s2 = Storage::open_in_memory().unwrap();
+    let e2 = SyncEngine::new(&client, &s2);
+    e2.sync(Some(&vault.password), &mut |_| {}).await.unwrap();
+    assert_eq!(s2.resource_blob(&rid).unwrap().unwrap(), ATTACHMENT_BYTES);
+    let seen = s2.note(note).unwrap().unwrap();
+    assert!(seen.body.contains(&format!(":/{rid}")), "{}", seen.body);
+}
+
+#[tokio::test]
+async fn deleting_a_resource_removes_its_remote_blob() {
+    let mut initial = HashMap::new();
+    initial.insert("info.json".to_string(), br#"{"version":3}"#.to_vec());
+    let (url, files) = spawn_fake_dav(initial).await;
+    let client = WebDavClient::new(&url, "user", "pass").unwrap();
+    let storage = Storage::open_in_memory().unwrap();
+    let engine = SyncEngine::new(&client, &storage);
+
+    let resource = storage
+        .create_resource("pixel.png", "image/png", "pixel.png", ATTACHMENT_BYTES)
+        .unwrap();
+    let rid = resource.props["id"].as_str().unwrap().to_string();
+    engine.sync(None, &mut |_| {}).await.unwrap();
+    assert!(files
+        .lock()
+        .unwrap()
+        .contains_key(&format!(".resource/{rid}")));
+
+    storage.delete_item(&rid).unwrap();
+    engine.sync(None, &mut |_| {}).await.unwrap();
+    assert!(!files
+        .lock()
+        .unwrap()
+        .contains_key(&items::system_path(&rid)));
+    assert!(!files
+        .lock()
+        .unwrap()
+        .contains_key(&format!(".resource/{rid}")));
+}
+
 /// Reporter bug: in an E2EE vault with no password supplied, local changes must
 /// NOT be uploaded (no plaintext leak into the target) but must ALSO not be
 /// deleted locally; the run reports them via `upload_blocked`. Supplying the

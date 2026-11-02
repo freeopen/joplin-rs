@@ -211,6 +211,24 @@ impl WebDavClient {
         Ok(())
     }
 
+    /// Upload raw bytes (unencrypted resource blobs).
+    pub async fn put_bytes(&self, path: &str, body: &[u8]) -> Result<()> {
+        let url = self.url_for(path);
+        let resp = self
+            .http
+            .put(&url)
+            .header(reqwest::header::AUTHORIZATION, &self.auth_header)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(body.to_vec())
+            .send()
+            .await
+            .map_err(|e| Error::WebDav(format!("PUT {path}: {e}")))?;
+        if !resp.status().is_success() && resp.status() != reqwest::StatusCode::CREATED {
+            return Err(Error::WebDav(format!("PUT {path}: HTTP {}", resp.status())));
+        }
+        Ok(())
+    }
+
     pub async fn mkcol(&self, path: &str) -> Result<()> {
         let resp = self.request("MKCOL", path, None).await?;
         let s = resp.status();

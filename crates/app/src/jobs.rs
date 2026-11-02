@@ -60,6 +60,7 @@ pub fn start_download(state: &mut AppState) {
                     downloaded: outcome.downloaded,
                     deleted: outcome.deleted,
                     resources: outcome.resources_downloaded,
+                    resources_uploaded: outcome.resources_uploaded,
                     uploaded: outcome.uploaded,
                     auto_merged: outcome.auto_merged,
                     unresolved_conflicts: outcome.unresolved_conflicts,

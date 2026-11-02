@@ -94,6 +94,8 @@ pub struct SyncOutcome {
     pub resources_downloaded: usize,
     /// Resources fetched but kept encrypted because no password was available.
     pub resources_pending: usize,
+    /// Resource blobs uploaded to the target this run.
+    pub resources_uploaded: usize,
     pub errors: Vec<String>,
     /// Item ids stored in encrypted form that could not be decrypted (no
     /// password). They are retried on the next sync once a password is given.
@@ -175,6 +177,17 @@ impl<'a> SyncEngine<'a> {
                     self.storage.clear_pending_delete(&id)?;
                     outcome.deleted_remote += 1;
                 }
+                Err(e) => outcome.errors.push(format!("delete {path}: {e}")),
+            }
+        }
+
+        // Resource blobs are deleted separately so a failure retries on the
+        // next sync instead of being forgotten with the metadata record.
+        let pending_blobs = self.storage.pending_blob_deletes()?;
+        for id in pending_blobs {
+            let path = format!(".resource/{id}");
+            match self.client.delete(&path).await {
+                Ok(()) => self.storage.clear_pending_blob_delete(&id)?,
                 Err(e) => outcome.errors.push(format!("delete {path}: {e}")),
             }
         }
@@ -366,16 +379,39 @@ impl<'a> SyncEngine<'a> {
         remote_updated_file_time: i64,
         outcome: &mut SyncOutcome,
     ) -> Result<()> {
+        let mut item = item.clone();
         let id = item
             .props
             .get("id")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let body = items::serialize_for_sync(item, key.as_ref())?;
+        if item.item_type == items::TYPE_RESOURCE {
+            // The blob encryption flag is part of the resource metadata, so it
+            // must be set before the item is serialized for upload.
+            let encrypted = i64::from(key.is_some());
+            let current = item
+                .props
+                .get("encryption_blob_encrypted")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            if current != encrypted {
+                item.props.insert(
+                    "encryption_blob_encrypted".to_string(),
+                    Value::from(encrypted),
+                );
+                self.storage.upsert_item(&item)?;
+            }
+        }
+        let body = items::serialize_for_sync(&item, key.as_ref())?;
         self.client.put(path, &body).await?;
-        let title = Self::item_title(item);
-        let note_body = Self::item_body(item);
+        if item.item_type == items::TYPE_RESOURCE {
+            // Upload the blob before recording the item as synced: if the
+            // blob fails, the next sync must retry it.
+            self.upload_resource_blob(&item, key, outcome).await?;
+        }
+        let title = Self::item_title(&item);
+        let note_body = Self::item_body(&item);
         self.storage.save_sync_base(
             &id,
             local_updated,
@@ -384,6 +420,74 @@ impl<'a> SyncEngine<'a> {
             &note_body,
         )?;
         outcome.uploaded += 1;
+        Ok(())
+    }
+
+    /// Upload one resource blob (`.resource/{id}`), encrypting it as FileV1
+    /// when the target is E2EE. Already-uploaded blobs are skipped using the
+    /// resource's `blob_updated_time`.
+    async fn upload_resource_blob(
+        &self,
+        item: &items::Item,
+        key: &Option<items::SyncKey>,
+        outcome: &mut SyncOutcome,
+    ) -> Result<()> {
+        let id = item
+            .props
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if id.is_empty() {
+            return Ok(());
+        }
+        let blob_time = item
+            .props
+            .get("blob_updated_time")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        if let Some(uploaded) = self.storage.resource_uploaded_time(&id)? {
+            if uploaded >= blob_time {
+                return Ok(());
+            }
+        }
+        let Some(data) = self.storage.resource_blob(&id)? else {
+            // Metadata without a local blob: nothing to upload. It will be
+            // retried once the blob is available.
+            return Ok(());
+        };
+        let path = format!(".resource/{id}");
+        match key {
+            Some(k) => {
+                let encrypted = crate::crypto::encrypt_file_v1(&k.key_hex, &k.key_id, &data)?;
+                self.client.put(&path, &encrypted).await?;
+            }
+            None => self.client.put_bytes(&path, &data).await?,
+        }
+        self.storage.set_resource_uploaded_time(&id, blob_time)?;
+        outcome.resources_uploaded += 1;
+        Ok(())
+    }
+
+    /// Retry blobs whose metadata is already synced (for example after a
+    /// network failure between the metadata PUT and the blob PUT).
+    async fn upload_pending_resources(
+        &self,
+        key: &Option<items::SyncKey>,
+        outcome: &mut SyncOutcome,
+    ) -> Result<()> {
+        for resource in self.storage.items_by_type(items::TYPE_RESOURCE)? {
+            let encrypted_placeholder = resource
+                .props
+                .get("encryption_applied")
+                .and_then(Value::as_i64)
+                .unwrap_or(0)
+                == 1;
+            if encrypted_placeholder {
+                continue;
+            }
+            self.upload_resource_blob(&resource, key, outcome).await?;
+        }
         Ok(())
     }
 
@@ -434,6 +538,18 @@ impl<'a> SyncEngine<'a> {
         // Non-notes have no textual merge. The remote version wins, matching
         // Joplin's item-conflict handling.
         if local.item_type != items::TYPE_NOTE {
+            if local.item_type == items::TYPE_RESOURCE {
+                // Do not let the pending-blob pass overwrite the remote blob
+                // after the metadata conflict was resolved in its favour.
+                let blob_time = local
+                    .props
+                    .get("blob_updated_time")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                self.storage.set_resource_uploaded_time(&id, blob_time)?;
+                // Force the remote blob to be downloaded again.
+                self.storage.set_resource_fetched_time(&id, 0)?;
+            }
             outcome.skipped_conflicts.push(format!(
                 "{id} (remote changed since the last sync; the remote version was kept)"
             ));
@@ -871,6 +987,7 @@ impl<'a> SyncEngine<'a> {
             skipped_unsupported: 0,
             resources_downloaded: 0,
             resources_pending: 0,
+            resources_uploaded: 0,
             errors: Vec::new(),
             pending_decryption: Vec::new(),
             uploaded: 0,
@@ -912,6 +1029,8 @@ impl<'a> SyncEngine<'a> {
             });
             self.delete_remote(&mut outcome, progress).await?;
             self.upload(&sync_key, &mut outcome, progress).await?;
+            self.upload_pending_resources(&sync_key, &mut outcome)
+                .await?;
         } else {
             let dirty = self.storage.items_needing_sync()?.len();
             outcome.upload_blocked = dirty;
@@ -1298,6 +1417,8 @@ impl<'a> SyncEngine<'a> {
             self.storage.save_resource_blob(&id, &data)?;
             self.storage
                 .set_resource_fetched_time(&id, crate::time_ms())?;
+            // The blob is already on the target; do not upload it back.
+            self.storage.set_resource_uploaded_time(&id, blob_time)?;
             downloaded += 1;
         }
         Ok((downloaded, pending, pending_errors))

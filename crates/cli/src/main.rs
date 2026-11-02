@@ -346,10 +346,11 @@ async fn main() -> Result<()> {
                 })
                 .await?;
             println!(
-                "done: {} uploaded, {} downloaded, {} deleted, {} deleted remote, {} resources ({} pending), {} unsupported, {} pending decryption, {} auto-merged, {} unresolved conflicts, {} conflict copies, {} non-note conflicts, {} upload blocked",
+                "done: {} uploaded, {} downloaded, {} deleted, {} deleted remote, {} resources downloaded ({} pending), {} resources uploaded, {} unsupported, {} pending decryption, {} auto-merged, {} unresolved conflicts, {} conflict copies, {} non-note conflicts, {} upload blocked",
                 outcome.uploaded, outcome.downloaded, outcome.deleted, outcome.deleted_remote,
                 outcome.resources_downloaded,
-                outcome.resources_pending, outcome.skipped_unsupported, outcome.pending_decryption.len(),
+                outcome.resources_pending, outcome.resources_uploaded,
+                outcome.skipped_unsupported, outcome.pending_decryption.len(),
                 outcome.auto_merged, outcome.unresolved_conflicts, outcome.conflict_copies,
                 outcome.skipped_conflicts.len(), outcome.upload_blocked
             );

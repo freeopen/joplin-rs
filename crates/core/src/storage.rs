@@ -144,6 +144,11 @@ impl Storage {
                     fetched_time INT NOT NULL DEFAULT 0
                 );
 
+                CREATE TABLE IF NOT EXISTS resource_upload_times (
+                    resource_id TEXT PRIMARY KEY,
+                    uploaded_time INT NOT NULL DEFAULT 0
+                );
+
                 CREATE TABLE IF NOT EXISTS note_conflicts (
                     note_id TEXT PRIMARY KEY,
                     base_title TEXT NOT NULL DEFAULT '',
@@ -479,6 +484,21 @@ impl Storage {
         self.conn
             .execute("DELETE FROM note_conflicts WHERE note_id = ?1", [id])
             .map_err(|e| Error::Storage(format!("delete conflict: {e}")))?;
+        self.conn
+            .execute("DELETE FROM resource_blobs WHERE resource_id = ?1", [id])
+            .map_err(|e| Error::Storage(format!("delete resource blob: {e}")))?;
+        self.conn
+            .execute(
+                "DELETE FROM resource_fetch_times WHERE resource_id = ?1",
+                [id],
+            )
+            .map_err(|e| Error::Storage(format!("delete resource fetch time: {e}")))?;
+        self.conn
+            .execute(
+                "DELETE FROM resource_upload_times WHERE resource_id = ?1",
+                [id],
+            )
+            .map_err(|e| Error::Storage(format!("delete resource upload time: {e}")))?;
         // Drop the local-only protection marker with the note.
         self.conn
             .execute(
@@ -588,8 +608,16 @@ impl Storage {
     /// Delete an item locally (row + sync metadata + protection marker) and
     /// record it for remote deletion on the next sync.
     pub fn delete_item(&self, id: &str) -> Result<()> {
+        let is_resource = self
+            .item(id)?
+            .map(|i| i.item_type == crate::items::TYPE_RESOURCE)
+            .unwrap_or(false);
         self.delete_row(id)?;
-        self.kv_set(&format!("{}{}", Self::PENDING_DELETE_PREFIX, id), "1")
+        self.kv_set(&format!("{}{}", Self::PENDING_DELETE_PREFIX, id), "1")?;
+        if is_resource {
+            self.kv_set(&format!("{}{}", Self::PENDING_BLOB_DELETE_PREFIX, id), "1")?;
+        }
+        Ok(())
     }
 
     /// Ids awaiting a remote delete.
@@ -620,6 +648,43 @@ impl Storage {
                 [format!("{}{}", Self::PENDING_DELETE_PREFIX, id)],
             )
             .map_err(|e| Error::Storage(format!("clear_pending_delete: {e}")))?;
+        Ok(())
+    }
+
+    const PENDING_BLOB_DELETE_PREFIX: &'static str = "pending_blob_delete:";
+
+    pub fn has_pending_blob_delete(&self, id: &str) -> Result<bool> {
+        Ok(self
+            .kv_get(&format!("{}{}", Self::PENDING_BLOB_DELETE_PREFIX, id))?
+            .is_some())
+    }
+
+    pub fn pending_blob_deletes(&self) -> Result<Vec<String>> {
+        let like = format!("{}%", Self::PENDING_BLOB_DELETE_PREFIX);
+        let mut stmt = self
+            .conn
+            .prepare("SELECT key FROM kv WHERE key LIKE ?1")
+            .map_err(|e| Error::Storage(format!("pending_blob_deletes: {e}")))?;
+        let rows = stmt
+            .query_map([like], |r| r.get::<_, String>(0))
+            .map_err(|e| Error::Storage(format!("pending_blob_deletes: {e}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let key = row.map_err(|e| Error::Storage(e.to_string()))?;
+            if let Some(id) = key.strip_prefix(Self::PENDING_BLOB_DELETE_PREFIX) {
+                out.push(id.to_string());
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn clear_pending_blob_delete(&self, id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM kv WHERE key = ?1",
+                [format!("{}{}", Self::PENDING_BLOB_DELETE_PREFIX, id)],
+            )
+            .map_err(|e| Error::Storage(format!("clear_pending_blob_delete: {e}")))?;
         Ok(())
     }
 
@@ -706,6 +771,34 @@ impl Storage {
                 rusqlite::params![resource_id, t],
             )
             .map_err(|e| Error::Storage(format!("set fetch time: {e}")))?;
+        Ok(())
+    }
+
+    /// Last `blob_updated_time` successfully uploaded for a resource.
+    /// `None` means the blob has never been uploaded from this client.
+    pub fn resource_uploaded_time(&self, resource_id: &str) -> Result<Option<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT uploaded_time FROM resource_upload_times WHERE resource_id = ?1")
+            .map_err(|e| Error::Storage(format!("resource uploaded time: {e}")))?;
+        let mut rows = stmt
+            .query([resource_id])
+            .map_err(|e| Error::Storage(format!("resource uploaded time: {e}")))?;
+        if let Some(row) = rows.next().map_err(|e| Error::Storage(e.to_string()))? {
+            Ok(Some(row.get(0).map_err(|e| Error::Storage(e.to_string()))?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn set_resource_uploaded_time(&self, resource_id: &str, t: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO resource_upload_times (resource_id, uploaded_time) VALUES (?1, ?2) \
+                 ON CONFLICT(resource_id) DO UPDATE SET uploaded_time=?2",
+                rusqlite::params![resource_id, t],
+            )
+            .map_err(|e| Error::Storage(format!("set resource uploaded time: {e}")))?;
         Ok(())
     }
 
@@ -1006,6 +1099,58 @@ impl Storage {
         };
         self.upsert_item(&item)?;
         Ok(id)
+    }
+
+    /// Create a Joplin resource (attachment) and cache its plaintext bytes.
+    ///
+    /// The resource item is marked dirty for the next sync; the blob is
+    /// encrypted during upload only when the target is E2EE.
+    pub fn create_resource(
+        &self,
+        title: &str,
+        mime: &str,
+        filename: &str,
+        data: &[u8],
+    ) -> Result<Item> {
+        let id = new_item_id();
+        let now = crate::time_ms();
+        let extension = filename
+            .rsplit_once('.')
+            .map(|(_, ext)| ext.to_ascii_lowercase())
+            .unwrap_or_default();
+        let mut props = std::collections::BTreeMap::new();
+        props.insert("id".to_string(), Value::String(id.clone()));
+        props.insert(
+            "title".to_string(),
+            Value::String(if title.is_empty() {
+                filename.to_string()
+            } else {
+                title.to_string()
+            }),
+        );
+        props.insert("mime".to_string(), Value::String(mime.to_string()));
+        props.insert("filename".to_string(), Value::String(filename.to_string()));
+        props.insert("file_extension".to_string(), Value::String(extension));
+        props.insert("created_time".to_string(), Value::from(now));
+        props.insert("updated_time".to_string(), Value::from(now));
+        props.insert("user_created_time".to_string(), Value::from(now));
+        props.insert("user_updated_time".to_string(), Value::from(now));
+        props.insert("size".to_string(), Value::from(data.len() as i64));
+        props.insert("blob_updated_time".to_string(), Value::from(now));
+        props.insert("encryption_applied".to_string(), Value::from(0));
+        props.insert("encryption_blob_encrypted".to_string(), Value::from(0));
+        props.insert("fetch_status".to_string(), Value::from(0));
+        props.insert("is_shared".to_string(), Value::from(0));
+        props.insert("deleted_time".to_string(), Value::from(0));
+        let item = Item {
+            item_type: crate::items::TYPE_RESOURCE,
+            props,
+            body: String::new(),
+        };
+        self.upsert_item(&item)?;
+        self.save_resource_blob(&id, data)?;
+        self.set_resource_fetched_time(&id, now)?;
+        Ok(item)
     }
 
     /// Create a new notebook (folder) and return its id.

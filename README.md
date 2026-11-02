@@ -20,8 +20,8 @@ joplin-rs is a from-scratch Rust client built for exactly this situation:
 
 1. **Compatibility first** - the primary goal is to run well on macOS Big Sur
    and other hardware/OS combinations the official client has dropped.
-2. **Roadmap** - today: two-way E2EE sync, browsing and note editing; next:
-   attachments/resources upload and more editors.
+2. **Roadmap** - today: two-way E2EE sync, browsing, note editing and
+   attachment upload; next: more editors.
 3. **Design philosophy** - fast, just-enough features, wide device
    compatibility.
 
@@ -42,7 +42,8 @@ joplin-rs is a from-scratch Rust client built for exactly this situation:
     `SJCL1a/1b/3/4` password master keys used by real Joplin 1.x/2.x vaults
   - item blobs: `StringV1` (JED01 container, chunked) for both reading and
     writing (uploads use the active master key)
-  - resource blobs: `FileV1` (download)
+  - resource blobs: `FileV1` (download and upload; attachments are encrypted
+    with the active master key on E2EE targets)
   - legacy `SJCL1a/1b/3/4` items (AES-CCM, byte-exact port of sjcl's mode)
   - item payloads encrypted with legacy SJCL (method 1a/1b/3/4) as well as `StringV1`
   - `SJCL`/`SJCL2` (OCB2) and PPK (RSA) master keys are reported as unsupported
@@ -73,6 +74,11 @@ joplin-rs is a from-scratch Rust client built for exactly this situation:
   rounded macOS Joplin app icon (dock/window) and About via the native
   app-name menu (in-window About on other platforms), optional reading
   password that gates notes marked as protected
+- Attachments: insert a file into the open note from the editor with the
+  **附件** button (native file picker). The file becomes a Joplin resource,
+  is embedded as an image when it is an image, and is uploaded on the next
+  sync (encrypted as `FileV1` on E2EE targets). Deleting a resource removes
+  both its metadata and `.resource/{id}` blob remotely.
 
 ## GUI usage
 
@@ -293,8 +299,6 @@ cargo test --workspace
 
 ## Not implemented (yet)
 
-- Attachments/resources upload (resource blobs are downloaded and rendered, but
-  new attachments are not created or uploaded)
 - Sync targets other than WebDAV
 - PPK (public/private key) master keys
 - OCB2-based legacy encryption (SJCL 1/2)

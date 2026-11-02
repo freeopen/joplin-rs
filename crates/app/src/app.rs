@@ -242,6 +242,8 @@ pub struct Stage1Summary {
     pub downloaded: usize,
     pub deleted: usize,
     pub resources: usize,
+    /// Resource blobs uploaded to the target.
+    pub resources_uploaded: usize,
     /// Items uploaded to the target.
     pub uploaded: usize,
     /// Notes auto-merged cleanly with their remote version.
@@ -1404,6 +1406,9 @@ impl AppState {
                         summary.deleted,
                         summary.resources
                     );
+                    if summary.resources_uploaded > 0 {
+                        base.push_str(&format!("；上传资源 {}", summary.resources_uploaded));
+                    }
                     if !summary.conflicts.is_empty() {
                         base.push_str(&format!(
                             "；{} 项非笔记冲突已跳过（保留远端）",
@@ -1973,6 +1978,7 @@ mod tests {
                 downloaded: 3,
                 deleted: 0,
                 resources: 0,
+                resources_uploaded: 0,
                 uploaded: 0,
                 auto_merged: 0,
                 unresolved_conflicts: 0,
@@ -2027,6 +2033,7 @@ mod tests {
                 downloaded: 2,
                 deleted: 0,
                 resources: 0,
+                resources_uploaded: 0,
                 uploaded: 0,
                 auto_merged: 0,
                 unresolved_conflicts: 0,

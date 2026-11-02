@@ -239,6 +239,28 @@ pub fn encrypt_string_v1(
     Ok(out)
 }
 
+/// Encrypt a file/blob the way Joplin's `FileV1` (method 9) does.
+///
+/// Joplin reads the file in 128 KiB blocks, base64-encodes each block on its
+/// own, then AES-GCM encrypts that base64 text with the master key
+/// (PBKDF2-SHA512, 3 iterations). Every encrypted block is written as
+/// `6-hex length + {salt, iv, ct}`.
+pub fn encrypt_file_v1(master_key_hex: &str, master_key_id: &str, data: &[u8]) -> Result<String> {
+    const RAW_CHUNK: usize = 131072;
+    let mut salt = [0u8; 32];
+    use rand::RngCore;
+    rand::rngs::OsRng.fill_bytes(&mut salt);
+
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let mut out = encode_header(METHOD_FILE_V1, master_key_id)?;
+    for chunk in data.chunks(RAW_CHUNK) {
+        let encoded = b64.encode(chunk);
+        let envelope = native_encrypt(master_key_hex, &salt, encoded.as_bytes(), 3)?;
+        out.push_str(&encode_chunk(&envelope));
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // SJCL methods (AES-CCM)
 // ---------------------------------------------------------------------------
@@ -668,5 +690,34 @@ mod tests {
         let md_size = usize::from_str_radix(&blob[5..11], 16).unwrap();
         assert!(decode_chunks(&blob[11 + md_size..]).unwrap().is_empty());
         assert_eq!(decrypt_string_v1_for_test(&blob, &key), "");
+    }
+
+    #[test]
+    fn file_v1_roundtrip_multi_chunk() {
+        let key = "ab".repeat(256);
+        let id = "0123456789abcdef0123456789abcdef";
+        let data: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        let blob = encrypt_file_v1(&key, id, &data).unwrap();
+        let header = decode_header(&blob).unwrap();
+        assert_eq!(header.method, METHOD_FILE_V1);
+        assert_eq!(header.master_key_id, id);
+        let md_size = usize::from_str_radix(&blob[5..11], 16).unwrap();
+        assert!(
+            decode_chunks(&blob[11 + md_size..]).unwrap().len() >= 3,
+            "300 KB split into 128 KB blocks"
+        );
+        let plain = crate::sync::SyncEngine::decrypt_resource_blob(&blob, &key).unwrap();
+        assert_eq!(plain, data);
+    }
+
+    #[test]
+    fn file_v1_empty_blob_is_header_only() {
+        let key = "cd".repeat(256);
+        let id = "fedcba9876543210fedcba9876543210";
+        let blob = encrypt_file_v1(&key, id, b"").unwrap();
+        let md_size = usize::from_str_radix(&blob[5..11], 16).unwrap();
+        assert!(decode_chunks(&blob[11 + md_size..]).unwrap().is_empty());
+        let plain = crate::sync::SyncEngine::decrypt_resource_blob(&blob, &key).unwrap();
+        assert!(plain.is_empty());
     }
 }

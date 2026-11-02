@@ -36,8 +36,9 @@ use gpui_kit::component::{
 use gpui_kit::{canvas, point};
 use gpui_kit::{
     div, prelude::*, px, relative, App, Bounds, Context, Entity, FocusHandle, Focusable, Image,
-    ImageFormat, ImageSource, KeyBinding, KeyDownEvent, Menu, MenuItem, Render, Resource,
-    ScrollHandle, SharedString, SharedUri, Size, Subscription, Window, WindowBounds, WindowOptions,
+    ImageFormat, ImageSource, KeyBinding, KeyDownEvent, Menu, MenuItem, PathPromptOptions, Render,
+    Resource, ScrollHandle, SharedString, SharedUri, Size, Subscription, Window, WindowBounds,
+    WindowOptions,
 };
 
 use crate::app::{is_encrypted_placeholder, short_id, AppState, Dialog as AppDialog};
@@ -1162,6 +1163,61 @@ impl NoteBrowser {
         self.note_edit
             .update(cx, |state, cx| state.set_submit_on_enter(false, cx));
         self.apply_vim_action(action, window, cx);
+        cx.notify();
+    }
+
+    /// Create a Joplin resource for the selected file, cache its bytes, and
+    /// insert a Markdown link at the editor's cursor. The resource item is
+    /// dirty and gets uploaded on the next sync.
+    fn insert_attachment(
+        &mut self,
+        filename: &str,
+        mime: &str,
+        data: &[u8],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.state.read(cx).editing {
+            self.state
+                .update(cx, |s, _| s.set_status("请先进入编辑模式再插入附件".into()));
+            return;
+        }
+        let item = {
+            let state = self.state.read(cx);
+            state
+                .storage
+                .create_resource(filename, mime, filename, data)
+        };
+        let item = match item {
+            Ok(item) => item,
+            Err(e) => {
+                self.state
+                    .update(cx, |s, _| s.set_status(format!("创建附件失败: {e}")));
+                return;
+            }
+        };
+        let id = item
+            .props
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let is_image = mime.starts_with("image/");
+        let alt = filename.replace('[', "\\[").replace(']', "\\]");
+        let link = if is_image {
+            format!("![{alt}](:/{id})")
+        } else {
+            format!("[{alt}](:/{id})")
+        };
+        let cursor = self.note_edit.read(cx).cursor();
+        self.note_edit.update(cx, |state, cx| {
+            state.set_selected_range(cursor..cursor, cx);
+            state.insert(link, window, cx);
+        });
+        self.state.update(cx, |s, _| {
+            s.mark_edit_dirty();
+            s.set_status(format!("已插入附件 {filename}，下次同步上传"));
+        });
         cx.notify();
     }
 
@@ -3731,6 +3787,59 @@ impl NoteBrowser {
                                         .child(SharedString::from(badge)),
                                 )
                             })
+                            .child(
+                                Button::new("btn-attach")
+                                    .outline()
+                                    .small()
+                                    .label("附件")
+                                    .disabled(!editing)
+                                    .on_click(cx.listener(|_this, _, window, cx| {
+                                        let rx = cx.prompt_for_paths(PathPromptOptions {
+                                            files: true,
+                                            directories: false,
+                                            multiple: false,
+                                            prompt: Some(SharedString::from("选择附件")),
+                                        });
+                                        cx.spawn_in(window, async move |this, cx| {
+                                            let paths = match rx.await {
+                                                Ok(Ok(Some(paths))) => paths,
+                                                _ => return,
+                                            };
+                                            let Some(path) = paths.into_iter().next() else {
+                                                return;
+                                            };
+                                            let data = match std::fs::read(&path) {
+                                                Ok(data) => data,
+                                                Err(e) => {
+                                                    let _ = this.update(cx, |this, cx| {
+                                                        this.state.update(cx, |s, _| {
+                                                            s.set_status(format!(
+                                                                "读取附件失败: {e}"
+                                                            ))
+                                                        });
+                                                        cx.notify();
+                                                    });
+                                                    return;
+                                                }
+                                            };
+                                            let filename = path
+                                                .file_name()
+                                                .and_then(|name| name.to_str())
+                                                .unwrap_or("attachment")
+                                                .to_string();
+                                            let mime = mime_guess::from_path(&path)
+                                                .first_or_octet_stream()
+                                                .essence_str()
+                                                .to_string();
+                                            let _ = this.update_in(cx, |this, window, cx| {
+                                                this.insert_attachment(
+                                                    &filename, &mime, &data, window, cx,
+                                                );
+                                            });
+                                        })
+                                        .detach();
+                                    })),
+                            )
                             .child(
                                 Button::new("btn-edit-toggle")
                                     .outline()
