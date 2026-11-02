@@ -100,6 +100,12 @@ pub struct SyncOutcome {
     pub pending_decryption: Vec<String>,
     /// Items uploaded to the target this run (created or updated).
     pub uploaded: usize,
+    /// Notes auto-merged cleanly with their remote version.
+    pub auto_merged: usize,
+    /// Notes left with local conflict markers and blocked from upload.
+    pub unresolved_conflicts: usize,
+    /// Joplin-style conflict copies created as a fallback.
+    pub conflict_copies: usize,
     /// Remote files physically deleted (pending local deletions).
     pub deleted_remote: usize,
     /// Items skipped because the remote changed since the last sync (conflict):
@@ -191,8 +197,10 @@ impl<'a> SyncEngine<'a> {
     /// Upload locally-created/modified items (Joplin's UPLOAD step).
     ///
     /// For each dirty item the remote is stat'd, and its content read when it
-    /// exists, so a remote change after our last sync is detected: in that case
-    /// the item is skipped as a conflict (remote wins) rather than overwritten.
+    /// exists. A remote change after our last sync is a conflict. Notes with a
+    /// stored common ancestor are merged three-way; clean merges upload the
+    /// result, unresolved merges leave markers locally and block upload.
+    /// Notes without a usable base fall back to a Joplin-style conflict copy.
     async fn upload(
         &self,
         key: &Option<items::SyncKey>,
@@ -218,45 +226,323 @@ impl<'a> SyncEngine<'a> {
                 continue;
             }
             let path = items::system_path(&id);
-            let local_updated = item
-                .props
-                .get("updated_time")
-                .and_then(Value::as_i64)
-                .unwrap_or(0);
 
-            // Joplin checks the remote only for items we have synced before:
-            // an item with no sync metadata has never been uploaded, so it is
-            // created remotely without a remote read (avoids clobbering the
-            // no-op self-heal flow and extra round-trips).
-            let sync_meta = self.storage.sync_time(&id)?;
-            let (conflict, remote_updated_file_time) = match sync_meta {
-                None => (false, 0),
-                Some((local_sync_time, _)) => match self.client.stat(&path).await? {
-                    // Remote absent: a previously-synced item was deleted
-                    // remotely while we changed it locally -> conflict.
-                    None => (local_sync_time != 0, 0),
-                    Some(st) => {
-                        let changed_remotely = match self.client.get_text(&path).await? {
-                            None => false,
-                            Some(text) => Self::remote_item_updated_time(&text) > local_sync_time,
-                        };
-                        (changed_remotely, st.updated_time)
-                    }
-                },
-            };
-            if conflict {
-                outcome.skipped_conflicts.push(format!(
-                    "{id} (remote changed since the last sync; the remote version was kept)"
-                ));
+            // An unresolved merge keeps the local markers in place and blocks
+            // upload until the user removes them.
+            if self.storage.note_conflict(&id)?.is_some() {
                 continue;
             }
 
-            let body = items::serialize_for_sync(item, key.as_ref())?;
-            self.client.put(&path, &body).await?;
-            self.storage
-                .save_sync_time(&id, local_updated, remote_updated_file_time)?;
-            outcome.uploaded += 1;
+            let local = item.clone();
+            let local_updated = Self::item_updated(&local);
+
+            // Joplin checks the remote only for items we have synced before:
+            // an item with no sync metadata has never been uploaded, so it is
+            // created remotely without a remote read.
+            let Some((local_sync_time, _)) = self.storage.sync_time(&id)? else {
+                self.put_item(&local, key, &path, local_updated, 0, outcome)
+                    .await?;
+                continue;
+            };
+
+            let stat = self.client.stat(&path).await?;
+            let Some(stat) = stat else {
+                if local_sync_time != 0 {
+                    if local.item_type == items::TYPE_NOTE {
+                        // Remote deleted while we edited locally: preserve the
+                        // local version as a conflict copy, then let the normal
+                        // deletion pass remove the original.
+                        self.upload_conflict_copy(&local, key, outcome).await?;
+                    } else {
+                        outcome.skipped_conflicts.push(format!(
+                            "{id} (deleted remotely; the local non-note change was discarded)"
+                        ));
+                    }
+                } else {
+                    self.put_item(&local, key, &path, local_updated, 0, outcome)
+                        .await?;
+                }
+                continue;
+            };
+
+            let Some(remote_text) = self.client.get_text(&path).await? else {
+                if local_sync_time != 0 {
+                    if local.item_type == items::TYPE_NOTE {
+                        self.upload_conflict_copy(&local, key, outcome).await?;
+                    } else {
+                        outcome.skipped_conflicts.push(format!(
+                            "{id} (deleted remotely; the local non-note change was discarded)"
+                        ));
+                    }
+                } else {
+                    self.put_item(
+                        &local,
+                        key,
+                        &path,
+                        local_updated,
+                        stat.updated_time,
+                        outcome,
+                    )
+                    .await?;
+                }
+                continue;
+            };
+
+            let changed_remotely = Self::remote_item_updated_time(&remote_text) > local_sync_time;
+            if !changed_remotely {
+                self.put_item(
+                    &local,
+                    key,
+                    &path,
+                    local_updated,
+                    stat.updated_time,
+                    outcome,
+                )
+                .await?;
+                continue;
+            }
+
+            self.resolve_upload_conflict(
+                &local,
+                &remote_text,
+                key,
+                &path,
+                stat.updated_time,
+                outcome,
+            )
+            .await?;
         }
+        Ok(())
+    }
+
+    fn item_title(item: &items::Item) -> String {
+        item.props
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    fn item_body(item: &items::Item) -> String {
+        if item.item_type == items::TYPE_NOTE {
+            item.body.clone()
+        } else {
+            String::new()
+        }
+    }
+
+    fn item_updated(item: &items::Item) -> i64 {
+        item.props
+            .get("updated_time")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+    }
+
+    fn item_is_locked(item: &items::Item) -> bool {
+        item.props
+            .get("is_locked")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            != 0
+            || item.body.starts_with("JLD")
+    }
+
+    fn item_is_conflict(item: &items::Item) -> bool {
+        item.props
+            .get("is_conflict")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            != 0
+    }
+
+    /// Serialize and upload one item, recording the content as the next merge
+    /// base.
+    async fn put_item(
+        &self,
+        item: &items::Item,
+        key: &Option<items::SyncKey>,
+        path: &str,
+        local_updated: i64,
+        remote_updated_file_time: i64,
+        outcome: &mut SyncOutcome,
+    ) -> Result<()> {
+        let id = item
+            .props
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let body = items::serialize_for_sync(item, key.as_ref())?;
+        self.client.put(path, &body).await?;
+        let title = Self::item_title(item);
+        let note_body = Self::item_body(item);
+        self.storage.save_sync_base(
+            &id,
+            local_updated,
+            remote_updated_file_time,
+            &title,
+            &note_body,
+        )?;
+        outcome.uploaded += 1;
+        Ok(())
+    }
+
+    /// Preserve the local version as a Joplin-style conflict copy and upload
+    /// it immediately. Used whenever a safe three-way merge is impossible.
+    async fn upload_conflict_copy(
+        &self,
+        source: &items::Item,
+        key: &Option<items::SyncKey>,
+        outcome: &mut SyncOutcome,
+    ) -> Result<()> {
+        let copy = self.storage.create_conflict_copy(source)?;
+        let copy_id = copy
+            .props
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let path = items::system_path(&copy_id);
+        let body = items::serialize_for_sync(&copy, key.as_ref())?;
+        self.client.put(&path, &body).await?;
+        let title = Self::item_title(&copy);
+        let note_body = Self::item_body(&copy);
+        self.storage
+            .save_sync_base(&copy_id, Self::item_updated(&copy), 0, &title, &note_body)?;
+        outcome.conflict_copies += 1;
+        outcome.uploaded += 1;
+        Ok(())
+    }
+
+    /// Handle a note whose remote copy changed since the last sync.
+    async fn resolve_upload_conflict(
+        &self,
+        local: &items::Item,
+        remote_text: &str,
+        key: &Option<items::SyncKey>,
+        path: &str,
+        remote_updated_file_time: i64,
+        outcome: &mut SyncOutcome,
+    ) -> Result<()> {
+        let id = local
+            .props
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        // Non-notes have no textual merge. The remote version wins, matching
+        // Joplin's item-conflict handling.
+        if local.item_type != items::TYPE_NOTE {
+            outcome.skipped_conflicts.push(format!(
+                "{id} (remote changed since the last sync; the remote version was kept)"
+            ));
+            return Ok(());
+        }
+
+        // A conflict note itself is never copied again; take the remote
+        // version instead of creating a conflict of a conflict.
+        if Self::item_is_conflict(local) {
+            outcome.skipped_conflicts.push(format!(
+                "{id} (conflict note changed remotely; the remote version was kept)"
+            ));
+            return Ok(());
+        }
+
+        let key_hex = key.as_ref().map(|k| k.key_hex.as_str());
+        let remote_item = match Self::process_item_text(remote_text, key_hex) {
+            ProcessResult::Item(item) => item,
+            _ => {
+                self.upload_conflict_copy(local, key, outcome).await?;
+                return Ok(());
+            }
+        };
+        if remote_item.item_type != items::TYPE_NOTE
+            || Self::item_is_locked(local)
+            || Self::item_is_locked(&remote_item)
+        {
+            self.upload_conflict_copy(local, key, outcome).await?;
+            return Ok(());
+        }
+
+        let local_title = Self::item_title(local);
+        let local_body = Self::item_body(local);
+        let remote_title = Self::item_title(&remote_item);
+        let remote_body = Self::item_body(&remote_item);
+        let remote_updated =
+            Self::item_updated(&remote_item).max(Self::remote_item_updated_time(remote_text));
+
+        let Some((base_title, base_body)) = self.storage.base_content(&id)? else {
+            // No common ancestor: three-way merge is not safe.
+            self.upload_conflict_copy(local, key, outcome).await?;
+            return Ok(());
+        };
+
+        let Some(merged) = crate::merge::merge_note(
+            &base_title,
+            &base_body,
+            &local_title,
+            &local_body,
+            &remote_title,
+            &remote_body,
+        ) else {
+            // Too large to merge safely.
+            self.upload_conflict_copy(local, key, outcome).await?;
+            return Ok(());
+        };
+
+        let next_updated = crate::time_ms()
+            .max(remote_updated.saturating_add(1))
+            .max(Self::item_updated(local).saturating_add(1));
+
+        if merged.conflicted {
+            let mut item = local.clone();
+            item.props
+                .insert("title".to_string(), Value::String(merged.title.clone()));
+            item.props
+                .insert("updated_time".to_string(), Value::from(next_updated));
+            item.props
+                .insert("user_updated_time".to_string(), Value::from(next_updated));
+            item.body = merged.body.clone();
+            self.storage.upsert_item(&item)?;
+            self.storage
+                .upsert_note_conflict(&crate::storage::NoteConflict {
+                    note_id: id.clone(),
+                    base_title,
+                    base_body,
+                    local_title,
+                    local_body,
+                    remote_title,
+                    remote_body,
+                    remote_updated_time: remote_updated,
+                    created_time: crate::time_ms(),
+                })?;
+            outcome.unresolved_conflicts += 1;
+            return Ok(());
+        }
+
+        let mut item = local.clone();
+        item.props
+            .insert("title".to_string(), Value::String(merged.title.clone()));
+        item.props
+            .insert("updated_time".to_string(), Value::from(next_updated));
+        item.props
+            .insert("user_updated_time".to_string(), Value::from(next_updated));
+        item.body = merged.body.clone();
+        self.storage.upsert_item(&item)?;
+
+        let body = items::serialize_for_sync(&item, key.as_ref())?;
+        self.client.put(path, &body).await?;
+        self.storage.save_sync_base(
+            &id,
+            next_updated,
+            remote_updated_file_time,
+            &merged.title,
+            &merged.body,
+        )?;
+        self.storage.clear_note_conflict(&id)?;
+        outcome.auto_merged += 1;
+        outcome.uploaded += 1;
         Ok(())
     }
 
@@ -588,6 +874,9 @@ impl<'a> SyncEngine<'a> {
             errors: Vec::new(),
             pending_decryption: Vec::new(),
             uploaded: 0,
+            auto_merged: 0,
+            unresolved_conflicts: 0,
+            conflict_copies: 0,
             deleted_remote: 0,
             skipped_conflicts: Vec::new(),
             upload_blocked: 0,
@@ -660,6 +949,7 @@ impl<'a> SyncEngine<'a> {
         // Local contents back the self-heal below and deletion detection.
         let local_ids = self.storage.all_item_ids()?;
         let local_id_set: HashSet<String> = local_ids.iter().cloned().collect();
+        let conflict_ids = self.storage.note_conflict_ids()?;
 
         for stat in &sorted {
             // Self-heal: the delta cursor may already have passed this item
@@ -709,6 +999,10 @@ impl<'a> SyncEngine<'a> {
             .synced_item_ids()?
             .into_iter()
             .filter(|id| local_id_set.contains(id))
+            // A note with unresolved conflict markers must not be deleted
+            // just because the remote side was deleted while the user was
+            // resolving it.
+            .filter(|id| !conflict_ids.contains(id))
             .collect();
         if !deletion_candidates.is_empty() {
             let deleted: Vec<String> = deletion_candidates
@@ -745,6 +1039,11 @@ impl<'a> SyncEngine<'a> {
                 progress(&format!("downloading {}/{}", done + 1, total));
             }
             let id = items::path_to_id(&stat.path);
+            // Never overwrite a note with local conflict markers. Its remote
+            // version is read again after the user resolves the merge.
+            if conflict_ids.contains(&id) {
+                continue;
+            }
             let text = match self.client.get_text(&stat.path).await? {
                 Some(t) => t,
                 None => {
@@ -761,8 +1060,15 @@ impl<'a> SyncEngine<'a> {
                         outcome.errors.push(format!("{}: store: {e}", stat.path));
                         continue;
                     }
-                    self.storage
-                        .save_sync_time(&id, crate::time_ms(), stat.updated_time)?;
+                    let title = Self::item_title(&final_item);
+                    let body = Self::item_body(&final_item);
+                    self.storage.save_sync_base(
+                        &id,
+                        crate::time_ms(),
+                        stat.updated_time,
+                        &title,
+                        &body,
+                    )?;
                     outcome.downloaded += 1;
                 }
                 ProcessResult::Pending(envelope) => {
@@ -829,6 +1135,7 @@ impl<'a> SyncEngine<'a> {
             }
         }
 
+        outcome.unresolved_conflicts = self.storage.count_note_conflicts().unwrap_or(0);
         Ok(outcome)
     }
 
@@ -862,7 +1169,10 @@ impl<'a> SyncEngine<'a> {
                     if let Err(e) = self.storage.upsert_item(&item) {
                         errors.push(format!("{path}: store: {e}"));
                     } else {
-                        self.storage.save_sync_time(id, crate::time_ms(), 0)?;
+                        let title = Self::item_title(&item);
+                        let body = Self::item_body(&item);
+                        self.storage
+                            .save_sync_base(id, crate::time_ms(), 0, &title, &body)?;
                         decrypted += 1;
                     }
                 }

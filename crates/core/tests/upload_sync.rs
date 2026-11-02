@@ -245,12 +245,41 @@ async fn upload_skips_conflicting_remote_change() {
     storage.save_sync_time(id, 1, 0).unwrap();
 
     let outcome = engine.sync(None, &mut |_| {}).await.unwrap();
-    assert_eq!(outcome.uploaded, 0, "conflict must not upload: {outcome:?}");
-    assert_eq!(outcome.skipped_conflicts.len(), 1, "{outcome:?}");
-    assert!(outcome.skipped_conflicts[0].contains(id));
+    // No merge base exists for a row that predates the base columns, so the
+    // fallback is a Joplin-style conflict copy of the local version.
+    assert_eq!(outcome.conflict_copies, 1, "{outcome:?}");
+    assert_eq!(
+        outcome.uploaded, 1,
+        "only the conflict copy is uploaded: {outcome:?}"
+    );
+    assert_eq!(outcome.unresolved_conflicts, 0, "{outcome:?}");
+    assert!(outcome.skipped_conflicts.is_empty(), "{outcome:?}");
     // The remote version was left untouched.
     let remote = remote_text(&files, &items::system_path(id)).unwrap();
     assert!(remote.contains("remote body"), "{remote}");
+    // The local edit survives in a new conflict copy, uploaded to the target.
+    let copy = {
+        let files = files.lock().unwrap();
+        files
+            .iter()
+            .filter(|(path, _)| path.ends_with(".md") && *path != &items::system_path(id))
+            .find_map(|(path, data)| {
+                let text = String::from_utf8_lossy(data);
+                (text.contains("local body") && text.contains("is_conflict: 1"))
+                    .then(|| (path.clone(), text.into_owned()))
+            })
+            .expect("conflict copy uploaded")
+    };
+    assert!(
+        copy.1.contains(&format!("conflict_original_id: {id}")),
+        "{}",
+        copy.1
+    );
+    let local = storage.note(id).unwrap().unwrap();
+    assert_eq!(
+        local.body, "remote body",
+        "original takes the remote version"
+    );
 }
 
 #[tokio::test]
@@ -322,6 +351,243 @@ async fn upload_e2ee_edit_roundtrip() {
     let n = s2.note(&note_id).unwrap().expect("note present");
     assert_eq!(n.body, "a brand new encrypted body");
     assert_eq!(n.props["title"].as_str(), Some("Edited title"));
+}
+
+#[tokio::test]
+async fn upload_auto_merges_disjoint_note_changes() {
+    let id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let mut initial = HashMap::new();
+    initial.insert("info.json".to_string(), br#"{"version":3}"#.to_vec());
+    initial.insert(
+        items::system_path(id),
+        items::serialize(&note_item(id, "Title", "a\nb\nc\n", 4_000_000_000_000)).into_bytes(),
+    );
+    let (url, files) = spawn_fake_dav(initial).await;
+    let client = WebDavClient::new(&url, "user", "pass").unwrap();
+    let storage = Storage::open_in_memory().unwrap();
+    let engine = SyncEngine::new(&client, &storage);
+
+    storage
+        .upsert_item(&note_item(id, "Title", "a\nLOCAL\nc\n", 1000))
+        .unwrap();
+    // Common ancestor from the last sync.
+    storage
+        .save_sync_base(id, 1, 0, "Title", "a\nb\nc\n")
+        .unwrap();
+
+    let outcome = engine.sync(None, &mut |_| {}).await.unwrap();
+    assert_eq!(outcome.auto_merged, 1, "{outcome:?}");
+    assert_eq!(outcome.uploaded, 1, "{outcome:?}");
+    assert_eq!(outcome.unresolved_conflicts, 0, "{outcome:?}");
+    assert_eq!(outcome.conflict_copies, 0, "{outcome:?}");
+
+    let remote = remote_text(&files, &items::system_path(id)).unwrap();
+    assert!(remote.contains("a\nLOCAL\nc"), "{remote}");
+    assert!(!remote.contains("<<<<<<<"), "{remote}");
+    let local = storage.note(id).unwrap().unwrap();
+    assert_eq!(local.body, "a\nLOCAL\nc\n");
+}
+
+#[tokio::test]
+async fn upload_writes_local_conflict_markers_then_uploads_resolution() {
+    let id = "cccccccccccccccccccccccccccccccc";
+    let mut initial = HashMap::new();
+    initial.insert("info.json".to_string(), br#"{"version":3}"#.to_vec());
+    initial.insert(
+        items::system_path(id),
+        items::serialize(&note_item(
+            id,
+            "Title",
+            "line1 remote\nline2\n",
+            4_000_000_000_000,
+        ))
+        .into_bytes(),
+    );
+    let (url, files) = spawn_fake_dav(initial).await;
+    let client = WebDavClient::new(&url, "user", "pass").unwrap();
+    let storage = Storage::open_in_memory().unwrap();
+    let engine = SyncEngine::new(&client, &storage);
+
+    storage
+        .upsert_item(&note_item(id, "Title", "line1 local\nline2\n", 1000))
+        .unwrap();
+    storage
+        .save_sync_base(id, 1, 0, "Title", "line1\nline2\n")
+        .unwrap();
+
+    let outcome = engine.sync(None, &mut |_| {}).await.unwrap();
+    assert_eq!(outcome.unresolved_conflicts, 1, "{outcome:?}");
+    assert_eq!(outcome.auto_merged, 0, "{outcome:?}");
+    assert_eq!(outcome.uploaded, 0, "{outcome:?}");
+    assert_eq!(outcome.conflict_copies, 0, "{outcome:?}");
+
+    let local = storage.note(id).unwrap().unwrap();
+    assert!(local.body.contains("<<<<<<< LOCAL"), "{}", local.body);
+    assert!(local.body.contains("======="), "{}", local.body);
+    assert!(local.body.contains(">>>>>>> REMOTE"), "{}", local.body);
+    assert!(local.body.contains("line1 local"), "{}", local.body);
+    assert!(local.body.contains("line1 remote"), "{}", local.body);
+    assert!(storage.note_conflict(id).unwrap().is_some());
+
+    // The remote version is untouched while the conflict is unresolved.
+    let remote = remote_text(&files, &items::system_path(id)).unwrap();
+    assert!(remote.contains("line1 remote"), "{remote}");
+    assert!(!remote.contains("<<<<<<<"), "{remote}");
+
+    // Removing the markers resolves the conflict and the next sync uploads it.
+    storage
+        .update_note(id, "Title", "line1 resolved\nline2\n")
+        .unwrap();
+    assert!(storage.note_conflict(id).unwrap().is_none());
+
+    let outcome = engine.sync(None, &mut |_| {}).await.unwrap();
+    assert_eq!(outcome.unresolved_conflicts, 0, "{outcome:?}");
+    assert_eq!(outcome.uploaded, 1, "{outcome:?}");
+    let remote = remote_text(&files, &items::system_path(id)).unwrap();
+    assert!(remote.contains("line1 resolved"), "{remote}");
+    assert!(!remote.contains("<<<<<<<"), "{remote}");
+}
+
+#[tokio::test]
+async fn unresolved_conflict_is_not_overwritten_by_later_remote_change() {
+    let id = "dddddddddddddddddddddddddddddddd";
+    let path = items::system_path(id);
+    let mut initial = HashMap::new();
+    initial.insert("info.json".to_string(), br#"{"version":3}"#.to_vec());
+    initial.insert(
+        path.clone(),
+        items::serialize(&note_item(
+            id,
+            "Title",
+            "line1 remote\nline2\n",
+            4_000_000_000_000,
+        ))
+        .into_bytes(),
+    );
+    let (url, files) = spawn_fake_dav(initial).await;
+    let client = WebDavClient::new(&url, "user", "pass").unwrap();
+    let storage = Storage::open_in_memory().unwrap();
+    let engine = SyncEngine::new(&client, &storage);
+
+    storage
+        .upsert_item(&note_item(id, "Title", "line1 local\nline2\n", 1000))
+        .unwrap();
+    storage
+        .save_sync_base(id, 1, 0, "Title", "line1\nline2\n")
+        .unwrap();
+
+    let outcome = engine.sync(None, &mut |_| {}).await.unwrap();
+    assert_eq!(outcome.unresolved_conflicts, 1, "{outcome:?}");
+    let marked = storage.note(id).unwrap().unwrap().body;
+
+    // The remote side advances while the local conflict is unresolved.
+    files.lock().unwrap().insert(
+        path.clone(),
+        items::serialize(&note_item(
+            id,
+            "Title",
+            "line1 newer remote\nline2\n",
+            5_000_000_000_000,
+        ))
+        .into_bytes(),
+    );
+    let outcome = engine.sync(None, &mut |_| {}).await.unwrap();
+    assert_eq!(outcome.unresolved_conflicts, 1, "{outcome:?}");
+    assert_eq!(outcome.uploaded, 0, "{outcome:?}");
+    let local = storage.note(id).unwrap().unwrap();
+    assert_eq!(
+        local.body, marked,
+        "local markers must survive the download"
+    );
+    assert!(storage.note_conflict(id).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn e2ee_conflict_auto_merges_and_reencrypts() {
+    let vault_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../fixtures/test_vault.json"
+    );
+    #[derive(serde::Deserialize)]
+    struct Vault {
+        info_json: String,
+        items: HashMap<String, String>,
+        password: String,
+    }
+    let vault: Vault = serde_json::from_str(
+        &std::fs::read_to_string(vault_path).expect("run tools/generate_fixtures.js"),
+    )
+    .unwrap();
+
+    let mut initial: HashMap<String, Vec<u8>> = HashMap::new();
+    initial.insert("info.json".into(), vault.info_json.clone().into_bytes());
+    for (path, content) in &vault.items {
+        initial.insert(path.clone(), content.as_bytes().to_vec());
+    }
+    let (url, files) = spawn_fake_dav(initial).await;
+    let client = WebDavClient::new(&url, "user", "pass").unwrap();
+    let storage = Storage::open_in_memory().unwrap();
+    let engine = SyncEngine::new(&client, &storage);
+
+    engine
+        .sync(Some(&vault.password), &mut |_| {})
+        .await
+        .unwrap();
+    let id = "11111111111111111111111111111111";
+    let local = storage.note(id).unwrap().unwrap();
+    assert_eq!(
+        local.body,
+        "Hello from the encrypted vault\n\nWith a second paragraph"
+    );
+
+    // Local changes the second paragraph; remote changes the first line.
+    storage
+        .update_note(
+            id,
+            "First note",
+            "Hello from the encrypted vault\n\nLOCAL paragraph",
+        )
+        .unwrap();
+
+    let info = engine.fetch_sync_info().await.unwrap();
+    let (key_hex, key_id) = engine
+        .unlock_master_key_any(&info, &vault.password)
+        .unwrap();
+    let key = items::SyncKey { key_hex, key_id };
+    let mut remote_item = local.clone();
+    remote_item
+        .props
+        .insert("title".into(), Value::from("First note"));
+    remote_item.props.insert(
+        "updated_time".into(),
+        Value::from(joplin_rs_core::time_ms() + 60_000),
+    );
+    remote_item.body = "REMOTE first line\n\nWith a second paragraph".into();
+    let remote_blob = items::serialize_for_sync(&remote_item, Some(&key)).unwrap();
+    files
+        .lock()
+        .unwrap()
+        .insert(items::system_path(id), remote_blob.into_bytes());
+
+    let outcome = engine
+        .sync(Some(&vault.password), &mut |_| {})
+        .await
+        .unwrap();
+    assert_eq!(outcome.auto_merged, 1, "{outcome:?}");
+    assert_eq!(outcome.unresolved_conflicts, 0, "{outcome:?}");
+    assert_eq!(outcome.uploaded, 1, "{outcome:?}");
+
+    // A second client sees the merged content, still encrypted on the target.
+    let remote_raw = remote_text(&files, &items::system_path(id)).unwrap();
+    assert!(
+        !remote_raw.contains("REMOTE first line"),
+        "remote must stay encrypted"
+    );
+    let s2 = Storage::open_in_memory().unwrap();
+    let e2 = SyncEngine::new(&client, &s2);
+    e2.sync(Some(&vault.password), &mut |_| {}).await.unwrap();
+    let seen = s2.note(id).unwrap().unwrap();
+    assert_eq!(seen.body, "REMOTE first line\n\nLOCAL paragraph");
 }
 
 /// Reporter bug: in an E2EE vault with no password supplied, local changes must

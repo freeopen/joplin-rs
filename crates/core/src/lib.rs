@@ -20,6 +20,7 @@ pub const VERSION_DISPLAY: &str = match option_env!("JOPLIN_RS_VERSION_DISPLAY")
 pub mod crypto;
 pub mod error;
 pub mod items;
+pub mod merge;
 pub mod secret;
 pub mod storage;
 pub mod sync;

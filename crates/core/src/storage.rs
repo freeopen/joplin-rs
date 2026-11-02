@@ -39,6 +39,24 @@ pub struct SearchHit {
     pub folder_id: String,
 }
 
+/// A note with an unresolved three-way merge conflict.
+///
+/// The local row already contains the conflict markers; this record preserves
+/// the pre-conflict sides and tells the sync engine to keep the note out of
+/// uploads and downloads until the user removes the markers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteConflict {
+    pub note_id: String,
+    pub base_title: String,
+    pub base_body: String,
+    pub local_title: String,
+    pub local_body: String,
+    pub remote_title: String,
+    pub remote_body: String,
+    pub remote_updated_time: i64,
+    pub created_time: i64,
+}
+
 pub struct Storage {
     conn: Connection,
 }
@@ -125,9 +143,47 @@ impl Storage {
                     resource_id TEXT PRIMARY KEY,
                     fetched_time INT NOT NULL DEFAULT 0
                 );
+
+                CREATE TABLE IF NOT EXISTS note_conflicts (
+                    note_id TEXT PRIMARY KEY,
+                    base_title TEXT NOT NULL DEFAULT '',
+                    base_body TEXT NOT NULL DEFAULT '',
+                    local_title TEXT NOT NULL DEFAULT '',
+                    local_body TEXT NOT NULL DEFAULT '',
+                    remote_title TEXT NOT NULL DEFAULT '',
+                    remote_body TEXT NOT NULL DEFAULT '',
+                    remote_updated_time INT NOT NULL DEFAULT 0,
+                    created_time INT NOT NULL DEFAULT 0
+                );
                 "#,
             )
             .map_err(|e| Error::Storage(format!("migrate: {e}")))?;
+        // Additive migration for databases created before three-way merging.
+        self.ensure_column("sync_items", "base_title", "TEXT NOT NULL DEFAULT ''")?;
+        self.ensure_column("sync_items", "base_body", "TEXT NOT NULL DEFAULT ''")?;
+        self.ensure_column("sync_items", "base_valid", "INT NOT NULL DEFAULT 0")?;
+        Ok(())
+    }
+
+    fn ensure_column(&self, table: &str, column: &str, definition: &str) -> Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(|e| Error::Storage(format!("table_info {table}: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| Error::Storage(format!("table_info {table}: {e}")))?;
+        for name in rows {
+            if name.map_err(|e| Error::Storage(e.to_string()))? == column {
+                return Ok(());
+            }
+        }
+        self.conn
+            .execute(
+                &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+                [],
+            )
+            .map_err(|e| Error::Storage(format!("add {table}.{column}: {e}")))?;
         Ok(())
     }
 
@@ -215,6 +271,136 @@ impl Storage {
         Ok(())
     }
 
+    /// Record sync metadata plus the common ancestor used by three-way merges.
+    pub fn save_sync_base(
+        &self,
+        item_id: &str,
+        sync_time: i64,
+        remote_updated_time: i64,
+        base_title: &str,
+        base_body: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                r#"INSERT INTO sync_items (item_id, sync_time, remote_updated_time, base_title, base_body, base_valid)
+                   VALUES (?1, ?2, ?3, ?4, ?5, 1)
+                   ON CONFLICT(item_id) DO UPDATE SET
+                     sync_time=?2, remote_updated_time=?3, base_title=?4, base_body=?5, base_valid=1"#,
+                rusqlite::params![item_id, sync_time, remote_updated_time, base_title, base_body],
+            )
+            .map_err(|e| Error::Storage(format!("save sync base: {e}")))?;
+        Ok(())
+    }
+
+    /// The last content both sides agreed on, used as the merge base.
+    pub fn base_content(&self, item_id: &str) -> Result<Option<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT base_title, base_body, base_valid FROM sync_items WHERE item_id = ?1")
+            .map_err(|e| Error::Storage(format!("base content: {e}")))?;
+        let mut rows = stmt
+            .query([item_id])
+            .map_err(|e| Error::Storage(format!("base content: {e}")))?;
+        if let Some(row) = rows.next().map_err(|e| Error::Storage(e.to_string()))? {
+            let valid: i64 = row.get(2).map_err(|e| Error::Storage(e.to_string()))?;
+            if valid == 0 {
+                return Ok(None);
+            }
+            Ok(Some((
+                row.get(0).map_err(|e| Error::Storage(e.to_string()))?,
+                row.get(1).map_err(|e| Error::Storage(e.to_string()))?,
+            )))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Persist (or replace) the unresolved conflict state for a note.
+    pub fn upsert_note_conflict(&self, conflict: &NoteConflict) -> Result<()> {
+        self.conn
+            .execute(
+                r#"INSERT INTO note_conflicts
+                     (note_id, base_title, base_body, local_title, local_body,
+                      remote_title, remote_body, remote_updated_time, created_time)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                   ON CONFLICT(note_id) DO UPDATE SET
+                     base_title=?2, base_body=?3, local_title=?4, local_body=?5,
+                     remote_title=?6, remote_body=?7, remote_updated_time=?8,
+                     created_time=?9"#,
+                rusqlite::params![
+                    conflict.note_id,
+                    conflict.base_title,
+                    conflict.base_body,
+                    conflict.local_title,
+                    conflict.local_body,
+                    conflict.remote_title,
+                    conflict.remote_body,
+                    conflict.remote_updated_time,
+                    conflict.created_time,
+                ],
+            )
+            .map_err(|e| Error::Storage(format!("upsert note conflict: {e}")))?;
+        Ok(())
+    }
+
+    pub fn note_conflict(&self, note_id: &str) -> Result<Option<NoteConflict>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT note_id, base_title, base_body, local_title, local_body, \
+                 remote_title, remote_body, remote_updated_time, created_time \
+                 FROM note_conflicts WHERE note_id = ?1",
+            )
+            .map_err(|e| Error::Storage(format!("note conflict: {e}")))?;
+        let mut rows = stmt
+            .query([note_id])
+            .map_err(|e| Error::Storage(format!("note conflict: {e}")))?;
+        let Some(row) = rows.next().map_err(|e| Error::Storage(e.to_string()))? else {
+            return Ok(None);
+        };
+        Ok(Some(NoteConflict {
+            note_id: row.get(0).map_err(|e| Error::Storage(e.to_string()))?,
+            base_title: row.get(1).map_err(|e| Error::Storage(e.to_string()))?,
+            base_body: row.get(2).map_err(|e| Error::Storage(e.to_string()))?,
+            local_title: row.get(3).map_err(|e| Error::Storage(e.to_string()))?,
+            local_body: row.get(4).map_err(|e| Error::Storage(e.to_string()))?,
+            remote_title: row.get(5).map_err(|e| Error::Storage(e.to_string()))?,
+            remote_body: row.get(6).map_err(|e| Error::Storage(e.to_string()))?,
+            remote_updated_time: row.get(7).map_err(|e| Error::Storage(e.to_string()))?,
+            created_time: row.get(8).map_err(|e| Error::Storage(e.to_string()))?,
+        }))
+    }
+
+    pub fn clear_note_conflict(&self, note_id: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM note_conflicts WHERE note_id = ?1", [note_id])
+            .map_err(|e| Error::Storage(format!("clear note conflict: {e}")))?;
+        Ok(())
+    }
+
+    pub fn note_conflict_ids(&self) -> Result<std::collections::HashSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT note_id FROM note_conflicts")
+            .map_err(|e| Error::Storage(format!("note conflict ids: {e}")))?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| Error::Storage(format!("note conflict ids: {e}")))?;
+        let mut out = std::collections::HashSet::new();
+        for row in rows {
+            out.insert(row.map_err(|e| Error::Storage(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
+    pub fn count_note_conflicts(&self) -> Result<usize> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM note_conflicts", [], |r| r.get(0))
+            .map_err(|e| Error::Storage(format!("count note conflicts: {e}")))?;
+        Ok(n as usize)
+    }
+
     pub fn sync_time(&self, item_id: &str) -> Result<Option<(i64, i64)>> {
         let mut stmt = self
             .conn
@@ -290,6 +476,9 @@ impl Storage {
         self.conn
             .execute("DELETE FROM sync_items WHERE item_id = ?1", [id])
             .map_err(|e| Error::Storage(format!("delete sync: {e}")))?;
+        self.conn
+            .execute("DELETE FROM note_conflicts WHERE note_id = ?1", [id])
+            .map_err(|e| Error::Storage(format!("delete conflict: {e}")))?;
         // Drop the local-only protection marker with the note.
         self.conn
             .execute(
@@ -682,7 +871,10 @@ impl Storage {
             .get("updated_time")
             .and_then(Value::as_i64)
             .unwrap_or(0);
-        let next = crate::time_ms().max(previous + 1);
+        // A download can stamp sync_time with the wall clock, so a same-ms
+        // edit must still land ahead of it to be picked up by the next sync.
+        let synced = self.sync_time(id)?.map(|(t, _)| t).unwrap_or(0);
+        let next = crate::time_ms().max(previous + 1).max(synced + 1);
         item.props
             .insert("updated_time".to_string(), Value::from(next));
         // Joplin records the user-visible time alongside updated_time; emit
@@ -693,7 +885,67 @@ impl Storage {
         item.props
             .insert("user_updated_time".to_string(), Value::from(next));
         item.body = body.to_string();
-        self.upsert_item(&item)
+        self.upsert_item(&item)?;
+
+        // A note with conflict markers is resolved once the user removes
+        // them. Point the merge base at the remote version they reconciled
+        // against, so the next sync uploads their resolution instead of
+        // re-conflicting with the same remote change.
+        if let Some(conflict) = self.note_conflict(id)? {
+            if !crate::merge::has_unresolved_markers(body) {
+                if let Some((sync_time, remote_updated_time)) = self.sync_time(id)? {
+                    self.save_sync_base(
+                        id,
+                        sync_time,
+                        remote_updated_time,
+                        &conflict.remote_title,
+                        &conflict.remote_body,
+                    )?;
+                }
+                self.clear_note_conflict(id)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Duplicate a note as a Joplin-style conflict copy.
+    ///
+    /// Returns the new item (already inserted locally, without sync metadata,
+    /// so the caller can upload it immediately).
+    pub fn create_conflict_copy(&self, source: &Item) -> Result<Item> {
+        if source.item_type != crate::items::TYPE_NOTE {
+            return Err(Error::Storage("conflict copy requires a note".into()));
+        }
+        let source_id = source
+            .props
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if source_id.is_empty() {
+            return Err(Error::Storage("conflict copy source without id".into()));
+        }
+
+        let id = new_item_id();
+        let now = crate::time_ms();
+        let mut props = source.props.clone();
+        props.insert("id".to_string(), Value::String(id.clone()));
+        props.insert("is_conflict".to_string(), Value::from(1));
+        props.insert("conflict_original_id".to_string(), Value::String(source_id));
+        props.insert("updated_time".to_string(), Value::from(now));
+        props.insert("user_updated_time".to_string(), Value::from(now));
+        props.insert("deleted_time".to_string(), Value::from(0));
+        props.insert("encryption_applied".to_string(), Value::from(0));
+        props.insert("is_shared".to_string(), Value::from(0));
+        props.remove("share_id");
+        props.remove("encryption_cipher_text");
+        let item = Item {
+            item_type: crate::items::TYPE_NOTE,
+            props,
+            body: source.body.clone(),
+        };
+        self.upsert_item(&item)?;
+        Ok(item)
     }
 
     /// Move a note to another notebook, bumping `updated_time` so the change
@@ -711,7 +963,8 @@ impl Storage {
             .get("updated_time")
             .and_then(Value::as_i64)
             .unwrap_or(0);
-        let next = crate::time_ms().max(previous + 1);
+        let synced = self.sync_time(id)?.map(|(t, _)| t).unwrap_or(0);
+        let next = crate::time_ms().max(previous + 1).max(synced + 1);
         item.props
             .insert("updated_time".to_string(), Value::from(next));
         item.props

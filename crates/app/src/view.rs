@@ -2897,6 +2897,7 @@ impl Render for NoteBrowser {
         let show_notebooks = self.state.read(cx).show_notebooks;
         let show_notes = self.state.read(cx).show_notes;
         let pending = self.state.read(cx).local_pending;
+        let unresolved = self.state.read(cx).unresolved_conflicts;
         let active_search = self.state.read(cx).search.clone();
         let base = if !worker.is_empty() {
             worker
@@ -2905,11 +2906,14 @@ impl Render for NoteBrowser {
         } else {
             status
         };
-        let status_line = if pending > 0 {
+        let mut status_line = if pending > 0 {
             format!("{base} · 本地 {pending} 项待同步")
         } else {
             base
         };
+        if unresolved > 0 {
+            status_line.push_str(&format!(" · {unresolved} 项冲突待解决"));
+        }
         let nb_focused = self.notebooks_focus.is_focused(window);
         let notes_focused = self.notes_focus.is_focused(window);
 
@@ -3265,6 +3269,7 @@ impl NoteBrowser {
         let protected = state.protected.clone();
         let selected_note = state.selected_note.clone();
         let note_cursor = state.note_cursor;
+        let conflict_note_ids = state.conflict_note_ids.clone();
         let has_folder = state.selected_folder.is_some();
         let browser = cx.entity().downgrade();
 
@@ -3342,6 +3347,18 @@ impl NoteBrowser {
                                 };
                                 if is_protected {
                                     title = format!("🔐 {title}");
+                                }
+                                if conflict_note_ids.contains(&id) {
+                                    title = format!("⚔ {title}");
+                                }
+                                let is_conflict = note
+                                    .props
+                                    .get("is_conflict")
+                                    .and_then(|v| v.as_i64())
+                                    .unwrap_or(0)
+                                    == 1;
+                                if is_conflict {
+                                    title = format!("⚠ 冲突副本 {title}");
                                 }
                                 let is_todo = note
                                     .props
@@ -3649,6 +3666,7 @@ impl NoteBrowser {
         let title = state.note_title.clone();
         let body = state.note_body.clone();
         let editing = state.editing;
+        let has_conflict = state.selected_note_conflict;
         let vim_mode = state.config.vim_mode;
         let vim_state = state.vim_mode;
         let vim_pending = state.vim_pending.clone();
@@ -3678,6 +3696,15 @@ impl NoteBrowser {
                         div()
                             .flex_1()
                             .min_w_0()
+                            .when(has_conflict, |el| {
+                                el.child(
+                                    div()
+                                        .mb_1()
+                                        .text_size(px(11.))
+                                        .text_color(theme.muted_foreground)
+                                        .child("未解决冲突：删除冲突标记后会自动上传"),
+                                )
+                            })
                             .text_size(px(16.))
                             .font_weight(gpui_kit::FontWeight::BOLD)
                             .child(SharedString::from(title))

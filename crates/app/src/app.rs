@@ -244,6 +244,12 @@ pub struct Stage1Summary {
     pub resources: usize,
     /// Items uploaded to the target.
     pub uploaded: usize,
+    /// Notes auto-merged cleanly with their remote version.
+    pub auto_merged: usize,
+    /// Notes holding local conflict markers and blocked from upload.
+    pub unresolved_conflicts: usize,
+    /// Joplin-style conflict copies created as a fallback.
+    pub conflict_copies: usize,
     /// Remote files physically deleted.
     pub deleted_remote: usize,
     /// Items skipped as conflicts (remote changed).
@@ -323,6 +329,8 @@ pub struct AppState {
     pub selected_note: Option<String>,
     /// The selected note is stored as an encrypted placeholder (no plaintext).
     pub selected_note_encrypted: bool,
+    /// The selected note has local conflict markers waiting for resolution.
+    pub selected_note_conflict: bool,
     pub note_body: String,
     pub note_title: String,
     pub search: String,
@@ -407,6 +415,10 @@ pub struct AppState {
     // ---- sync lifecycle ----
     /// Local changes waiting to be uploaded, mirrored each UI tick.
     pub local_pending: usize,
+    /// Notes with unresolved conflict markers (local only, never uploaded).
+    pub unresolved_conflicts: usize,
+    /// Ids of notes with unresolved conflict markers.
+    pub conflict_note_ids: std::collections::HashSet<String>,
     /// A quit is waiting for an in-flight sync-before-quit to finish.
     pub quit_after_sync: bool,
 
@@ -456,6 +468,7 @@ impl AppState {
             notes: Vec::new(),
             selected_note: None,
             selected_note_encrypted: false,
+            selected_note_conflict: false,
             note_body: String::new(),
             note_title: String::new(),
             search: String::new(),
@@ -493,6 +506,8 @@ impl AppState {
             vim_mode: VimMode::Insert,
             vim_pending: String::new(),
             local_pending: 0,
+            unresolved_conflicts: 0,
+            conflict_note_ids: Default::default(),
             quit_after_sync: false,
             set_webdav_url: String::new(),
             set_username: String::new(),
@@ -519,6 +534,8 @@ impl AppState {
     /// touching the currently open note. Used after an inline save.
     pub fn refresh_lists(&mut self) {
         self.folders = self.storage.folders().unwrap_or_default();
+        self.unresolved_conflicts = self.storage.count_note_conflicts().unwrap_or(0);
+        self.conflict_note_ids = self.storage.note_conflict_ids().unwrap_or_default();
         self.load_notes();
         let note_tags = self.storage.note_tags().unwrap_or_default();
         let tags = self.storage.tags().unwrap_or_default();
@@ -713,6 +730,7 @@ impl AppState {
             self.note_body.clear();
             self.note_raw_body.clear();
             self.selected_note_encrypted = false;
+            self.selected_note_conflict = false;
             self.note_locked = false;
             self.editing = false;
         }
@@ -741,6 +759,7 @@ impl AppState {
     fn open_note(&mut self, id: &str) {
         if let Ok(Some(note)) = self.storage.note(id) {
             self.selected_note_encrypted = is_encrypted_placeholder(&note);
+            self.selected_note_conflict = self.storage.note_conflict(id).ok().flatten().is_some();
             self.note_title = note
                 .props
                 .get("title")
@@ -932,6 +951,7 @@ impl AppState {
                     self.note_raw_body.clear();
                     self.note_title.clear();
                     self.selected_note_encrypted = false;
+                    self.selected_note_conflict = false;
                     self.note_locked = false;
                 }
                 self.refresh_lists();
@@ -1386,8 +1406,20 @@ impl AppState {
                     );
                     if !summary.conflicts.is_empty() {
                         base.push_str(&format!(
-                            "；{} 项冲突已跳过（保留远端）",
+                            "；{} 项非笔记冲突已跳过（保留远端）",
                             summary.conflicts.len()
+                        ));
+                    }
+                    if summary.auto_merged > 0 {
+                        base.push_str(&format!("；自动合并 {} 项", summary.auto_merged));
+                    }
+                    if summary.conflict_copies > 0 {
+                        base.push_str(&format!("；创建冲突副本 {} 个", summary.conflict_copies));
+                    }
+                    if summary.unresolved_conflicts > 0 {
+                        base.push_str(&format!(
+                            "；{} 项冲突待解决（已写入冲突标记，解决后自动上传）",
+                            summary.unresolved_conflicts
                         ));
                     }
                     let blocked = summary.upload_blocked;
@@ -1942,6 +1974,9 @@ mod tests {
                 deleted: 0,
                 resources: 0,
                 uploaded: 0,
+                auto_merged: 0,
+                unresolved_conflicts: 0,
+                conflict_copies: 0,
                 deleted_remote: 0,
                 conflicts: Vec::new(),
                 upload_blocked: 0,
@@ -1993,6 +2028,9 @@ mod tests {
                 deleted: 0,
                 resources: 0,
                 uploaded: 0,
+                auto_merged: 0,
+                unresolved_conflicts: 0,
+                conflict_copies: 0,
                 deleted_remote: 0,
                 conflicts: Vec::new(),
                 upload_blocked: 0,

@@ -24,6 +24,7 @@ hex = { workspace = true }
 quick-xml = { workspace = true }
 tracing = { workspace = true }
 time = { workspace = true }
+diffy = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

@@ -346,10 +346,11 @@ async fn main() -> Result<()> {
                 })
                 .await?;
             println!(
-                "done: {} uploaded, {} downloaded, {} deleted, {} deleted remote, {} resources ({} pending), {} unsupported, {} pending decryption, {} conflicts, {} upload blocked",
+                "done: {} uploaded, {} downloaded, {} deleted, {} deleted remote, {} resources ({} pending), {} unsupported, {} pending decryption, {} auto-merged, {} unresolved conflicts, {} conflict copies, {} non-note conflicts, {} upload blocked",
                 outcome.uploaded, outcome.downloaded, outcome.deleted, outcome.deleted_remote,
                 outcome.resources_downloaded,
                 outcome.resources_pending, outcome.skipped_unsupported, outcome.pending_decryption.len(),
+                outcome.auto_merged, outcome.unresolved_conflicts, outcome.conflict_copies,
                 outcome.skipped_conflicts.len(), outcome.upload_blocked
             );
             if outcome.upload_blocked > 0 {
@@ -359,10 +360,22 @@ async fn main() -> Result<()> {
                 );
             }
             if !outcome.skipped_conflicts.is_empty() {
-                println!("conflicts skipped (remote kept):");
+                println!("non-note conflicts skipped (remote kept):");
                 for c in &outcome.skipped_conflicts {
                     println!("  - {c}");
                 }
+            }
+            if outcome.unresolved_conflicts > 0 {
+                println!(
+                    "{} note(s) have unresolved conflict markers and are blocked from upload; remove the markers to resolve them",
+                    outcome.unresolved_conflicts
+                );
+            }
+            if outcome.conflict_copies > 0 {
+                println!(
+                    "{} conflict copy/copies created (no common ancestor, oversized, or locked note)",
+                    outcome.conflict_copies
+                );
             }
             if !outcome.pending_decryption.is_empty() {
                 println!("items stored encrypted - run sync again with the E2EE password to decrypt them");

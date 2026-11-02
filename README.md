@@ -31,8 +31,12 @@ joplin-rs is a from-scratch Rust client built for exactly this situation:
   Joplin): downloads remote changes with a timestamp context, uploads local
   edits/creations (encrypted for E2EE vaults), physically deletes remote files
   for locally-deleted items, and refuses mass deletion with a 90% fail-safe.
-  Conflicting items (the remote changed since the last sync) are skipped and
-  reported, keeping the remote version.
+  Conflicting notes are merged three-way against the last synced version:
+  non-overlapping edits merge automatically and upload the result, while
+  overlapping edits leave Git-style `<<<<<<< LOCAL` / `>>>>>>> REMOTE` markers
+  in the local note and block its upload until the markers are removed. Notes
+  without a usable common ancestor (and oversized/locked notes) fall back to a
+  Joplin-style conflict copy. Non-note items keep the remote version.
 - E2EE encrypt and decrypt:
   - master keys: `KeyV1` (PBKDF2-HMAC-SHA512 x220k + AES-256-GCM) and the legacy
     `SJCL1a/1b/3/4` password master keys used by real Joplin 1.x/2.x vaults
@@ -141,6 +145,14 @@ sync-on-startup and sync-before-quit.
 **Sync lifecycle**: the status bar shows `· N local changes pending` while local
 notes have unsynced changes; quitting (menu, `Cmd+Q`, or the window close button)
 syncs first when `sync_on_quit` is on, then exits.
+
+**Conflicts**: when a note changed both locally and remotely, the client merges
+the two versions against the last synced copy. Clean merges upload
+automatically. Overlapping edits are written into the note with
+`<<<<<<< LOCAL` / `=======` / `>>>>>>> REMOTE` markers, the note header and
+status bar show the unresolved count, and the note is not uploaded until the
+markers are removed (autosave then clears the conflict on the next sync). Notes
+without a merge base fall back to a Joplin-style conflict copy.
 
 New `config.toml` keys (all default to `true` when absent): `vim_mode`,
 `sync_on_startup`, `sync_on_quit`.
@@ -286,6 +298,4 @@ cargo test --workspace
 - Sync targets other than WebDAV
 - PPK (public/private key) master keys
 - OCB2-based legacy encryption (SJCL 1/2)
-- Conflict copies: a conflicting item keeps the remote version and is reported
-  instead of creating a `(conflict)` note
 - Note history / revisions, plugins, note locking
