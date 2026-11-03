@@ -22,6 +22,7 @@ use crate::{
 
 use super::{
     CursorShape, InputBaseState, PrepaintCaretGeometry, RangeDecorationStyle, TextDecoration,
+    char_byte_range,
     layout::{LastLayout, WhitespaceIndicators},
     mode::LayoutMode,
 };
@@ -2370,16 +2371,20 @@ fn paint_block_cursor_glyph(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let start = text
-        .byte_to_char_idx(cursor.min(text.len()))
-        .min(text.len_chars());
-    let Some(ch) = text.chars_at(start).next() else {
+    // The caret offset is a byte offset, and so is the range we slice: a char
+    // index would pick a different character and panic with "byte index is not
+    // on a char boundary" on any non-ASCII text.
+    let Some(range) = char_byte_range(text, cursor) else {
         return;
     };
-    if ch.is_whitespace() {
+    if text
+        .chars_at(range.start)
+        .next()
+        .is_none_or(char::is_whitespace)
+    {
         return;
     }
-    let grapheme = text.slice(start..start + 1).to_string();
+    let grapheme = text.slice(range).to_string();
     let style = window.text_style();
     let font = style.font();
     let font_size = style.font_size.to_pixels(window.rem_size());

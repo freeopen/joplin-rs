@@ -16,6 +16,21 @@ impl Point {
     }
 }
 
+/// Byte range of the character that covers `byte_offset`.
+///
+/// `byte_offset` is a **byte** offset into `text`. The character it points at
+/// can be multi-byte, so the result is a byte range: `Rope::slice` and
+/// `Rope::chars_at` both take byte offsets, and feeding them a char index
+/// selects a different character and panics with "byte index is not on a char
+/// boundary" on any non-ASCII text.
+///
+/// Returns `None` when the offset is past the end of the text.
+pub fn char_byte_range(text: &Rope, byte_offset: usize) -> Option<Range<usize>> {
+    let offset = text.floor_char_boundary(byte_offset.min(text.len()));
+    let ch = text.chars_at(offset).next()?;
+    Some(offset..offset + ch.len_utf8())
+}
+
 /// Parser-independent description of an incremental text replacement.
 #[derive(Debug, Clone, Copy)]
 pub struct InputEdit {

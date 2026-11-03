@@ -4657,6 +4657,89 @@ mod tests {
         .unwrap();
     }
 
+    /// Regression for the Cmd+E crash: the block cursor repaints the character
+    /// under the caret, and the caret offset is a **byte** offset. The glyph
+    /// lookup used to mix char indices into `Rope::slice`, which takes byte
+    /// offsets, so every note with non-ASCII text panicked with "byte index is
+    /// not on a char boundary" as soon as the caret sat behind a CJK
+    /// character.
+    ///
+    /// The headless test window is never "active", so the caret is not painted
+    /// in a test; the byte-range helper the painter uses is asserted directly
+    /// here instead.
+    #[test]
+    fn block_cursor_glyph_range_uses_byte_offsets_on_multibyte_text() {
+        let text = gpui_kit::base::input::Rope::from("a你b🙂c");
+        // 'a' is 1 byte, '你' is 3, 'b' is 1, '🙂' is 4, 'c' is 1.
+        assert_eq!(gpui_kit::base::input::char_byte_range(&text, 0), Some(0..1));
+        assert_eq!(gpui_kit::base::input::char_byte_range(&text, 1), Some(1..4));
+        assert_eq!(gpui_kit::base::input::char_byte_range(&text, 4), Some(4..5));
+        assert_eq!(gpui_kit::base::input::char_byte_range(&text, 5), Some(5..9));
+        assert_eq!(
+            gpui_kit::base::input::char_byte_range(&text, 9),
+            Some(9..10)
+        );
+        // Past the end of the text there is no character to repaint.
+        assert_eq!(gpui_kit::base::input::char_byte_range(&text, 10), None);
+
+        // Every offset inside the text must resolve to a whole, sliceable
+        // character. An offset in the middle of a multi-byte character snaps
+        // down to the character that contains it.
+        for offset in 0..text.len() {
+            let range = gpui_kit::base::input::char_byte_range(&text, offset)
+                .expect("a character under every offset");
+            assert!(text.is_char_boundary(range.start));
+            assert!(text.is_char_boundary(range.end));
+            let glyph = text.slice(range).to_string();
+            assert_eq!(glyph.chars().count(), 1, "offset {offset}");
+        }
+    }
+
+    #[gpui::test]
+    fn native_block_cursor_renders_on_multibyte_text_without_panicking(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        struct Root(Entity<TextareaState>);
+        impl Render for Root {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .text_size(px(16.))
+                    .child(Textarea::new(&self.0).h(relative(1.)).appearance(false))
+            }
+        }
+
+        let mut state = None;
+        let window = cx.add_window(|window, cx| {
+            gpui_kit::init(cx);
+            let textarea = cx.new(|cx| {
+                let mut state = TextareaState::new(window, cx);
+                state.set_value("你好，世界\nsecond line 🙂", window, cx);
+                state.set_cursor_shape(CursorShape::Block);
+                state
+            });
+            state = Some(textarea.clone());
+            Root(textarea)
+        });
+        let textarea = state.expect("textarea state");
+
+        // Walk the caret through every character of both lines. Each column
+        // index is a character offset, so the byte offset behind it grows with
+        // the multi-byte characters that precede it.
+        for line in 0..2 {
+            for column in 0..8 {
+                cx.update_window(window.into(), |_, window, cx| {
+                    textarea.update(cx, |state, cx| {
+                        state.set_cursor_position(Position::new(line, column), window, cx);
+                        state.focus(window, cx);
+                    });
+                    window.draw(cx).clear(cx);
+                })
+                .unwrap();
+            }
+        }
+    }
+
     #[gpui::test]
     fn vim_line_edits_drive_the_real_textarea(cx: &mut gpui::TestAppContext) {
         struct Root(Entity<TextareaState>);
