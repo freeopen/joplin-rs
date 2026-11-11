@@ -112,6 +112,7 @@ match highest:
 2. 日常 push（非 tag 触发）：`TAG_NAME=v${VERSION}`，在**当前提交**上建 tag 并发布 Release。
 3. 版本不变（本次 push 无 feat/fix）：tag 已存在，跳过发布，避免把新产物挂到旧提交的 tag 上。
 4. 人工 push `vX.Y.Z` tag：Release 直接绑定该 tag。
+5. Release body 由 `tools/release-notes.sh` 生成：范围是「上一 tag..本版 tag」（master push 时本版 tag 尚未创建，脚本回退到 `HEAD`）。body 包含提交总数与 feat/fix/perf/other 统计、每个非 merge 提交的短 hash 链接与标题（按 Conventional Commits 分组）、以及 compare 链接；`chore(release*)`/`Release v*` 等发布提交会被过滤。提交枚举使用 `--pretty=tformat:...`（`format` 不带末尾换行，`while read` 会丢掉最旧一条提交）。
 
 `src/version.rs` 中的 `display_string_is_parseable_like_ci_sed` 测试与这条 sed 表达式一一对应，保证显示格式永远可被 CI 解析。
 

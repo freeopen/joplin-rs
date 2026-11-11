@@ -203,10 +203,9 @@ jobs:
           echo "Releasing $VERSION as $TAG_NAME"
 
       # Generate this version's changelog from the git log (the source of the
-      # Release body): group by conventional-commit prefix -- feat under
-      # "New features", fix under "Bug fixes", perf under "Performance", and
-      # everything else under "Other changes". The range is the previous
-      # release tag..HEAD.
+      # Release body). tools/release-notes.sh lists every commit between the
+      # previous tag and this version with a short-hash link, plus counts per
+      # Conventional Commits type.
       - name: Generate release notes from git log
         if: env.SKIP_RELEASE != 'true'
         shell: bash
@@ -215,44 +214,19 @@ jobs:
           TAG_NAME="${{ env.TAG_NAME }}"
           VERSION="${{ env.VERSION }}"
           PREV_TAG="$(git tag --list 'v[0-9]*' --sort=-v:refname | grep -vx "$TAG_NAME" | head -n1 || true)"
-          if [ -n "$PREV_TAG" ]; then RANGE="$PREV_TAG..HEAD"; else RANGE="HEAD"; fi
-          echo "Generating release notes for $VERSION (range: $RANGE)"
+          if [ -n "$PREV_TAG" ]; then
+            echo "Generating release notes for $VERSION (since $PREV_TAG)"
+          else
+            echo "Generating release notes for $VERSION (initial release)"
+          fi
 
-          d="$(mktemp -d)"
-          : > "$d/feat"; : > "$d/fix"; : > "$d/perf"; : > "$d/other"
-          git log "$RANGE" --no-merges --pretty=format:'%s' | while IFS= read -r subject; do
-            [ -z "$subject" ] && continue
-            case "$subject" in
-              chore\(release*|Release\ v*|v[0-9]*.[0-9]*.[0-9]*) continue ;;
-            esac
-            case "$subject" in
-              feat:*|feat\(*\):*|feat!:*|feat\(*\)!:*) section="feat" ;;
-              fix:*|fix\(*\):*|fix!:*|fix\(*\)!:*)   section="fix" ;;
-              perf:*|perf\(*\):*|perf!:*)             section="perf" ;;
-              *)                                       section="other" ;;
-            esac
-            text="$(printf '%s' "$subject" | sed -E 's/^[a-z]+(\([^)]*\))?!?: //')"
-            printf -- '- %s\n' "$text" >> "$d/$section"
-          done
-
-          {
-            echo "## joplin-rs $VERSION"
-            echo
-            if [ -n "$PREV_TAG" ]; then
-              echo "_Changes since \`$PREV_TAG\`_"
-            else
-              echo "_Initial release_"
-            fi
-            echo
-            if [ -s "$d/feat" ]; then echo "### ✨ New features"; cat "$d/feat"; echo; fi
-            if [ -s "$d/fix" ]; then echo "### 🐛 Bug fixes"; cat "$d/fix"; echo; fi
-            if [ -s "$d/perf" ]; then echo "### ⚡ Performance"; cat "$d/perf"; echo; fi
-            if [ -s "$d/other" ]; then echo "### 🔧 Other changes"; cat "$d/other"; echo; fi
-            if [ -n "$PREV_TAG" ]; then
-              echo "---"
-              echo "Full changelog: https://github.com/${GITHUB_REPOSITORY}/compare/${PREV_TAG}...${TAG_NAME}"
-            fi
-          } > release-body.md
+          if [ -n "$PREV_TAG" ]; then
+            tools/release-notes.sh --version "$VERSION" --tag "$TAG_NAME" \
+              --prev "$PREV_TAG" > release-body.md
+          else
+            tools/release-notes.sh --version "$VERSION" --tag "$TAG_NAME" \
+              > release-body.md
+          fi
 
           echo "----- release-body.md -----"
           cat release-body.md
