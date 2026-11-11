@@ -45,3 +45,4 @@ tempfile = "3"
 
 [patch.crates-io]
 gpui-base = { path = "vendor/gpui-base" }
+gpui-pre-macos = { path = "vendor/gpui-pre-macos" }

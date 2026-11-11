@@ -100,6 +100,17 @@ recently opened note; falls back to the newest note) and syncs on launch.
 | Toggle edit/preview for the open note | `Cmd+E` | `Ctrl+E` |
 | Settings | `Cmd+,` | `Ctrl+,` |
 | Sync | `Cmd+R` | `Ctrl+R` |
+| Hide joplin-rs (macOS) | `Cmd+H` | — |
+| Hide other apps (macOS) | `Cmd+Option+H` | — |
+| Minimize window (macOS) | `Cmd+M` | — |
+| Close window (macOS) | `Cmd+W` | — |
+
+On macOS the app follows the platform convention of staying alive after its
+last window closes, and the standard app menu carries Hide / Hide Others /
+Show All plus a Window menu (Minimize / Zoom / Close). To bring the window
+back, click the Dock icon, or select joplin-rs in the `Cmd+Tab` switcher and
+press `Cmd+Option`; a minimized window is restored and a closed one is
+recreated (the last session is loaded again).
 
 Showing a panel with its shortcut also focuses it; hiding a focused panel moves
 focus back to the note body. With a list focused, `j`/`k` move a single
@@ -151,8 +162,10 @@ like `joplin-rs set-password`), TLS options, and toggles for Vim mode,
 sync-on-startup and sync-before-quit.
 
 **Sync lifecycle**: the status bar shows `· N local changes pending` while local
-notes have unsynced changes; quitting (menu, `Cmd+Q`, or the window close button)
-syncs first when `sync_on_quit` is on, then exits.
+notes have unsynced changes; quitting (menu, `Cmd+Q`, or the window close button
+when changes are pending) syncs first when `sync_on_quit` is on, then exits.
+On macOS, closing the window with nothing pending leaves the app running, so
+the Dock icon / `Cmd+Tab` can bring the window back (see the shortcuts above).
 
 **Conflicts**: when a note changed both locally and remotely, the client merges
 the two versions against the last synced copy. Clean merges upload

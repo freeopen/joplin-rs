@@ -4356,34 +4356,54 @@ fn family_from_name_table(table: &[u8]) -> Option<String> {
     best
 }
 
+/// Open the application's main window.
+///
+/// Shared by startup and the macOS reopen path: on macOS the process keeps
+/// running after the last window closes, and the system sends a reopen
+/// request when the user clicks the Dock icon (or reveals the app from the
+/// app switcher) with no windows available.
+fn open_main_window(cx: &mut App) {
+    let bounds = Bounds::centered(None, Size::new(px(1100.), px(720.)), cx);
+    let icon = image::load_from_memory_with_format(crate::APP_ICON_PNG, image::ImageFormat::Png)
+        .ok()
+        .map(|img| Arc::new(img.to_rgba8()));
+    gpui_kit::open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: Some(gpui_kit::TitlebarOptions {
+                title: Some("joplin-rs".into()),
+                ..Default::default()
+            }),
+            icon,
+            ..Default::default()
+        },
+        cx,
+        |window, cx| cx.new(|cx| NoteBrowser::new(window, cx)),
+    )
+    .expect("open main window");
+}
+
 /// GPUI entry point.
 pub fn gpui_main() {
-    gpui_kit::application().run(|cx: &mut App| {
+    let application = gpui_kit::application();
+    // Recreate the main window when the user reactivates the app after
+    // closing it. gpui only calls this when no window is open; minimized
+    // windows are restored by AppKit's default reopen behavior.
+    application.on_reopen(|cx| {
+        if cx.windows().is_empty() {
+            open_main_window(cx);
+        }
+        cx.activate(true);
+    });
+    application.run(|cx: &mut App| {
         gpui_kit::init(cx);
         init_fonts(cx);
         register(cx);
-        let bounds = Bounds::centered(None, Size::new(px(1100.), px(720.)), cx);
-        let icon =
-            image::load_from_memory_with_format(crate::APP_ICON_PNG, image::ImageFormat::Png)
-                .ok()
-                .map(|img| Arc::new(img.to_rgba8()));
-        gpui_kit::open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(gpui_kit::TitlebarOptions {
-                    title: Some("joplin-rs".into()),
-                    ..Default::default()
-                }),
-                icon,
-                ..Default::default()
-            },
-            cx,
-            |window, cx| cx.new(|cx| NoteBrowser::new(window, cx)),
-        )
-        .expect("open main window");
+        open_main_window(cx);
         cx.activate(true);
         // The GPUI app menu exists now; retarget its About item to the
-        // custom panel and set the rounded dock icon.
+        // custom panel, set the rounded dock icon, and add the standard
+        // macOS application/window menu items.
         #[cfg(target_os = "macos")]
         crate::macos_about::install_native_about();
     });
