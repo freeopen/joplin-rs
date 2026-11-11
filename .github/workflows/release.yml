@@ -145,6 +145,47 @@ jobs:
         shell: bash
         run: ./tools/make-dmg.sh --target ${{ matrix.target }}
 
+      # Guard the drag-to-install layout: exactly the app plus an
+      # Applications shortcut. A leftover iconset/staging folder means the
+      # packaging script leaked build scratch files into the image.
+      - name: Verify macOS app DMG layout
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          dmgs=(joplin-rs-"${VERSION}"-*.dmg)
+          if [ "${#dmgs[@]}" -eq 0 ]; then
+            echo "no DMG produced" >&2
+            exit 1
+          fi
+          for dmg in "${dmgs[@]}"; do
+            mountpoint="$(mktemp -d)"
+            cleanup() {
+              hdiutil detach "$mountpoint" >/dev/null 2>&1 || true
+              rmdir "$mountpoint" 2>/dev/null || true
+            }
+            trap cleanup EXIT
+            hdiutil attach "$dmg" -nobrowse -readonly \
+              -mountpoint "$mountpoint" >/dev/null
+
+            test -d "$mountpoint/joplin-rs.app"
+            test -f "$mountpoint/joplin-rs.app/Contents/Resources/joplin-rs.icns"
+            test -L "$mountpoint/Applications"
+            test "$(readlink "$mountpoint/Applications")" = "/Applications"
+
+            iconsets=("$mountpoint"/*.iconset)
+            if [ "${#iconsets[@]}" -ne 0 ]; then
+              echo "unexpected iconset in $dmg: ${iconsets[*]}" >&2
+              exit 1
+            fi
+
+            ls -la "$mountpoint"
+            hdiutil detach "$mountpoint" >/dev/null
+            rmdir "$mountpoint"
+            trap - EXIT
+          done
+
       - name: List artifacts
         if: runner.os == 'macOS'
         shell: bash

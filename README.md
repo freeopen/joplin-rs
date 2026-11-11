@@ -218,9 +218,9 @@ complete change set since the previous version, not just a summary.
 Release artifacts: Linux and Windows ship both binaries (CLI `joplin-rs` +
 GUI `joplin-rs-app`) in `tar.gz` / `zip`. On macOS the `tar.gz` carries the
 CLI binary only, and the GUI additionally ships as a DMG containing a
-`joplin-rs.app` bundle (drag into Applications; ad-hoc signed, not
-notarized, so use right-click -> Open on first launch). To package it
-locally on a Mac:
+`joplin-rs.app` bundle plus an `Applications` shortcut to `/Applications`
+(drag the app onto it; ad-hoc signed, not notarized, so use right-click ->
+Open on first launch). To package it locally on a Mac:
 
 ```
 cargo build --release --target aarch64-apple-darwin

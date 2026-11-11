@@ -60,8 +60,12 @@ VERSION="$("$GUI_BIN" --version | sed -E 's/.* v([0-9]+\.[0-9]+\.[0-9]+).*/\1/')
 OUT="$REPO_ROOT/joplin-rs-${VERSION}-${TARGET}.dmg"
 
 STAGE="$(mktemp -d)"
+# Scratch space for the iconset. It must stay OUTSIDE $STAGE: hdiutil packs
+# everything under the staging directory into the image, and a leftover
+# joplin-rs.iconset folder would show up in the mounted DMG.
+WORK="$(mktemp -d)"
 APP="$STAGE/joplin-rs.app"
-trap 'rm -rf "$STAGE"' EXIT
+trap 'rm -rf "$STAGE" "$WORK"' EXIT
 
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
@@ -81,7 +85,7 @@ EOF
 
 # .icns: real multi-representation iconset, falling back to a single
 # 1024px-representation icns generated via sips.
-ICONSET="$STAGE/joplin-rs.iconset"
+ICONSET="$WORK/joplin-rs.iconset"
 if [[ -x "$(command -v iconutil)" ]] && mkdir "$ICONSET" 2>/dev/null; then
     for size in 16 32 64 128 256 512 1024; do
         half=$((size / 2))
@@ -121,6 +125,10 @@ EOF
 # first-launch right-click -> Open still applies. A failed sign is not fatal.
 codesign --force --sign - "$APP" >/dev/null 2>&1 ||
     echo "warning: ad-hoc codesign failed; continuing unsigned"
+
+# Standard drag-to-install layout: the app plus an Applications shortcut
+# pointing at the system-wide /Applications folder.
+ln -s /Applications "$STAGE/Applications"
 
 echo ">> creating $OUT"
 rm -f "$OUT"
